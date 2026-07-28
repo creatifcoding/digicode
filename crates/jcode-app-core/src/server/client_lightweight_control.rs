@@ -17,6 +17,7 @@ use super::comm_sync::{
     CommResyncPlanContext, handle_comm_plan_status, handle_comm_read_context,
     handle_comm_resync_plan, handle_comm_status, handle_comm_summary,
 };
+use super::session_discovery::handle_list_sessions_request;
 use super::{
     AwaitMembersRuntime, ChannelSubscriptions, ClientConnectionInfo, FileTouchService,
     SessionAgents, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
@@ -127,6 +128,16 @@ pub(super) async fn handle_lightweight_control_request(
     });
 
     match request {
+        Request::ListSessions { id } => {
+            handle_list_sessions_request(
+                id,
+                &client_event_tx,
+                sessions,
+                global_session_id,
+                swarm_members,
+            )
+            .await?;
+        }
         Request::CommShare {
             id,
             session_id: req_session_id,

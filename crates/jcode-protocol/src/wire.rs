@@ -68,27 +68,24 @@ pub enum Request {
     /// Cancel all pending soft interrupts (remove from server queue before injection)
     #[serde(rename = "cancel_soft_interrupts")]
     CancelSoftInterrupts { id: u64 },
-
     /// Clear conversation history
     #[serde(rename = "clear")]
     Clear { id: u64 },
-
     /// Rewind conversation history to the given 1-based message index.
     #[serde(rename = "rewind")]
     Rewind { id: u64, message_index: usize },
-
     /// Undo the most recent rewind, if one is available.
     #[serde(rename = "rewind_undo")]
     RewindUndo { id: u64 },
-
     /// Health check
     #[serde(rename = "ping")]
     Ping { id: u64 },
-
     /// Get current state (debug)
     #[serde(rename = "state")]
     GetState { id: u64 },
-
+    /// List lightweight resumable-session metadata before subscribing.
+    #[serde(rename = "list_sessions")]
+    ListSessions { id: u64 },
     /// Execute a debug command (debug socket only)
     #[serde(rename = "debug_command")]
     DebugCommand {
@@ -97,11 +94,9 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
     },
-
     /// Execute a client debug command (forwarded to TUI)
     #[serde(rename = "client_debug_command")]
     ClientDebugCommand { id: u64, command: String },
-
     /// Response from TUI for client debug command
     #[serde(rename = "client_debug_response")]
     ClientDebugResponse { id: u64, output: String },
@@ -713,7 +708,6 @@ pub enum Request {
         wake: bool,
     },
 }
-
 /// Server event sent to client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -726,6 +720,12 @@ pub enum ServerEvent {
     #[serde(rename = "ack")]
     Ack { id: u64 },
 
+    /// Lightweight resumable-session discovery response.
+    #[serde(rename = "session_list")]
+    SessionList {
+        id: u64,
+        sessions: Vec<SessionListEntry>,
+    },
     /// Streaming text delta
     #[serde(rename = "text_delta")]
     TextDelta { text: String },

@@ -558,6 +558,29 @@ pub struct AwaitedMemberStatus {
     pub completion_report: Option<String>,
 }
 
+/// Lightweight metadata for a resumable session.
+///
+/// This intentionally excludes transcript content so clients can discover a
+/// session before subscribing without forcing the server to hydrate history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionListEntry {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub friendly_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// RFC 3339 timestamp for the latest persisted session update.
+    pub updated_at: String,
+    /// Stable snake_case lifecycle status.
+    pub status: String,
+    /// Whether this is the server's current session.
+    pub is_current: bool,
+    /// Whether a live process currently owns this session.
+    pub is_live: bool,
+}
+
 impl Request {
     pub fn id(&self) -> u64 {
         match self {
@@ -571,6 +594,7 @@ impl Request {
             Request::RewindUndo { id } => *id,
             Request::Ping { id } => *id,
             Request::GetState { id } => *id,
+            Request::ListSessions { id } => *id,
             Request::DebugCommand { id, .. } => *id,
             Request::ClientDebugCommand { id, .. } => *id,
             Request::ClientDebugResponse { id, .. } => *id,
@@ -645,6 +669,7 @@ impl Request {
         matches!(
             self,
             Request::Ping { .. }
+                | Request::ListSessions { .. }
                 | Request::CommShare { .. }
                 | Request::CommRead { .. }
                 | Request::CommMessage { .. }
