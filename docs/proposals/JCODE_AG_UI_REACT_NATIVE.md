@@ -126,6 +126,75 @@ AG-UI transports machine definitions, snapshots, events, and state changes. XSta
 - AG-UI protocol documentation: AG-UI provides bidirectional agent/frontend events, shared state, `STATE_SNAPSHOT`, and RFC 6902 `STATE_DELTA`.
 - Jcode source: the existing WebSocket gateway exposes Jcode's native session protocol and remains useful for current clients, but is not the canonical dynamic RN interoperability layer under this decision.
 
+## Source-grounded implementation findings
+
+A controlled read-only swarm analyzed pinned checkouts of CopilotKit, AG-UI, XState, and the user's local MetaTool implementation. These findings refine the delivery plan.
+
+### CopilotKit React Native
+
+- `@copilotkit/react-native` is a headless package. We own the React Native presentation layer.
+- The provider expects a `runtimeUrl` and reuses CopilotKit's platform-neutral hooks, including agent, frontend-tool, and human-in-the-loop behavior.
+- The normal client path is a JSON HTTP request with an SSE response, not Jcode's existing WebSocket wire protocol.
+- Hermes requires CopilotKit's streams, encoding, crypto, DOM, and location polyfills to load before other CopilotKit imports.
+- Mobile validation must cover long-running streams, because the inspected React Native streaming-fetch path has timeout behavior that may affect runs longer than roughly one minute.
+- Authentication headers/cookies, app backgrounding, reload replay, frontend-tool calls, and approval round trips require on-device tests rather than browser-only confidence.
+
+### AG-UI
+
+- The practical canonical event contract is the TypeScript Zod schema in the AG-UI repository.
+- `RunAgentInput` carries `threadId`, `runId`, current state, messages, tools, context, forwarded properties, optional parent run, and optional resume data.
+- The standard TypeScript `HttpAgent` performs a JSON `POST` with `Accept: text/event-stream` and expects JSON events in SSE `data:` fields.
+- The minimum lifecycle is bounded by `RUN_STARTED` and `RUN_FINISHED` or `RUN_ERROR`.
+- Assistant output uses explicit text-message start/content/end events. Tool calls likewise have a typed lifecycle.
+- Shared state already provides `STATE_SNAPSHOT` and RFC 6902 `STATE_DELTA`; Jcode must not invent replacements.
+- AG-UI is transport-agnostic conceptually, but its standard TypeScript client path is HTTP/SSE. WebSocket and resumability are capabilities rather than one fully specified universal handshake.
+- The base protocol does not provide a mandatory global event sequence suitable for durable replay. Jcode must define a compatible resume extension or recover with authoritative message and state snapshots.
+- Session discovery is not the same operation as an AG-UI run. A generic authenticated host/session discovery API may remain useful alongside AG-UI.
+
+### XState v5
+
+- A machine definition and a persisted actor snapshot are separate serializable artifacts.
+- `machine.definition` or `machine.toJSON()` preserves topology and symbolic descriptors, not executable implementation functions.
+- `actor.getPersistedSnapshot()` produces restorable actor state, including nested children when supported.
+- Restoration uses `createActor(machine, { snapshot }).start()` after reconstructing the machine with the correct implementation registry.
+- `setup(...)` and `.provide(...)` implementations remain local runtime maps and do not serialize into the machine definition.
+- Remote machine definitions must therefore reference allow-listed actions, guards, actors, and delays by stable identifiers.
+- The workflow envelope must carry the XState major, Jcode schema version, machine version/hash, implementation requirements, definition, and optional persisted snapshot.
+
+### MetaTool
+
+- The live Pi host exposes a fixed `mt` tool, while package and stored procedure code also contain `cm` and `ms` vocabulary. Migration must preserve aliases at execution boundaries while choosing one canonical Jcode vocabulary.
+- MetaTool already separates the host extension, a portable compositional package, and a short-lived evaluator child.
+- Its evaluator isolation protects the host event loop with timeout, abort, process termination, console capture, and clone-safe results, but it is not a security sandbox and currently inherits the host environment.
+- The portable package composes a stable API object from overlays/plugins and store/runtime services. This is the valuable seam for adding AG-UI/XState workflow capabilities.
+- Renderer and host-boundary abstractions support Pi/OMP portability and should become explicit Jcode frontend-capability adapters rather than being discarded.
+- The procedure workbench is an implementation-ready design direction, not fully live functionality. The first Jcode integration should target the current `mt` execution and overlay model rather than depending on proposed v2 behavior.
+
+## Refined adapter decision
+
+The first AG-UI adapter should be a **Jcode-hosted authenticated HTTP/SSE endpoint** rather than a WebSocket translation in the RN client:
+
+1. Accept AG-UI `RunAgentInput` via `POST`.
+2. Bind `threadId` to a Jcode session and `runId` to one turn attempt.
+3. Translate Jcode server events into canonical AG-UI run, message, tool, state, and custom events.
+4. Emit SSE keepalives and clean terminal run events.
+5. Recover reconnects with authoritative message/state snapshots until a versioned Jcode replay extension is defined.
+6. Keep the existing Jcode WebSocket gateway unchanged for native clients.
+7. Keep generic host/session discovery separate and reusable.
+
+Jcode currently has no Axum or Hyper dependency. The implementation choice is therefore between a focused HTTP/SSE extension of the existing Tokio gateway and introducing a dedicated HTTP framework. This must be decided with compile-size, maintainability, streaming correctness, authentication, and testability measurements rather than preference.
+
+## Validation gates added by the reference analysis
+
+- Hermes device test with a stream lasting longer than 60 seconds.
+- Bearer-token authentication test for AG-UI HTTP/SSE.
+- App background, disconnect, reconnect, and authoritative snapshot recovery.
+- Frontend-tool invocation and human approval round trip.
+- Exact AG-UI event-schema conformance fixtures.
+- XState machine definition plus persisted-snapshot restoration with nested actors.
+- Refusal of unknown XState actions, guards, actors, delays, and component capabilities.
+- MetaTool evaluator timeout, cancellation, clone-safe output, and environment-isolation review.
+
 ## Open implementation decisions
 
 - Implement AG-UI directly in Rust or initially run a thin adapter service.
