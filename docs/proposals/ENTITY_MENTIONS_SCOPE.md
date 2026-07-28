@@ -14,7 +14,7 @@ The key product promise is:
 
 > If Jcode accepts an `@entity` mention, the user can inspect exactly what it resolved, what was sent to the model, and where it came from. If it cannot resolve safely, it says so and does not guess.
 
-This scope is intentionally about reference semantics and user workflow. It does not prescribe a particular parser, UI toolkit, storage schema, or provider integration.
+This scope is intentionally about reference semantics and user workflow. It does not prescribe a particular parser, UI toolkit, or storage schema. It does prescribe FFF's native Rust engine as the file/folder discovery provider so Jcode does not build and maintain a competing workspace index.
 
 ## 2. Repository-grounded constraints
 
@@ -23,6 +23,7 @@ This scope is intentionally about reference semantics and user workflow. It does
 - Swarm members expose session identity plus friendly name, lifecycle status, runtime status, task/progress information, and completion reports. Parent/child ownership and subtree boundaries are meaningful permissions.
 - Transcript rendering distinguishes stored messages from synthetic UI messages, supports tool results and inline media, and already has context-window compaction and output-size caps.
 - The safety model treats local read-only inspection as auto-allowed, while external communication, mutation, and actions outside the local sandbox require stronger approval. Entity resolution must preserve this boundary.
+- File and folder discovery must use the native `fff-search` Rust crate. The unrelated crate named `fff` is a finite-field library and must not be added. Jcode should reuse FFF's long-lived workspace index, mixed file/directory fuzzy search, frecency, git awareness, ignore handling, metadata, binary classification, and filesystem watcher rather than implementing a parallel crawler or ranking system.
 
 These existing concepts should be reused rather than inventing a parallel identity system.
 
@@ -106,13 +107,22 @@ Autocomplete opens after `@`, after `@<kind>:` and while editing the selector. I
 
 ### 5.2 MVP discovery sources
 
-- `file` and `folder` candidates from the current working directory.
+- `file` and `folder` candidates from an FFF index rooted at the current working directory.
 - Current input prefix and path segments.
 - Recently mentioned entities in the current session.
-- Recent files/folders within a bounded scan set.
+- FFF frecency and query-history ranking within the authorized root.
 - Explicitly typed paths, even when they are not indexed.
 
 Do not scan the entire home directory by default. Discovery is scoped to the active project/session root and configured include/exclude rules.
+
+### 5.2.1 FFF lifecycle
+
+- Add `fff-search` as the native dependency and construct one long-lived picker/index per active workspace root, shared by composer discovery requests for that root.
+- Initialize and scan asynchronously. Cold-index progress must not block typing; a selected result is always revalidated by Jcode's authoritative resolver at submit time.
+- Reuse FFF watcher updates instead of running periodic full rescans. Workspace/root changes create or select the matching scoped index.
+- Use FFF's mixed search for the combined file/folder menu and its typed metadata for result rendering. Jcode remains responsible for authorization, secret policy, preview construction, byte/token budgeting, and final content reads.
+- Feed successful mention selections back into FFF frecency/query tracking when the API supports it. Do not persist raw query text or paths in Jcode telemetry.
+- Bound resident memory and idle workspace indexes. The implementation must define eviction or teardown for inactive roots rather than retaining every workspace index indefinitely.
 
 ### 5.3 Ranking
 
@@ -428,11 +438,12 @@ For `@session`, model-visible expansion is metadata-first and bounded. It never 
 
 ### Milestone 1: Local resolver core
 
-- Implement parser-independent canonical path normalization and authorization.
-- Implement file/folder discovery, resolution, deterministic manifests, metadata fingerprints, and bounded selection.
+- Integrate `fff-search` and implement a workspace-scoped index lifecycle with cold-scan progress, watcher updates, and bounded idle-index retention.
+- Implement parser-independent canonical path normalization and authorization. FFF results are discovery hints, not authorization decisions.
+- Implement FFF-backed mixed file/folder discovery plus authoritative resolution, deterministic manifests, metadata fingerprints, and bounded selection.
 - Add structured status/provenance output.
 
-**Exit:** resolver tests pass for every security and failure state; no UI or provider changes required to inspect results.
+**Exit:** resolver tests pass for every security and failure state; FFF discovery latency and cold-scan behavior meet the target; no UI or provider changes are required to inspect results.
 
 ### Milestone 2: Composer discovery and preview
 
@@ -471,6 +482,7 @@ Ship one kind at a time behind the same resolver/preview/transcript contract: se
 | Fuzzy matching selects the wrong file | Incorrect model advice | Exact-first ranking, ambiguity state, explicit confirmation, no silent fallback |
 | Path/symlink escape leaks secrets | Security/privacy incident | Root authorization after normalization, symlink policy, secret filters, negative tests |
 | Index is stale during editing | Surprising previews or missing context | Submit-time revalidation, metadata fingerprint, changed-since-discovery notice |
+| Long-lived FFF indexes increase resident memory | Jcode retains excessive memory across many workspaces | One shared index per active root, measurable memory diagnostics, bounded idle-root retention, explicit teardown |
 | File content contains prompt injection | Model follows untrusted file instructions | Delimited attachment, provenance, system/developer instruction precedence, security tests |
 | Transcript duplicates large payloads | Storage/UI/memory growth | Persist references and bounded metadata, not repeated full payloads; preserve snapshots only by explicit decision |
 | Imported sessions have incompatible identity/storage | Broken later `@session` references or unsafe continuation | Source-qualified `{source, source_id}` identity, locator-only provenance, explicit compatibility/archive-vs-continuation state, read-only previews, bridge compatibility tests |
@@ -493,6 +505,7 @@ Ship one kind at a time behind the same resolver/preview/transcript contract: se
 9. Whether URL entities are fetched by the resolver or by an explicit user-approved tool action.
 10. Which request/message types own the optional mention sidecar and how provider adapters derive attachments without exposing the sidecar as a `ContentBlock`.
 11. Which transcript surfaces ship in Milestone 3 and how compact attachment rows behave in narrow TUI layouts.
+12. The exact FFF index ownership boundary: daemon-owned for all clients, client-local for local composers, or a shared abstraction with daemon-authoritative revalidation. Prefer daemon ownership when remote clients must receive identical rankings and lifecycle behavior.
 
 ## 18. Definition of done for this scope
 
