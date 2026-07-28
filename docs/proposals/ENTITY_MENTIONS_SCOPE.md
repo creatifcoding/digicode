@@ -62,14 +62,14 @@ Use a namespaced form that is unambiguous and extensible:
 
 - `@file:<path>`
 - `@folder:<path>`
-- Later: `@session:<id>`, `@task:<id>`, `@initiative:<id>`, `@peer:<id>`, `@url:<normalized-url>`
+- Later: `@session:<source>/<source-id>`, `@task:<id>`, `@initiative:<id>`, `@peer:<id>`, `@url:<normalized-url>`
 
 Examples:
 
 - `@file:src/main.rs`
 - `@file:"docs/Design Notes.md"`
 - `@folder:crates/jcode-app-core`
-- `@session:jcode_01J...`
+- `@session:jcode/jcode_01J...`
 
 The parser must also accept a UI-created mention token whose display label is shorter than its canonical value. The canonical value, not the display label, is what is persisted and resolved.
 
@@ -95,6 +95,8 @@ Every resolved mention has:
 - bounded preview metadata
 
 For files and folders, the canonical identifier is a normalized path relative to the session working directory when safely possible, plus the resolved root identity needed to prevent working-directory drift. Absolute paths are displayed only when necessary and are subject to redaction settings.
+
+For sessions, canonical identity is a stable `{source, source_id}` pair. A mutable locator such as a snapshot path, JSONL path, or provider-specific resume path is never the identity and is stored only in provenance. This prevents imported-session IDs from changing when stores are moved or reindexed.
 
 ## 5. Discovery and autocomplete
 
@@ -143,6 +145,8 @@ Every mention resolves to exactly one state:
 - **oversize:** entity exists but exceeds configured limits and cannot be reduced under the selected policy.
 
 The resolver must never silently fall back from a failed canonical reference to a similarly named candidate.
+
+Later entity kinds may expose a separate compatibility result rather than overloading resolution status. For sessions, the resolver must report whether the record is native, imported read-only, archive-only, continuation-capable, or unavailable. Compatibility is informational and actionable; it never authorizes access by itself.
 
 ### 6.2 File resolution
 
@@ -277,6 +281,8 @@ For every mention attachment, record:
 
 Do not store full file contents in provenance when the transcript can be replayed by re-resolving the entity. If reproducible replay requires content snapshots, that must be a separate opt-in decision.
 
+For sessions, store `{source, source_id}` as the canonical reference and retain any mutable locator/path only as provenance. The locator is evidence about where the resolver found the record, not a portable identity.
+
 ### 11.2 User-visible transcript
 
 The user message remains readable as typed:
@@ -302,9 +308,17 @@ Selecting the row opens the same metadata/provenance preview. It must distinguis
 
 Exports and replay should preserve the literal mention plus structured attachment metadata. They must not make a stale historical resolution appear current.
 
-### 11.3 Model-visible transcript
+### 11.3 Structured mention sidecars
+
+Mention metadata should be represented as an optional structured sidecar on the request/message model, including `Request` and persisted `StoredMessage` where those types own turn history. It must not be encoded as a provider-visible `ContentBlock` and must not rely on the generic external-text extraction path.
+
+The sidecar carries the literal source span, canonical identity, resolution/compatibility status, provenance, preview summary, and byte/token accounting. Provider adapters may derive a bounded, clearly delimited attachment from the sidecar at request-build time, but the sidecar itself remains available for transcript rendering, persistence, replay, and compaction.
+
+### 11.4 Model-visible transcript
 
 The model-facing message contains a clearly labeled context attachment, not a hidden mutation of the user's text. The attachment is stable enough for providers and compaction to preserve, but compact enough that transcript rendering does not duplicate the full payload.
+
+For `@session`, model-visible expansion is metadata-first and bounded. It never implicitly resumes the referenced session, injects its full history, or invokes generic external-text extraction that could recursively surface encrypted reasoning or signatures. A user must explicitly choose an archive preview or a continuation-oriented preview when both are supported.
 
 ## 12. Entity roadmap and boundaries
 
@@ -320,10 +334,12 @@ The model-facing message contains a clearly labeled context attachment, not a hi
 ### Stage 2: `@session`
 
 - Jcode sessions first, then imported Pi/OpenCode/Codex/Cursor sources where compatibility exists.
-- Source-qualified canonical IDs to prevent collisions.
+- Canonical identity is the source-qualified `{source, source_id}` pair. Mutable snapshot/store locators are provenance only. For example, Pi's current path-shaped resume target must not become the portable mention ID.
 - Metadata-first preview: title/short name, status, provider/model, working directory, timestamps, and bounded excerpts.
+- Resolver exposes compatibility state and an explicit archive-vs-continuation choice when the source supports both. Imported records may be archive-only or read-only.
 - Read-only access governed by session visibility and ownership.
 - External-store unavailable state is explicit; no fallback to same-name sessions.
+- No implicit resume, no full-history injection, and no generic external-text extraction for mention expansion. Any provider/source-specific excerpt path must be deliberately bounded and must exclude encrypted reasoning/signatures.
 
 ### Stage 3: `@task`, `@initiative`
 
@@ -350,6 +366,8 @@ The model-facing message contains a clearly labeled context attachment, not a hi
 - No unbounded recursive folder dump or “attach the whole repository” button.
 - No implicit network fetching for URLs.
 - No automatic cross-session transcript injection.
+- No implicit session resume, continuation, or full-history expansion from an `@session` mention.
+- No use of generic external-text extraction for session mention expansion when it can recursively surface encrypted reasoning or signatures.
 - No mutation, command execution, task control, peer messaging, or initiative updates through mentions.
 - No user-facing requirement that every plain `@word` becomes a mention.
 - No provider-specific mention syntax.
@@ -387,13 +405,16 @@ The model-facing message contains a clearly labeled context attachment, not a hi
 18. Existing transcript exports remain readable and retain the literal prompt text.
 19. Structured mention metadata survives session save/reload and is not duplicated as full payload on every render.
 20. Context compaction and replay preserve attachment boundaries, status, and provenance, or explicitly mark unavailable historical payloads.
-21. The contract leaves room for source-qualified `@session` IDs and later entity kinds without a breaking syntax change.
+21. Mention metadata is persisted as an optional structured sidecar on request/message records, including `StoredMessage`, and is not represented as a provider-visible `ContentBlock`.
+22. `@session` uses a source-qualified canonical identity separate from mutable locators, reports compatibility state, and requires an explicit archive-vs-continuation choice where applicable.
+23. `@session` never implicitly resumes, injects full history, or uses generic external-text extraction that can surface encrypted reasoning/signatures.
+24. The contract leaves room for source-qualified `@session` IDs and later entity kinds without a breaking syntax change.
 
 ### Quality targets
 
-22. Warm autocomplete suggestions appear within 100 ms and do not block typing during cold scans.
-23. Resolution and preview are deterministic for the same filesystem snapshot and policy.
-24. Unit, integration, and manual UI coverage exercise at least one happy path and every resolver failure state.
+25. Warm autocomplete suggestions appear within 100 ms and do not block typing during cold scans.
+26. Resolution and preview are deterministic for the same filesystem snapshot and policy.
+27. Unit, integration, and manual UI coverage exercise at least one happy path and every resolver failure state.
 
 ## 15. Staged milestones
 
@@ -427,7 +448,7 @@ The model-facing message contains a clearly labeled context attachment, not a hi
 - Render compact transcript attachment rows and expose provenance/details.
 - Verify compaction, export, replay, and reload behavior.
 
-**Exit:** acceptance criteria 1–10 and 17–20 pass in TUI/desktop surfaces that support the composer.
+**Exit:** acceptance criteria 1–10 and 17–23 pass in TUI/desktop surfaces that support the composer.
 
 ### Milestone 4: Hardening and rollout
 
@@ -452,7 +473,8 @@ Ship one kind at a time behind the same resolver/preview/transcript contract: se
 | Index is stale during editing | Surprising previews or missing context | Submit-time revalidation, metadata fingerprint, changed-since-discovery notice |
 | File content contains prompt injection | Model follows untrusted file instructions | Delimited attachment, provenance, system/developer instruction precedence, security tests |
 | Transcript duplicates large payloads | Storage/UI/memory growth | Persist references and bounded metadata, not repeated full payloads; preserve snapshots only by explicit decision |
-| Imported sessions have incompatible identity/storage | Broken later `@session` references | Source-qualified IDs, explicit unavailable state, read-only previews, bridge compatibility tests |
+| Imported sessions have incompatible identity/storage | Broken later `@session` references or unsafe continuation | Source-qualified `{source, source_id}` identity, locator-only provenance, explicit compatibility/archive-vs-continuation state, read-only previews, bridge compatibility tests |
+| Session expansion surfaces encrypted reasoning/signatures | Sensitive or unusable context reaches the model | Structured mention sidecars, deliberate bounded source adapters, no generic external-text extraction, no implicit full-history injection |
 | Peer names and task titles collide | Wrong coordination context | Canonical IDs plus display labels, ownership/visibility checks, observed-at timestamps |
 | URL fetching expands attack surface | SSRF, large payload, prompt injection | Defer URLs, explicit fetch, redirect/content-type/size controls, isolation and permissions |
 | Mention syntax harms ordinary prose/code | Compatibility regressions | Require namespaced kind syntax or explicit autocomplete selection; ignore code spans and escaped `@` |
@@ -466,10 +488,11 @@ Ship one kind at a time behind the same resolver/preview/transcript contract: se
 4. Whether to persist only metadata/fingerprints or optional content snapshots for reproducible replay.
 5. The canonical attachment serialization shared by TUI, desktop, remote sessions, and providers.
 6. Whether the UI stores a structured token in the composer or reparses source text on submit.
-7. Which imported session stores are available for Stage 2 and how their source-qualified IDs map to existing session search.
+7. Which imported session stores are available for Stage 2 and how their source-qualified `{source, source_id}` identities map to existing session search, including Pi's header ID versus path-shaped resume locator and archive-only versus continuation-capable records.
 8. Whether `@initiative` is an alias for the existing `Goal` domain type or a compatibility layer over it.
 9. Whether URL entities are fetched by the resolver or by an explicit user-approved tool action.
-10. Which transcript surfaces ship in Milestone 3 and how compact attachment rows behave in narrow TUI layouts.
+10. Which request/message types own the optional mention sidecar and how provider adapters derive attachments without exposing the sidecar as a `ContentBlock`.
+11. Which transcript surfaces ship in Milestone 3 and how compact attachment rows behave in narrow TUI layouts.
 
 ## 18. Definition of done for this scope
 
