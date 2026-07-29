@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use jcode_tasker_pi::{
-    BatchOperation, ClaimTaskInput, CreateFeature, CreateTask, NextWorkUnitInput, PiTaskerStore,
-    PlanTask, ProjectPartition, ReleaseClaimInput, ResolveFeatureGate, Task, UpdateFeature,
-    UpdateTask, WorkContextInput,
+    BatchOperation, ClaimTaskInput, CreateFeature, CreateTask, FeaturePlanFeature,
+    FeaturePlanInput, NextWorkUnitInput, PiTaskerStore, PlanTask, ProjectPartition,
+    ReleaseClaimInput, ResolveFeatureGate, Task, UpdateFeature, UpdateTask, WorkContextInput,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -111,6 +111,8 @@ struct TaskerInput {
     resolved_by: Option<String>,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    feature: Option<FeaturePlanFeature>,
 }
 
 fn required<T>(value: Option<T>, field: &'static str, action: &str) -> Result<T> {
@@ -246,7 +248,7 @@ impl Tool for TaskerTool {
                     "enum": [
                         "status", "ready", "show", "create_feature", "create", "add_dependency", "set_state",
                         "list", "search", "update", "add_note", "feature_list", "feature_update", "feature_status",
-                        "link", "unlink", "batch", "plan", "claim", "release", "working_set", "next_work_unit", "feature_gate"
+                        "link", "unlink", "batch", "plan", "feature_plan", "claim", "release", "working_set", "next_work_unit", "feature_gate"
                     ]
                 },
                 "title": {"type": "string"},
@@ -318,7 +320,55 @@ impl Tool for TaskerTool {
                 "gate_status": {"type": "string", "enum": ["pending", "passed", "failed"]},
                 "resolved_by": {"type": "string"},
                 "note": {"type": "string", "description": "Gate resolution note. Automated resolver evidence is retained separately by the store adapter."},
+                "feature": {
+                    "type": "object",
+                    "description": "Root of an atomic Pi-compatible feature plan.",
+                    "required": ["key", "title"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "key": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "brief": {"type": "string"},
+                        "acceptance": {"type": "array", "items": {"type": "object", "required": ["criterion"], "additionalProperties": false, "properties": {"criterion": {"type": "string"}, "met": {"type": "boolean"}}}},
+                        "owner": {"type": "string"},
+                        "gates": {"type": "array", "items": {"type": "object"}},
+                        "indexes": {"type": "array", "items": {}},
+                        "notes": {"type": "array", "items": {"type": "object", "required": ["content"], "additionalProperties": false, "properties": {"content": {"type": "string"}, "category": {"type": "string"}}}},
+                        "children": {"type": "array", "items": {"$ref": "#/$defs/featurePlanChild"}},
+                        "tasks": {"type": "array", "items": {"$ref": "#/$defs/featurePlanTask"}}
+                    }
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum records returned by bounded list, search, and status projections."}
+            },
+            "$defs": {
+                "featurePlanTask": {
+                    "type": "object",
+                    "required": ["key", "title"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "key": {"type": "string"}, "title": {"type": "string"}, "description": {"type": "string"},
+                        "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done"]},
+                        "after": {"type": "array", "items": {"type": "string"}},
+                        "notes": {"type": "array", "items": {"type": "object", "required": ["content"], "additionalProperties": false, "properties": {"content": {"type": "string"}, "category": {"type": "string"}}}},
+                        "indexes": {"type": ["array", "object"]}
+                    }
+                },
+                "featurePlanChild": {
+                    "type": "object",
+                    "required": ["key", "title"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "key": {"type": "string"}, "title": {"type": "string"}, "description": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "gates": {"type": "array", "items": {"type": "object"}},
+                        "children": {"type": "array", "items": {"$ref": "#/$defs/featurePlanChild"}},
+                        "tasks": {"type": "array", "items": {"$ref": "#/$defs/featurePlanTask"}}
+                    }
+                }
             }
         })
     }
@@ -539,6 +589,17 @@ impl Tool for TaskerTool {
                             result.task_count, result.dependency_count
                         ),
                         with_base(json!({"plan": result})),
+                    )
+                }
+                "feature_plan" => {
+                    let feature = required(params.feature, "feature", "feature_plan")?;
+                    let result = store.feature_plan_import(FeaturePlanInput { feature })?;
+                    output(
+                        format!(
+                            "Feature plan: {} features, {} tasks, {} dependencies",
+                            result.feature_count, result.task_count, result.dependency_count
+                        ),
+                        with_base(json!({"feature_plan": result})),
                     )
                 }
                 "claim" => {
@@ -959,6 +1020,7 @@ mod tests {
             "unlink",
             "batch",
             "plan",
+            "feature_plan",
             "claim",
             "release",
             "working_set",
@@ -1364,5 +1426,81 @@ mod tests {
             )
             .await;
         assert!(invalid.is_err());
+    }
+
+    #[tokio::test]
+    async fn imports_atomic_feature_plans_through_the_public_tool() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (_database_dir, tool) = temp_tool();
+        let ctx = context(workspace.path());
+
+        let imported = tool
+            .execute(
+                json!({
+                    "action": "feature_plan",
+                    "feature": {
+                        "key": "root",
+                        "title": "Migration program",
+                        "brief": "Retire Pi after measured parity",
+                        "acceptance": [{"criterion": "Canonical writes verified"}],
+                        "notes": [{"category": "context", "content": "atomic feature plan"}],
+                        "gates": [{"label": "Operator approval"}],
+                        "children": [{
+                            "key": "bridge",
+                            "title": "Compatibility bridge",
+                            "tasks": [{"key": "ground", "title": "Ground Pi semantics", "state": "done"}]
+                        }],
+                        "tasks": [{"key": "port", "title": "Port behavior", "after": ["ground"]}]
+                    }
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("import feature plan")
+            .metadata
+            .expect("feature plan metadata");
+        assert_eq!(imported["feature_plan"]["featureCount"], 2);
+        assert_eq!(imported["feature_plan"]["taskCount"], 2);
+        assert_eq!(imported["feature_plan"]["dependencyCount"], 1);
+        assert_eq!(
+            imported["feature_plan"]["feature"]["brief"],
+            "Retire Pi after measured parity"
+        );
+        assert_eq!(
+            imported["feature_plan"]["feature"]["gates"][0]["status"],
+            "pending"
+        );
+
+        let before = tool
+            .execute(json!({"action": "status"}), ctx.clone())
+            .await
+            .expect("status before duplicate")
+            .metadata
+            .expect("before metadata");
+        let duplicate = tool
+            .execute(
+                json!({
+                    "action": "feature_plan",
+                    "feature": {
+                        "key": "duplicate",
+                        "title": "Must roll back",
+                        "tasks": [
+                            {"key": "same", "title": "One"},
+                            {"key": "same", "title": "Two"}
+                        ]
+                    }
+                }),
+                ctx.clone(),
+            )
+            .await;
+        assert!(duplicate.is_err());
+        let after = tool
+            .execute(json!({"action": "status"}), ctx)
+            .await
+            .expect("status after duplicate")
+            .metadata
+            .expect("after metadata");
+        assert_eq!(before["counts"]["features"], after["counts"]["features"]);
+        assert_eq!(before["counts"]["tasks"], after["counts"]["tasks"]);
     }
 }
