@@ -309,7 +309,12 @@ impl PiTaskerStore {
             return Ok(meta);
         }
         let now = now_ms();
-        self.conn.execute("INSERT INTO task_lists (list_id, project_root, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![self.partition.list_id, self.partition.project_root, self.partition.project_root, now, now])?;
+        let name = Path::new(&self.partition.project_root)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&self.partition.project_root);
+        self.conn.execute("INSERT INTO task_lists (list_id, project_root, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![self.partition.list_id, self.partition.project_root, name, now, now])?;
         Ok(self.list_meta()?.expect("inserted list meta"))
     }
 
@@ -501,6 +506,16 @@ impl PiTaskerStore {
         }
         task.updated_at = now_ms();
         tx.execute("UPDATE tasks SET title=?1,description=?2,state=?3,feature_id=?4,indexes=?5,updated_at=?6 WHERE id=?7 AND list_id=?8 AND project_root=?9", params![task.title, task.description, task.state, task.feature_id, serde_json::to_string(&task.indexes)?, task.updated_at, task.id, self.partition.list_id, self.partition.project_root])?;
+        if task.state == "done" {
+            tx.execute(
+                "UPDATE work_units SET status='done', completed_at=?1 WHERE task_id=?2 AND list_id=?3 AND project_root=?4 AND status IN ('queued','active')",
+                params![task.updated_at, task.id, self.partition.list_id, self.partition.project_root],
+            )?;
+            tx.execute(
+                "UPDATE task_claims SET released_at=?1, release_reason='task_done' WHERE task_id=?2 AND list_id=?3 AND project_root=?4 AND released_at IS NULL",
+                params![task.updated_at, task.id, self.partition.list_id, self.partition.project_root],
+            )?;
+        }
         tx.commit()?;
         Ok(task)
     }
@@ -938,6 +953,88 @@ const REQUIRED: &[(&str, &[&str])] = &[
             "created_at",
         ],
     ),
+    (
+        "tasker_session_instances",
+        &[
+            "id",
+            "list_id",
+            "project_root",
+            "agent_id",
+            "session_id",
+            "session_file",
+            "pid",
+            "model",
+            "leaf_id_at_start",
+            "current_leaf_id",
+            "started_at",
+            "last_seen_at",
+            "ended_at",
+        ],
+    ),
+    (
+        "task_claims",
+        &[
+            "id",
+            "task_id",
+            "scope_feature_id",
+            "list_id",
+            "project_root",
+            "agent_id",
+            "session_id",
+            "session_file",
+            "session_instance_id",
+            "pid",
+            "claim_kind",
+            "reason",
+            "claimed_at",
+            "expires_at",
+            "released_at",
+            "release_reason",
+        ],
+    ),
+    (
+        "work_units",
+        &[
+            "id",
+            "task_id",
+            "claim_id",
+            "scope_feature_id",
+            "list_id",
+            "project_root",
+            "agent_id",
+            "session_id",
+            "session_file",
+            "session_instance_id",
+            "status",
+            "priority",
+            "note",
+            "created_at",
+            "dispatched_at",
+            "completed_at",
+            "cancelled_at",
+        ],
+    ),
+    (
+        "visual_artifacts",
+        &[
+            "id",
+            "list_id",
+            "project_root",
+            "task_id",
+            "feature_id",
+            "work_unit_id",
+            "stage",
+            "kind",
+            "title",
+            "summary",
+            "path",
+            "mime_type",
+            "metadata",
+            "created_by",
+            "created_at",
+            "updated_at",
+        ],
+    ),
 ];
 
 pub fn preflight(conn: &Connection) -> Result<()> {
@@ -1000,6 +1097,10 @@ mod tests {
         CREATE TABLE features (id TEXT PRIMARY KEY, list_id TEXT NOT NULL, project_root TEXT NOT NULL, display_id INTEGER NOT NULL, parent_feature_id TEXT, title TEXT NOT NULL, description TEXT, state TEXT NOT NULL DEFAULT 'open', priority TEXT DEFAULT 'medium', tags TEXT DEFAULT '[]', brief TEXT, acceptance TEXT DEFAULT '[]', owner TEXT, gates TEXT DEFAULT '[]', indexes TEXT DEFAULT '[]', depth INTEGER DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
         CREATE TABLE feature_dependencies (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, depends_on TEXT NOT NULL, list_id TEXT NOT NULL, project_root TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE feature_notes (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, list_id TEXT NOT NULL, project_root TEXT NOT NULL, category TEXT, content TEXT NOT NULL, created_at INTEGER NOT NULL);
+        CREATE TABLE tasker_session_instances (id TEXT PRIMARY KEY, list_id TEXT NOT NULL, project_root TEXT NOT NULL, agent_id TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT, pid INTEGER NOT NULL, model TEXT, leaf_id_at_start TEXT, current_leaf_id TEXT, started_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, ended_at INTEGER);
+        CREATE TABLE task_claims (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, list_id TEXT NOT NULL, project_root TEXT NOT NULL, agent_id TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT, session_instance_id TEXT NOT NULL, pid INTEGER NOT NULL, claim_kind TEXT NOT NULL, reason TEXT, claimed_at INTEGER NOT NULL, expires_at INTEGER, released_at INTEGER, release_reason TEXT, scope_feature_id TEXT);
+        CREATE TABLE work_units (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, claim_id TEXT, list_id TEXT NOT NULL, project_root TEXT NOT NULL, agent_id TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT, session_instance_id TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, note TEXT, created_at INTEGER NOT NULL, dispatched_at INTEGER, completed_at INTEGER, cancelled_at INTEGER, scope_feature_id TEXT);
+        CREATE TABLE visual_artifacts (id TEXT PRIMARY KEY, list_id TEXT NOT NULL, project_root TEXT NOT NULL, task_id TEXT, feature_id TEXT, work_unit_id TEXT, stage TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, path TEXT NOT NULL, mime_type TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}', created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
         "#)
     }
 
@@ -1041,6 +1142,7 @@ mod tests {
     #[test]
     fn creates_updates_snapshots_and_preserves_json() {
         let mut store = temp_store();
+        assert_eq!(store.ensure_list_meta().unwrap().name, "root");
         let f = store
             .create_feature(CreateFeature {
                 tags: serde_json::json!(["ui"]),
@@ -1086,6 +1188,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(updated.state, "in_progress");
+        store
+            .conn
+            .execute(
+                "INSERT INTO task_claims (id,task_id,list_id,project_root,agent_id,session_id,session_instance_id,pid,claim_kind,claimed_at) VALUES ('claim_test',?1,?2,?3,'agent','session','instance',1,'claim',1)",
+                params![t2.id, store.partition.list_id, store.partition.project_root],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO work_units (id,task_id,list_id,project_root,agent_id,session_id,session_instance_id,status,created_at) VALUES ('wu_test',?1,?2,?3,'agent','session','instance','active',1)",
+                params![t2.id, store.partition.list_id, store.partition.project_root],
+            )
+            .unwrap();
+        store
+            .update_task(
+                &t2.id,
+                UpdateTask {
+                    state: Some("done".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let claim_release: (Option<i64>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT released_at,release_reason FROM task_claims WHERE id='claim_test'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(claim_release.0.is_some());
+        assert_eq!(claim_release.1.as_deref(), Some("task_done"));
+        let work_unit: (String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT status,completed_at FROM work_units WHERE id='wu_test'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(work_unit.0, "done");
+        assert!(work_unit.1.is_some());
         let snap = store.snapshot().unwrap();
         assert_eq!(snap.tasks.len(), 2);
         assert_eq!(snap.features[0].tags, serde_json::json!(["ui"]));
