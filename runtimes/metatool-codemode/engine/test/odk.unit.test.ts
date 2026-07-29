@@ -379,7 +379,7 @@ describe("ODK: inspect", () => {
     expect(r.id).toBe("metatool")
     expect(r.contract.valid).toBe(true)
     expect(r.conformance.level).toBeGreaterThanOrEqual(1)
-    expect(r.methods.length).toBe(21)
+    expect(r.methods.length).toBe(24)
     expect(r.guideSections.length).toBeGreaterThan(0)
   })
 })

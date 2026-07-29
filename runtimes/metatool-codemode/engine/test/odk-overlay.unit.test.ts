@@ -67,11 +67,11 @@ describe("ODK overlay: methods", () => {
 
   it("compare detects 0 collisions between odk and metatool", () => {
     const r = odkmethods.compare(odkov, metatool)
-    // Both have 'odk' namespace, metatool has 21 domain methods
+    // Both have 'odk' namespace, metatool has 24 domain methods (21 + 3 journal)
     // ODK has 1 method (odk), metatool has 21 — 0 shared
     expect(r.shared.length).toBe(0)
     expect(r.onlyInA.length).toBe(1)
-    expect(r.onlyInB.length).toBe(21)
+    expect(r.onlyInB.length).toBe(24)
     expect(r.collisionRisk).toBe("none")
   })
 
@@ -196,9 +196,9 @@ describe("ODK: metatool dogfood", () => {
     expect(r.level).toBeGreaterThanOrEqual(1)
   })
 
-  it("metatool has 21 inspectable methods", () => {
+  it("metatool has 24 inspectable methods", () => {
     const r = inspect(metatool)
-    expect(r.methods.length).toBe(21)
+    expect(r.methods.length).toBe(24)
     for (const m of r.methods) {
       expect(m.type).toBe("function")
     }

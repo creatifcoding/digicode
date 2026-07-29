@@ -28,9 +28,9 @@ describe('metatoolPlugin', () => {
     expect(plugin.name).toBe('Skill Governance')
   })
 
-  it('exposes 21 domain methods', () => {
+  it('exposes 24 domain methods', () => {
     const methods = Object.keys(plugin.methods)
-    expect(methods).toHaveLength(21)
+    expect(methods).toHaveLength(24)
   })
 
   it('includes all discovery methods', () => {
