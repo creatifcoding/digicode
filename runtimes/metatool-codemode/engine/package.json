@@ -1,0 +1,120 @@
+{
+  "name": "@jcode/metatool-engine",
+  "version": "0.0.1",
+  "description": "Jcode first-party fork of @tmnl/metatool - codemode engine (persistent knowledge, procedures, overlays, eval sandbox)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./store": {
+      "import": "./dist/store/index.js",
+      "types": "./dist/store/index.d.ts"
+    },
+    "./overlay": {
+      "import": "./dist/overlay.js",
+      "types": "./dist/overlay.d.ts"
+    },
+    "./plugin": {
+      "import": "./dist/plugin.js",
+      "types": "./dist/plugin.d.ts"
+    },
+    "./manifest": {
+      "import": "./dist/manifest.js",
+      "types": "./dist/manifest.d.ts"
+    },
+    "./manifest-sections": {
+      "import": "./dist/manifest-sections.js",
+      "types": "./dist/manifest-sections.d.ts"
+    },
+    "./history": {
+      "import": "./dist/history.js",
+      "types": "./dist/history.d.ts"
+    },
+    "./llm-bridge": {
+      "import": "./dist/llm-bridge.js",
+      "types": "./dist/llm-bridge.d.ts"
+    },
+    "./host": {
+      "import": "./dist/host.js",
+      "types": "./dist/host.d.ts"
+    },
+    "./primitives": {
+      "import": "./dist/primitives/types.js",
+      "types": "./dist/primitives/types.d.ts"
+    },
+    "./runtime": {
+      "import": "./dist/services/MetatoolRuntime.js",
+      "types": "./dist/services/MetatoolRuntime.d.ts"
+    },
+    "./schemas/runtime": {
+      "import": "./dist/schemas/runtime.js",
+      "types": "./dist/schemas/runtime.d.ts"
+    },
+    "./adapters/sqlite-node": {
+      "import": "./dist/adapters/sqlite-node.js",
+      "types": "./dist/adapters/sqlite-node.d.ts"
+    },
+    "./adapters/sqlite-bun": {
+      "import": "./dist/adapters/sqlite-bun.js",
+      "types": "./dist/adapters/sqlite-bun.d.ts"
+    },
+    "./adapters/filesystem-node": {
+      "import": "./dist/adapters/filesystem-node.js",
+      "types": "./dist/adapters/filesystem-node.d.ts"
+    },
+    "./plugins/metatool": {
+      "import": "./dist/plugins/metatool.js",
+      "types": "./dist/plugins/metatool.d.ts"
+    },
+    "./plugins/metatool-api": {
+      "import": "./dist/plugins/metatool-api.js",
+      "types": "./dist/plugins/metatool-api.d.ts"
+    },
+    "./api-surface": {
+      "import": "./dist/api-surface.js",
+      "types": "./dist/api-surface.d.ts"
+    },
+    "./plugins/odk": {
+      "import": "./dist/plugins/odk/index.js",
+      "types": "./dist/plugins/odk/index.d.ts"
+    },
+    "./plugins": {
+      "import": "./dist/plugins/index.js",
+      "types": "./dist/plugins/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:ci": "vitest run --reporter=junit --outputFile=reports/junit.xml",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist reports",
+    "prepublishOnly": "bun run clean && bun run build"
+  },
+  "dependencies": {
+    "effect": "4.0.0-beta.93",
+    "flexsearch": "0.8.212"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT",
+  "author": "GBG",
+  "keywords": [
+    "effect-ts",
+    "effect-smol",
+    "metatool"
+  ]
+}

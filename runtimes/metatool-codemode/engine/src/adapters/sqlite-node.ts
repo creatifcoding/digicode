@@ -1,0 +1,158 @@
+/**
+ * @module sqlite-node
+ *
+ * Effect v4 SqlClient adapter for Node 24's built-in `node:sqlite` module.
+ * Mirrors @effect/sql-sqlite-bun but targets DatabaseSync.
+ *
+ * Why:
+ * - @effect/sql-sqlite-node uses better-sqlite3 → won't compile under Node 24
+ * - Node 24 ships native `node:sqlite` with DatabaseSync (synchronous API)
+ * - Same sync semantics → clean 1:1 adapter
+ *
+ * Known workaround: Reactivity.layer from the npm alias has a build issue.
+ * We provide a no-op Reactivity implementation since RLM doesn't use
+ * reactive SQL queries.
+ */
+import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+import * as Context from "effect/Context"
+import * as Scope from "effect/Scope"
+import * as Semaphore from "effect/Semaphore"
+import * as Stream from "effect/Stream"
+import * as Fiber from "effect/Fiber"
+import { SqlClient, make as makeSqlClient } from "effect/unstable/sql/SqlClient"
+import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError"
+import * as Statement from "effect/unstable/sql/Statement"
+import { Reactivity } from "effect/unstable/reactivity/Reactivity"
+import { DatabaseSync } from "node:sqlite"
+
+// ── Connection type (mirrors v4's SqlConnection) ─────────────────
+
+type SqlParam = string | number | bigint | null | Uint8Array
+type Connection = {
+  execute: (sql: string, params: ReadonlyArray<unknown>, transformRows: any) => Effect.Effect<ReadonlyArray<any>, SqlError>
+  executeRaw: (sql: string, params: ReadonlyArray<unknown>) => Effect.Effect<unknown, SqlError>
+  executeValues: (sql: string, params: ReadonlyArray<unknown>) => Effect.Effect<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>
+  executeUnprepared: (sql: string, params: ReadonlyArray<unknown>, transformRows: any) => Effect.Effect<ReadonlyArray<any>, SqlError>
+  executeValuesUnprepared: (sql: string, params: ReadonlyArray<unknown>) => Effect.Effect<ReadonlyArray<ReadonlyArray<unknown>>, SqlError>
+  executeStream: (sql: string, params: ReadonlyArray<unknown>, transformRows: any) => Stream.Stream<any, SqlError>
+}
+
+// ── Config ───────────────────────────────────────────────────────
+
+export interface SqliteNodeConfig {
+  readonly filename: string
+  readonly readonly?: boolean
+  readonly disableWAL?: boolean
+  readonly transformResultNames?: ((str: string) => string)
+  readonly transformQueryNames?: ((str: string) => string)
+}
+
+// ── No-op Reactivity (Reactivity.layer has npm alias build issue) ─
+
+const ReactivityNoop = Layer.effect(Reactivity)(
+  Effect.sync(() =>
+    Reactivity.of({
+      invalidateUnsafe: () => {},
+      registerUnsafe: () => () => {},
+      invalidate: () => Effect.void,
+      mutation: (_keys: any, effect: any) => effect,
+      query: () => Effect.die("Reactivity not available in RLM store") as any,
+      stream: () => { throw new Error("Reactivity not available in RLM store") },
+      withBatch: (effect: any) => effect,
+    })
+  )
+)
+
+// ── Layer factory ────────────────────────────────────────────────
+
+/**
+ * Create a SqlClient layer backed by Node 24's `node:sqlite`.
+ * Provides both the abstract `SqlClient` and concrete connection.
+ */
+export const layer = (config: SqliteNodeConfig): Layer.Layer<SqlClient> => {
+  const makeClient = Effect.gen(function*() {
+    const compiler = Statement.makeCompilerSqlite(config.transformQueryNames)
+    const transformRows = config.transformResultNames
+      ? Statement.defaultTransforms(config.transformResultNames).array
+      : undefined
+
+    const db = new DatabaseSync(config.filename, {
+      readOnly: config.readonly ?? false,
+    } as any)
+    yield* Effect.addFinalizer(() => Effect.sync(() => db.close()))
+
+    if (config.disableWAL !== true) {
+      db.exec("PRAGMA journal_mode = WAL")
+    }
+
+    const run = (sql: string, params: ReadonlyArray<unknown> = []) =>
+      Effect.try({
+        try: () => {
+          const stmt = db.prepare(sql)
+          try {
+            const sqlParams = params.map((param) => typeof param === "boolean" ? Number(param) : param) as ReadonlyArray<SqlParam>
+            return stmt.all(...sqlParams) as Array<any>
+          } catch {
+            const sqlParams = params.map((param) => typeof param === "boolean" ? Number(param) : param) as ReadonlyArray<SqlParam>
+            stmt.run(...sqlParams)
+            return []
+          }
+        },
+        catch: (cause: unknown) => new SqlError({ reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: sql }) }),
+      })
+
+    const connection: Connection = {
+      execute(sql, params, transformRows) {
+        return transformRows
+          ? Effect.map(run(sql, params), transformRows)
+          : run(sql, params)
+      },
+      executeRaw(sql, params) {
+        return run(sql, params)
+      },
+      executeValues(sql, params) {
+        return Effect.map(run(sql, params), (rows: any[]) =>
+          rows.map((r: any) => Object.values(r))
+        )
+      },
+      executeValuesUnprepared(sql, params) {
+        return this.executeValues(sql, params ?? [])
+      },
+      executeUnprepared(sql, params, transformRows) {
+        return this.execute(sql, params ?? [], transformRows)
+      },
+      executeStream() {
+        return Stream.die("executeStream not implemented for node:sqlite") as any
+      },
+    }
+
+    const semaphore = yield* Semaphore.make(1)
+    const acquirer = Effect.acquireRelease(Effect.succeed(connection), () => Effect.void) as import("effect/unstable/sql/SqlConnection").Acquirer
+    const transactionAcquirer = Effect.uninterruptibleMask((restore: any) => {
+      const fiber = Fiber.getCurrent()!
+      const scope = Context.getUnsafe(fiber.context, Scope.Scope)
+      return Effect.as(
+        Effect.tap(
+          restore(semaphore.take(1)),
+          () => Scope.addFinalizer(scope, semaphore.release(1))
+        ),
+        connection
+      )
+    }) as import("effect/unstable/sql/SqlConnection").Acquirer
+
+    return yield* makeSqlClient({
+      acquirer,
+      compiler,
+      transactionAcquirer,
+      spanAttributes: [["db.system.name", "sqlite"]],
+      transformRows,
+    })
+  })
+
+  return Layer.effectContext(
+    Effect.map(makeClient, (client: any) =>
+      Context.make(SqlClient, client)
+    )
+  ).pipe(Layer.provide(ReactivityNoop))
+}

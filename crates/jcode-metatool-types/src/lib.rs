@@ -104,11 +104,14 @@ pub struct ExecutionLimits {
 
 impl Default for ExecutionLimits {
     fn default() -> Self {
+        // Codemode budgets: the in-guest engine boot alone measures ~4-5s
+        // (AgentOS VM + Effect store graph + SQLite migrations), so these
+        // are engine-inclusive budgets, not raw script budgets.
         Self {
-            cpu_time_ms: 250,
-            wall_time_ms: 5_000,
-            heap_mb: 32,
-            max_output_bytes: 64 * 1024,
+            cpu_time_ms: 30_000,
+            wall_time_ms: 60_000,
+            heap_mb: 256,
+            max_output_bytes: 256 * 1024,
         }
     }
 }
@@ -120,6 +123,10 @@ pub struct ExecutionRequest {
     pub inputs: Value,
     pub profile: ExecutionProfile,
     pub limits: ExecutionLimits,
+    /// Host directory backing the durable guest store mount. Required by the
+    /// codemode sidecar; ignored by the plain evaluation sidecar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

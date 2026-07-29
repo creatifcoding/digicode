@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use jcode_metatool_runtime::{
-    AGENTOS_PACKAGE, AGENTOS_VERSION, AgentOsExecutor, AgentOsRuntimeConfig, JavaScriptExecutor,
-    SIDECAR_SOURCE,
+    AGENTOS_PACKAGE, AGENTOS_VERSION, AgentOsExecutor, AgentOsRuntimeConfig, GUEST_ENGINE_FILE,
+    JavaScriptExecutor, SIDECAR_SOURCE,
 };
 use jcode_metatool_types::{
     ExecutionId, ExecutionLimits, ExecutionProfile, ExecutionRequest, MetaToolError,
@@ -16,15 +16,58 @@ use super::{Tool, ToolContext, ToolOutput};
 
 const RUNTIME_DIR_ENV: &str = "JCODE_METATOOL_RUNTIME_DIR";
 const NODE_BINARY_ENV: &str = "JCODE_METATOOL_NODE";
-const SIDECAR_FILE: &str = "jcode-agentos-sidecar.mjs";
+const SIDECAR_FILE: &str = "jcode-codemode-sidecar.mjs";
+const GUEST_ENGINE_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../jcode-metatool-runtime/assets/guest-engine.mjs"
+));
 const MAX_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
-pub struct MetaTool;
+pub struct MetaTool {
+    store_root_override: Option<PathBuf>,
+}
 
 impl MetaTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            store_root_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_store_root(store_root: PathBuf) -> Self {
+        Self {
+            store_root_override: Some(store_root),
+        }
+    }
+
+    /// Workspace-scoped durable store directory: the guest's /data mount is
+    /// backed by this host directory write-through.
+    fn store_root(&self, ctx: &ToolContext) -> Result<PathBuf> {
+        if let Some(root) = &self.store_root_override {
+            return Ok(root.clone());
+        }
+        let workspace = ctx
+            .working_dir
+            .as_deref()
+            .ok_or_else(|| anyhow!("mt evaluate requires a session working directory"))?;
+        let canonical =
+            std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let digest = {
+            use sha2::{Digest, Sha256};
+            format!(
+                "{:x}",
+                Sha256::digest(canonical.to_string_lossy().as_bytes())
+            )
+        };
+        let name = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        Ok(crate::storage::jcode_dir()?
+            .join("metatool/stores")
+            .join(format!("{name}-{}", &digest[..12])))
     }
 
     fn runtime_dir() -> Result<PathBuf> {
@@ -91,56 +134,48 @@ impl MetaTool {
         }))
     }
 
-    fn materialize_sidecar(runtime_dir: &Path) -> Result<PathBuf> {
+    fn materialize_asset(runtime_dir: &Path, file_name: &str, source: &str) -> Result<PathBuf> {
         std::fs::create_dir_all(runtime_dir).with_context(|| {
             format!(
                 "create MetaTool runtime directory {}",
                 runtime_dir.display()
             )
         })?;
-        let path = Self::sidecar_path(runtime_dir);
-        let expected = AgentOsRuntimeConfig::expected_sidecar_sha256();
-        if path.exists() {
-            let current_matches = std::fs::read(&path)
-                .ok()
-                .map(|source| {
-                    use sha2::{Digest, Sha256};
-                    format!("{:x}", Sha256::digest(source)) == expected
-                })
-                .unwrap_or(false);
-            if !current_matches {
-                return Err(anyhow!(MetaToolError::RuntimeUnavailable {
-                    message: format!(
-                        "refusing to replace an AgentOS sidecar with an unexpected digest at {}",
-                        path.display()
-                    ),
-                }));
-            }
-        } else {
+        let path = runtime_dir.join(file_name);
+        let expected = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        };
+        let current_matches = std::fs::read(&path)
+            .ok()
+            .map(|bytes| {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(bytes)) == expected
+            })
+            .unwrap_or(false);
+        if !current_matches {
             use std::io::Write;
 
+            let temporary = runtime_dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&path)
-                .context("create MetaTool sidecar")?;
-            file.write_all(SIDECAR_SOURCE.as_bytes())
-                .context("write MetaTool sidecar")?;
-            file.sync_all().context("sync MetaTool sidecar")?;
-            let written_matches = std::fs::read(&path)
-                .ok()
-                .map(|source| {
-                    use sha2::{Digest, Sha256};
-                    format!("{:x}", Sha256::digest(source)) == expected
-                })
-                .unwrap_or(false);
-            if !written_matches {
-                return Err(anyhow!(MetaToolError::RuntimeUnavailable {
-                    message: "written AgentOS sidecar failed its integrity check".to_owned(),
-                }));
-            }
+                .open(&temporary)
+                .with_context(|| format!("create MetaTool asset {file_name}"))?;
+            file.write_all(source.as_bytes())
+                .with_context(|| format!("write MetaTool asset {file_name}"))?;
+            file.sync_all()
+                .with_context(|| format!("sync MetaTool asset {file_name}"))?;
+            drop(file);
+            std::fs::rename(&temporary, &path)
+                .with_context(|| format!("publish MetaTool asset {file_name}"))?;
         }
         Ok(path)
+    }
+
+    fn materialize_sidecar(runtime_dir: &Path) -> Result<PathBuf> {
+        Self::materialize_asset(runtime_dir, GUEST_ENGINE_FILE, GUEST_ENGINE_SOURCE)?;
+        Self::materialize_asset(runtime_dir, SIDECAR_FILE, SIDECAR_SOURCE)
     }
 
     fn executor() -> Result<AgentOsExecutor> {
@@ -215,7 +250,7 @@ impl Tool for MetaTool {
     }
 
     fn description(&self) -> &str {
-        "Execute bounded JavaScript through Jcode's experimental native MetaTool runtime. Use action=status to inspect availability. Only the pure profile is executable until the capability broker exists."
+        "Run codemode JavaScript through Jcode's native MetaTool: your code executes inside a sandboxed AgentOS runtime with a live `mt` object offering the full metatool engine (durable workspace store: mt.put/get/query/search/collections, fluent mt.from/mt.into builders, procedures, catalog). State persists across calls in a workspace-scoped store. Use action=status to inspect availability."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -229,7 +264,7 @@ impl Tool for MetaTool {
                     "enum": ["status", "evaluate"],
                     "description": "status inspects runtime availability; evaluate runs code. Defaults to evaluate when omitted."
                 },
-                "code": {"type": "string", "description": "Async JavaScript source. Required for evaluate."},
+                "code": {"type": "string", "description": "JavaScript body evaluated as an async function with the live `mt` engine object in scope. Use `return` for the final value, e.g. `await mt.put('notes', 'k', { _meta: { summary: 's' }, v: 1 }); return await mt.get('notes', 'k')`. Required for evaluate."},
                 "inputs": {
                     "type": "object",
                     "description": "Optional JSON object exposed to the guest as `inputs`."
@@ -243,7 +278,7 @@ impl Tool for MetaTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let params: MetaToolInput = serde_json::from_value(input)?;
         match params.action {
             MetaToolAction::Status => output("MetaTool runtime status", Self::status()?),
@@ -267,12 +302,14 @@ impl Tool for MetaTool {
                 if input_bytes > MAX_INPUT_BYTES {
                     return Err(anyhow!("inputs exceed the {MAX_INPUT_BYTES}-byte limit"));
                 }
+                let store_root = self.store_root(&ctx)?;
                 let request = ExecutionRequest {
                     id: ExecutionId::new(),
                     source,
                     inputs: params.inputs,
                     profile: ExecutionProfile::Pure,
                     limits: ExecutionLimits::default(),
+                    store_root: Some(store_root.to_string_lossy().into_owned()),
                 };
                 let result = Self::executor()?.execute(request).await?;
                 output(
@@ -305,7 +342,7 @@ mod tests {
     fn schema_exposes_status_evaluate_and_profiles() {
         let definition = MetaTool::new().to_definition();
         assert_eq!(definition.name, "mt");
-        assert!(definition.description.contains("pure profile"));
+        assert!(definition.description.contains("codemode"));
         assert_eq!(
             definition.input_schema["properties"]["action"]["enum"],
             json!(["status", "evaluate"])
@@ -344,23 +381,44 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a pinned AgentOS runtime via JCODE_METATOOL_RUNTIME_DIR"]
-    async fn evaluates_pure_javascript_through_public_tool_contract() {
+    async fn evaluates_codemode_with_durable_store_across_calls() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let result = MetaTool::new()
+        let store_root = tempfile::tempdir().expect("store tempdir");
+
+        let write_tool = MetaTool::with_store_root(store_root.path().to_path_buf());
+        let written = write_tool
             .execute(
                 json!({
                     "action": "evaluate",
-                    "code": "({ answer: inputs.left * inputs.right })",
-                    "inputs": {"left": 6, "right": 7},
+                    "code": "await mt.put('probe', 'first', { _meta: { summary: 'codemode probe' }, n: inputs.n }); const got = await mt.get('probe', 'first'); return { doubled: got.n * 2 };",
+                    "inputs": {"n": 21},
                     "profile": "pure"
                 }),
                 context(workspace.path()),
             )
             .await
-            .expect("evaluate pure JavaScript")
+            .expect("codemode write evaluation")
             .metadata
-            .expect("execution metadata");
-        assert_eq!(result["outcome"], "succeeded");
-        assert_eq!(result["value"]["answer"], 42);
+            .expect("write metadata");
+        assert_eq!(written["outcome"], "succeeded");
+        assert_eq!(written["value"]["doubled"], 42);
+
+        let read_tool = MetaTool::with_store_root(store_root.path().to_path_buf());
+        let read = read_tool
+            .execute(
+                json!({
+                    "action": "evaluate",
+                    "code": "const got = await mt.get('probe', 'first'); const hits = await mt.search('codemode'); return { persisted: got?.n ?? null, hits: hits.length };",
+                    "profile": "pure"
+                }),
+                context(workspace.path()),
+            )
+            .await
+            .expect("codemode read evaluation")
+            .metadata
+            .expect("read metadata");
+        assert_eq!(read["outcome"], "succeeded");
+        assert_eq!(read["value"]["persisted"], 21);
+        assert_eq!(read["value"]["hits"], 1);
     }
 }
