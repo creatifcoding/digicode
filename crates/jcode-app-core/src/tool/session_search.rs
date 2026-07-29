@@ -17,7 +17,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use jcode_import_core::{
     ExternalMessageRecord, ExternalSessionRecord, ImportCoreResult, collect_recent_files_recursive,
     load_claude_external_messages, load_codex_external_session, load_cursor_external_session,
-    load_opencode_external_session, load_pi_external_session,
+    load_omp_external_session, load_opencode_external_session, load_pi_external_session,
 };
 use jcode_session_types::{
     SessionSearchContextLine as ResultContextLine, SessionSearchQueryProfile as QueryProfile,
@@ -102,7 +102,7 @@ struct SearchInput {
     /// Restrict Jcode sessions by canary flag.
     #[serde(default)]
     canary: Option<bool>,
-    /// Restrict source: jcode, claude, codex, pi, opencode, cursor, or all.
+    /// Restrict source: jcode, claude, codex, pi, omp, opencode, cursor, or all.
     #[serde(default)]
     source: Option<String>,
     /// Include external session sources discovered by the session picker. Defaults to true.
@@ -163,6 +163,7 @@ pub fn spawn_recent_index_warmup() {
         for (source, root_relative) in [
             ("codex", ".codex/sessions"),
             ("pi", ".pi/agent/sessions"),
+            ("omp", ".omp/profiles"),
             ("cursor", ".cursor/projects"),
         ] {
             let Ok(root) = crate::storage::user_home_path(root_relative) else {
@@ -369,7 +370,7 @@ impl Tool for SessionSearchTool {
                 },
                 "source": {
                     "type": "string",
-                    "enum": ["all", "jcode", "claude", "codex", "pi", "opencode", "cursor"],
+                    "enum": ["all", "jcode", "claude", "codex", "pi", "omp", "opencode", "cursor"],
                     "description": "Restrict session source. Defaults to all available sources."
                 },
                 "include_external": {
@@ -574,11 +575,11 @@ fn normalize_source_filter(raw: Option<&str>) -> std::result::Result<Option<Stri
     let normalized = source.to_ascii_lowercase();
     match normalized.as_str() {
         "all" => Ok(None),
-        "jcode" | "claude" | "claude-code" | "codex" | "pi" | "opencode" | "cursor" => {
+        "jcode" | "claude" | "claude-code" | "codex" | "pi" | "omp" | "opencode" | "cursor" => {
             Ok(Some(normalized.replace("claude-code", "claude")))
         }
         _ => Err(format!(
-            "source must be one of all, jcode, claude, codex, pi, opencode, or cursor; received {source}."
+            "source must be one of all, jcode, claude, codex, pi, omp, opencode, or cursor; received {source}."
         )),
     }
 }
@@ -1014,6 +1015,15 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
         query,
         options,
         load_pi_external_session,
+    );
+    collect_external_jsonl_source(
+        &mut records,
+        &mut report,
+        "omp",
+        ".omp/profiles",
+        query,
+        options,
+        load_omp_external_session,
     );
     collect_opencode_external_sessions(&mut records, &mut report, options);
     collect_external_jsonl_source(
