@@ -56,9 +56,53 @@ impl TaskerStore {
             .await
     }
 
+    pub async fn resolve_feature(
+        &self,
+        project_id: ProjectId,
+        reference: impl Into<String>,
+    ) -> StoreResult<Feature> {
+        let reference = reference.into();
+        self.call(move |connection| {
+            if reference.starts_with("feat_") {
+                return feature_by_id(connection, project_id, FeatureId::from_str(&reference)?);
+            }
+            let alias = reference
+                .strip_prefix("#F")
+                .ok_or_else(|| {
+                    invalid_reference("feature", &reference, "feat_<uuid> or #F<number>")
+                })?
+                .parse::<u64>()
+                .map_err(|_| {
+                    invalid_reference("feature", &reference, "feat_<uuid> or #F<number>")
+                })?;
+            feature_by_alias(connection, project_id, alias)
+        })
+        .await
+    }
+
     pub async fn get_task(&self, project_id: ProjectId, task_id: TaskId) -> StoreResult<Task> {
         self.call(move |connection| task_by_id(connection, project_id, task_id))
             .await
+    }
+
+    pub async fn resolve_task(
+        &self,
+        project_id: ProjectId,
+        reference: impl Into<String>,
+    ) -> StoreResult<Task> {
+        let reference = reference.into();
+        self.call(move |connection| {
+            if reference.starts_with("task_") {
+                return task_by_id(connection, project_id, TaskId::from_str(&reference)?);
+            }
+            let alias = reference
+                .strip_prefix('#')
+                .ok_or_else(|| invalid_reference("task", &reference, "task_<uuid> or #<number>"))?
+                .parse::<u64>()
+                .map_err(|_| invalid_reference("task", &reference, "task_<uuid> or #<number>"))?;
+            task_by_alias(connection, project_id, alias)
+        })
+        .await
     }
 
     pub async fn project_revision(&self, project_id: ProjectId) -> StoreResult<ProjectRevision> {
@@ -214,6 +258,56 @@ fn task_by_id(
         .optional()?
         .ok_or_else(|| not_found("task", task_id))?;
     rows::task_from_row(row)
+}
+
+fn feature_by_alias(
+    connection: &Connection,
+    project_id: ProjectId,
+    alias: u64,
+) -> StoreResult<Feature> {
+    let alias = i64::try_from(alias)
+        .map_err(|_| invalid_reference("feature", &alias.to_string(), "#F<number>"))?;
+    let row = connection
+        .query_row(
+            "SELECT id, project_id, alias, parent_id, title, description, state, created_at,
+                    updated_at
+             FROM features WHERE project_id = ?1 AND alias = ?2",
+            params![project_id.to_string(), alias],
+            feature_row,
+        )
+        .optional()?
+        .ok_or_else(|| TaskerError::NotFound {
+            entity: "feature".to_string(),
+            id: format!("#F{alias}"),
+        })?;
+    rows::feature_from_row(row)
+}
+
+fn task_by_alias(connection: &Connection, project_id: ProjectId, alias: u64) -> StoreResult<Task> {
+    let alias = i64::try_from(alias)
+        .map_err(|_| invalid_reference("task", &alias.to_string(), "#<number>"))?;
+    let row = connection
+        .query_row(
+            "SELECT id, project_id, feature_id, alias, title, description, state, priority, rank,
+                    created_at, updated_at
+             FROM tasks WHERE project_id = ?1 AND alias = ?2",
+            params![project_id.to_string(), alias],
+            task_row,
+        )
+        .optional()?
+        .ok_or_else(|| TaskerError::NotFound {
+            entity: "task".to_string(),
+            id: format!("#{alias}"),
+        })?;
+    rows::task_from_row(row)
+}
+
+fn invalid_reference(entity: &str, value: &str, expected: &str) -> StoreError {
+    TaskerError::InvalidInput {
+        field: format!("{entity}_reference"),
+        message: format!("expected {expected}, received {value}"),
+    }
+    .into()
 }
 
 fn revision_by_project(

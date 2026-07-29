@@ -4,8 +4,8 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use jcode_tasker_store::TaskerStore;
 use jcode_tasker_types::{
-    AddTaskDependency, CreateFeature, CreateProject, CreateTask, FeatureId, Project,
-    ProjectRevision, SetTaskState, TaskId, TaskPriority, TaskState,
+    AddTaskDependency, CreateFeature, CreateProject, CreateTask, Project, ProjectRevision,
+    SetTaskState, TaskPriority, TaskState,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -52,13 +52,13 @@ struct TaskerInput {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
-    feature_id: Option<FeatureId>,
+    feature_id: Option<String>,
     #[serde(default)]
-    parent_feature_id: Option<FeatureId>,
+    parent_feature_id: Option<String>,
     #[serde(default)]
-    task_id: Option<TaskId>,
+    task_id: Option<String>,
     #[serde(default)]
-    depends_on_task_id: Option<TaskId>,
+    depends_on_task_id: Option<String>,
     #[serde(default)]
     state: Option<TaskState>,
     #[serde(default)]
@@ -140,10 +140,10 @@ impl Tool for TaskerTool {
                 },
                 "title": {"type": "string"},
                 "description": {"type": "string"},
-                "feature_id": {"type": "string", "description": "Typed feat_ UUIDv7 identifier."},
-                "parent_feature_id": {"type": "string", "description": "Optional parent feat_ identifier."},
-                "task_id": {"type": "string", "description": "Typed task_ UUIDv7 identifier."},
-                "depends_on_task_id": {"type": "string", "description": "Prerequisite task_ identifier."},
+                "feature_id": {"type": "string", "description": "Feature reference: feat_<uuid> or #F<number>."},
+                "parent_feature_id": {"type": "string", "description": "Optional parent feature reference."},
+                "task_id": {"type": "string", "description": "Task reference: task_<uuid> or #<number>."},
+                "depends_on_task_id": {"type": "string", "description": "Prerequisite task reference."},
                 "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done", "cancelled"]},
                 "priority": {"type": "string", "enum": ["low", "normal", "high", "critical"]},
                 "rank": {"type": "integer"},
@@ -187,8 +187,9 @@ impl Tool for TaskerTool {
                 )
             }
             "show" => {
-                let task_id = required(params.task_id, "task_id", "show")?;
-                let task = store.get_task(project.id, task_id).await?;
+                let task_reference = required(params.task_id, "task_id", "show")?;
+                let task = store.resolve_task(project.id, task_reference).await?;
+                let task_id = task.id;
                 let readiness = store.task_readiness(project.id, task_id).await?;
                 let dependencies = store.task_dependencies(project.id, task_id).await?;
                 output(
@@ -203,11 +204,15 @@ impl Tool for TaskerTool {
             }
             "create_feature" => {
                 let title = required(params.title, "title", "create_feature")?;
+                let parent_id = match params.parent_feature_id {
+                    Some(reference) => Some(store.resolve_feature(project.id, reference).await?.id),
+                    None => None,
+                };
                 let mutation = store
                     .create_feature(CreateFeature {
                         project_id: project.id,
                         id: None,
-                        parent_id: params.parent_feature_id,
+                        parent_id,
                         title,
                         description: params.description.unwrap_or_default(),
                         expected_revision: params.expected_revision.or(Some(project.revision)),
@@ -220,7 +225,11 @@ impl Tool for TaskerTool {
             }
             "create" => {
                 let title = required(params.title, "title", "create")?;
-                let feature_id = required(params.feature_id, "feature_id", "create")?;
+                let feature_reference = required(params.feature_id, "feature_id", "create")?;
+                let feature_id = store
+                    .resolve_feature(project.id, feature_reference)
+                    .await?
+                    .id;
                 let mutation = store
                     .create_task(CreateTask {
                         project_id: project.id,
@@ -230,7 +239,7 @@ impl Tool for TaskerTool {
                         description: params.description.unwrap_or_default(),
                         priority: params.priority.unwrap_or_default(),
                         rank: params.rank.unwrap_or_default(),
-                        expected_revision: params.expected_revision,
+                        expected_revision: params.expected_revision.or(Some(project.revision)),
                     })
                     .await?;
                 output(
@@ -239,18 +248,23 @@ impl Tool for TaskerTool {
                 )
             }
             "add_dependency" => {
-                let task_id = required(params.task_id, "task_id", "add_dependency")?;
-                let depends_on_task_id = required(
+                let task_reference = required(params.task_id, "task_id", "add_dependency")?;
+                let dependency_reference = required(
                     params.depends_on_task_id,
                     "depends_on_task_id",
                     "add_dependency",
                 )?;
+                let task_id = store.resolve_task(project.id, task_reference).await?.id;
+                let depends_on_task_id = store
+                    .resolve_task(project.id, dependency_reference)
+                    .await?
+                    .id;
                 let mutation = store
                     .add_task_dependency(AddTaskDependency {
                         project_id: project.id,
                         task_id,
                         depends_on_task_id,
-                        expected_revision: params.expected_revision,
+                        expected_revision: params.expected_revision.or(Some(project.revision)),
                     })
                     .await?;
                 output(
@@ -259,14 +273,15 @@ impl Tool for TaskerTool {
                 )
             }
             "set_state" => {
-                let task_id = required(params.task_id, "task_id", "set_state")?;
+                let task_reference = required(params.task_id, "task_id", "set_state")?;
+                let task_id = store.resolve_task(project.id, task_reference).await?.id;
                 let state = required(params.state, "state", "set_state")?;
                 let mutation = store
                     .set_task_state(SetTaskState {
                         project_id: project.id,
                         task_id,
                         state,
-                        expected_revision: params.expected_revision,
+                        expected_revision: params.expected_revision.or(Some(project.revision)),
                     })
                     .await?;
                 output(
@@ -332,17 +347,16 @@ mod tests {
             )
             .await
             .expect("create feature");
-        let feature_id: FeatureId = feature.metadata.expect("feature metadata")["feature"]["id"]
-            .as_str()
-            .expect("feature id")
-            .parse()
-            .expect("typed feature id");
+        assert_eq!(
+            feature.metadata.expect("feature metadata")["feature"]["alias"],
+            1
+        );
 
         let task = tool
             .execute(
                 json!({
                     "action": "create",
-                    "feature_id": feature_id,
+                    "feature_id": "#F1",
                     "title": "Expose tasker tool",
                     "priority": "critical"
                 }),
@@ -353,6 +367,14 @@ mod tests {
         let task_metadata = task.metadata.expect("task metadata");
         assert_eq!(task_metadata["task"]["alias"], 1);
         assert_eq!(task_metadata["task"]["state"], "todo");
+
+        let shown = tool
+            .execute(json!({"action": "show", "task_id": "#1"}), ctx.clone())
+            .await
+            .expect("show task by alias")
+            .metadata
+            .expect("shown metadata");
+        assert_eq!(shown["task"]["title"], "Expose tasker tool");
 
         let status = tool
             .execute(json!({"action": "status"}), ctx)
