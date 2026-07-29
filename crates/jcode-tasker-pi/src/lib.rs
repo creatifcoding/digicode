@@ -242,6 +242,85 @@ pub struct UpdateTask {
     pub feature_id: Option<Option<String>>,
     pub indexes: Option<Value>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteInput {
+    pub content: String,
+    pub category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "op", rename_all = "camelCase")]
+pub enum BatchOperation {
+    #[serde(rename = "create", rename_all = "camelCase")]
+    Create {
+        key: Option<String>,
+        title: String,
+        description: Option<String>,
+        state: Option<String>,
+        #[serde(default)]
+        depends_on: Vec<String>,
+        #[serde(default)]
+        notes: Vec<NoteInput>,
+        indexes: Option<Value>,
+    },
+    #[serde(rename = "update", rename_all = "camelCase")]
+    Update {
+        task_id: String,
+        title: Option<String>,
+        #[serde(default)]
+        description: Option<Option<String>>,
+        state: Option<String>,
+        #[serde(default)]
+        depends_on: Vec<String>,
+        #[serde(default)]
+        clear_dependencies: bool,
+        active: Option<bool>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchResultEntry {
+    pub op: String,
+    pub key: Option<String>,
+    pub task_id: Option<String>,
+    pub task: Task,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchResult {
+    pub operations: Vec<BatchResultEntry>,
+    pub key_map: BTreeMap<String, String>,
+    pub created: usize,
+    pub updated: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanTask {
+    pub key: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub state: Option<String>,
+    #[serde(default)]
+    pub after: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<NoteInput>,
+    pub indexes: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanResult {
+    pub tasks: Vec<Task>,
+    pub key_map: BTreeMap<String, String>,
+    pub dependencies: Vec<TaskDependency>,
+    pub task_count: usize,
+    pub dependency_count: usize,
+}
 #[derive(Debug, Clone)]
 pub struct CreateFeature {
     pub title: String,
@@ -524,6 +603,192 @@ impl PiTaskerStore {
         Ok(task)
     }
 
+    pub fn batch_execute(&mut self, operations: Vec<BatchOperation>) -> Result<BatchResult> {
+        let tx = self.conn.transaction()?;
+        ensure_list_meta_tx(&tx, &self.partition)?;
+        let snapshot_tasks = load_tasks_tx(&tx, &self.partition)?;
+        let mut visible_tasks = snapshot_tasks.clone();
+        let mut key_map = BTreeMap::new();
+        let mut results = Vec::new();
+        let mut created = 0;
+        let mut updated = 0;
+
+        for op in &operations {
+            let BatchOperation::Create {
+                key,
+                title,
+                description,
+                state,
+                depends_on,
+                notes,
+                indexes,
+            } = op
+            else {
+                continue;
+            };
+            let task = create_task_tx(
+                &tx,
+                &self.partition,
+                title.clone(),
+                description.clone(),
+                state.clone(),
+                None,
+                indexes.clone(),
+            )?;
+            append_task_notes_tx(&tx, &self.partition, &task.id, notes)?;
+            if let Some(key) = key {
+                key_map.insert(key.clone(), task.id.clone());
+            }
+            let resolved_deps = resolve_task_refs(depends_on, &key_map, &snapshot_tasks)?;
+            if !resolved_deps.is_empty() {
+                set_dependencies_tx(&tx, &self.partition, &task.id, &resolved_deps)?;
+            }
+            visible_tasks.push(task.clone());
+            results.push(BatchResultEntry {
+                op: "create".into(),
+                key: key.clone(),
+                task_id: None,
+                task,
+            });
+            created += 1;
+        }
+
+        for op in &operations {
+            let BatchOperation::Update {
+                task_id,
+                title,
+                description,
+                state,
+                depends_on,
+                clear_dependencies,
+                active: _,
+            } = op
+            else {
+                continue;
+            };
+            let resolved_task_id = key_map
+                .get(task_id)
+                .cloned()
+                .or_else(|| {
+                    resolve_task_id_from(&snapshot_tasks, task_id)
+                        .ok()
+                        .flatten()
+                })
+                .ok_or_else(|| PiTaskerError::InvalidReference(task_id.clone()))?;
+            let mut task = visible_tasks
+                .iter()
+                .find(|task| task.id == resolved_task_id)
+                .cloned()
+                .ok_or_else(|| PiTaskerError::NotFound(task_id.clone()))?;
+            if let Some(title) = title {
+                task.title = title.clone();
+            }
+            if let Some(description) = description {
+                task.description = description.clone();
+            }
+            if let Some(state) = state {
+                task.state = state.clone();
+            }
+            task.updated_at = now_ms();
+            tx.execute("UPDATE tasks SET title=?1,description=?2,state=?3,updated_at=?4 WHERE id=?5 AND list_id=?6 AND project_root=?7", params![task.title, task.description, task.state, task.updated_at, task.id, self.partition.list_id, self.partition.project_root])?;
+            if task.state == "done" {
+                complete_task_work_tx(&tx, &self.partition, &task.id, task.updated_at)?;
+            }
+            if *clear_dependencies {
+                set_dependencies_tx(&tx, &self.partition, &task.id, &[])?;
+            } else if !depends_on.is_empty() {
+                let resolved_deps = resolve_task_refs(depends_on, &key_map, &snapshot_tasks)?;
+                set_dependencies_tx(&tx, &self.partition, &task.id, &resolved_deps)?;
+            }
+            if let Some(existing) = visible_tasks
+                .iter_mut()
+                .find(|existing| existing.id == task.id)
+            {
+                *existing = task.clone();
+            }
+            results.push(BatchResultEntry {
+                op: "update".into(),
+                key: None,
+                task_id: Some(task_id.clone()),
+                task,
+            });
+            updated += 1;
+        }
+
+        tx.commit()?;
+        Ok(BatchResult {
+            operations: results,
+            key_map,
+            created,
+            updated,
+        })
+    }
+
+    pub fn plan_import(&mut self, tasks: Vec<PlanTask>) -> Result<PlanResult> {
+        let valid_keys: BTreeSet<_> = tasks.iter().map(|task| task.key.as_str()).collect();
+        for task in &tasks {
+            for dep_key in &task.after {
+                if !valid_keys.contains(dep_key.as_str()) {
+                    return Err(PiTaskerError::InvalidReference(dep_key.clone()));
+                }
+            }
+        }
+
+        let tx = self.conn.transaction()?;
+        ensure_list_meta_tx(&tx, &self.partition)?;
+        let mut key_map = BTreeMap::new();
+        let mut created_tasks = Vec::new();
+        let mut dependencies = Vec::new();
+
+        for task in &tasks {
+            let created = create_task_tx(
+                &tx,
+                &self.partition,
+                task.title.clone(),
+                task.description.clone(),
+                task.state.clone(),
+                None,
+                task.indexes.clone(),
+            )?;
+            append_task_notes_tx(&tx, &self.partition, &created.id, &task.notes)?;
+            key_map.insert(task.key.clone(), created.id.clone());
+            created_tasks.push(created);
+        }
+
+        for task in &tasks {
+            if task.after.is_empty() {
+                continue;
+            }
+            let task_id = key_map
+                .get(&task.key)
+                .cloned()
+                .ok_or_else(|| PiTaskerError::InvalidReference(task.key.clone()))?;
+            let dep_ids = task
+                .after
+                .iter()
+                .map(|key| {
+                    key_map
+                        .get(key)
+                        .cloned()
+                        .ok_or_else(|| PiTaskerError::InvalidReference(key.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            set_dependencies_tx(&tx, &self.partition, &task_id, &dep_ids)?;
+            dependencies.extend(load_task_dependencies_tx(&tx, &self.partition, &task_id)?);
+        }
+
+        let task_count = created_tasks.len();
+        let dependency_count = dependencies.len();
+        tx.commit()?;
+        Ok(PlanResult {
+            tasks: created_tasks,
+            key_map,
+            dependencies,
+            task_count,
+            dependency_count,
+        })
+    }
+
     pub fn create_feature(&mut self, input: CreateFeature) -> Result<Feature> {
         let tx = self.conn.transaction()?;
         ensure_list_meta_tx(&tx, &self.partition)?;
@@ -752,6 +1017,114 @@ fn load_task_tx(
     id: &str,
 ) -> Result<Option<Task>> {
     Ok(tx.query_row("SELECT id,list_id,project_root,display_id,feature_id,title,description,state,indexes,created_at,updated_at FROM tasks WHERE id=?1 AND list_id=?2 AND project_root=?3", params![id,p.list_id,p.project_root], row_task).optional()?)
+}
+
+fn load_tasks_tx(tx: &rusqlite::Transaction<'_>, p: &ProjectPartition) -> Result<Vec<Task>> {
+    let mut stmt = tx.prepare("SELECT id,list_id,project_root,display_id,feature_id,title,description,state,indexes,created_at,updated_at FROM tasks WHERE list_id=?1 AND project_root=?2 ORDER BY display_id ASC")?;
+    Ok(stmt
+        .query_map(params![p.list_id, p.project_root], row_task)?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn create_task_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    title: String,
+    description: Option<String>,
+    state: Option<String>,
+    feature_id: Option<String>,
+    indexes: Option<Value>,
+) -> Result<Task> {
+    let now = now_ms();
+    let display_id: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(display_id),0)+1 FROM tasks WHERE list_id=?1 AND project_root=?2",
+        params![p.list_id, p.project_root],
+        |r| r.get(0),
+    )?;
+    let task = Task {
+        id: make_task_id(),
+        list_id: p.list_id.clone(),
+        project_root: p.project_root.clone(),
+        display_id,
+        feature_id,
+        title,
+        description,
+        state: state.unwrap_or_else(|| "todo".into()),
+        indexes: indexes.unwrap_or_else(|| Value::Array(vec![])),
+        created_at: now,
+        updated_at: now,
+    };
+    tx.execute("INSERT INTO tasks (id,list_id,project_root,display_id,feature_id,title,description,state,indexes,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![task.id, task.list_id, task.project_root, task.display_id, task.feature_id, task.title, task.description, task.state, serde_json::to_string(&task.indexes)?, task.created_at, task.updated_at])?;
+    Ok(task)
+}
+
+fn append_task_notes_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    task_id: &str,
+    notes: &[NoteInput],
+) -> Result<()> {
+    for note in notes {
+        tx.execute("INSERT INTO task_notes (id,task_id,list_id,project_root,category,content,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![make_task_note_id(), task_id, p.list_id, p.project_root, note.category, note.content, now_ms()])?;
+    }
+    Ok(())
+}
+
+fn load_task_dependencies_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    task_id: &str,
+) -> Result<Vec<TaskDependency>> {
+    let mut stmt = tx.prepare("SELECT id,task_id,depends_on,list_id,project_root,created_at FROM task_dependencies WHERE task_id=?1 AND list_id=?2 AND project_root=?3 ORDER BY created_at ASC")?;
+    Ok(stmt
+        .query_map(params![task_id, p.list_id, p.project_root], |r| {
+            Ok(TaskDependency {
+                id: r.get(0)?,
+                task_id: r.get(1)?,
+                depends_on_id: r.get(2)?,
+                list_id: r.get(3)?,
+                project_root: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn complete_task_work_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    task_id: &str,
+    completed_at: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE work_units SET status='done', completed_at=?1 WHERE task_id=?2 AND list_id=?3 AND project_root=?4 AND status IN ('queued','active')",
+        params![completed_at, task_id, p.list_id, p.project_root],
+    )?;
+    tx.execute(
+        "UPDATE task_claims SET released_at=?1, release_reason='task_done' WHERE task_id=?2 AND list_id=?3 AND project_root=?4 AND released_at IS NULL",
+        params![completed_at, task_id, p.list_id, p.project_root],
+    )?;
+    Ok(())
+}
+
+fn resolve_task_refs(
+    refs: &[String],
+    key_map: &BTreeMap<String, String>,
+    snapshot_tasks: &[Task],
+) -> Result<Vec<String>> {
+    refs.iter()
+        .map(|reference| {
+            key_map
+                .get(reference)
+                .cloned()
+                .or_else(|| {
+                    resolve_task_id_from(snapshot_tasks, reference)
+                        .ok()
+                        .flatten()
+                })
+                .ok_or_else(|| PiTaskerError::InvalidReference(reference.clone()))
+        })
+        .collect()
 }
 fn load_feature_tx(
     tx: &rusqlite::Transaction<'_>,
@@ -1313,5 +1686,178 @@ mod tests {
             store.list_feature_dependencies().unwrap()[0].id,
             make_feature_dependency_id(&f2.id, &f1.id)
         );
+    }
+
+    #[test]
+    fn batch_execute_creates_updates_dependencies_and_done_side_effects() {
+        let mut store = temp_store();
+        let existing = store
+            .create_task(CreateTask {
+                title: "Existing".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO task_claims (id,task_id,list_id,project_root,agent_id,session_id,session_instance_id,pid,claim_kind,claimed_at) VALUES ('claim_batch',?1,?2,?3,'agent','session','instance',1,'claim',1)",
+                params![existing.id, store.partition.list_id, store.partition.project_root],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO work_units (id,task_id,list_id,project_root,agent_id,session_id,session_instance_id,status,created_at) VALUES ('wu_batch',?1,?2,?3,'agent','session','instance','active',1)",
+                params![existing.id, store.partition.list_id, store.partition.project_root],
+            )
+            .unwrap();
+
+        let result = store
+            .batch_execute(vec![
+                BatchOperation::Create {
+                    key: Some("a".into()),
+                    title: "A".into(),
+                    description: Some("desc".into()),
+                    state: None,
+                    depends_on: vec![],
+                    notes: vec![NoteInput {
+                        content: "note".into(),
+                        category: Some("context".into()),
+                    }],
+                    indexes: Some(serde_json::json!([{ "type": "file", "path": "a.rs" }])),
+                },
+                BatchOperation::Create {
+                    key: Some("b".into()),
+                    title: "B".into(),
+                    description: None,
+                    state: None,
+                    depends_on: vec!["a".into(), "#1".into()],
+                    notes: vec![],
+                    indexes: None,
+                },
+                BatchOperation::Update {
+                    task_id: "#1".into(),
+                    title: Some("Existing done".into()),
+                    description: None,
+                    state: Some("done".into()),
+                    depends_on: vec!["a".into()],
+                    clear_dependencies: false,
+                    active: None,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(result.created, 2);
+        assert_eq!(result.updated, 1);
+        assert!(result.key_map.contains_key("a"));
+        let deps = store.list_dependencies().unwrap();
+        assert!(
+            deps.iter().any(|dep| dep.task_id == result.key_map["b"]
+                && dep.depends_on_id == result.key_map["a"])
+        );
+        assert!(
+            deps.iter()
+                .any(|dep| dep.task_id == result.key_map["b"] && dep.depends_on_id == existing.id)
+        );
+        assert_eq!(store.list_task_notes().unwrap().len(), 1);
+        let claim_release: (Option<i64>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT released_at,release_reason FROM task_claims WHERE id='claim_batch'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(claim_release.0.is_some());
+        assert_eq!(claim_release.1.as_deref(), Some("task_done"));
+        let work_unit: (String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT status,completed_at FROM work_units WHERE id='wu_batch'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(work_unit.0, "done");
+        assert!(work_unit.1.is_some());
+    }
+
+    #[test]
+    fn batch_execute_rolls_back_on_invalid_reference() {
+        let mut store = temp_store();
+        let err = store
+            .batch_execute(vec![BatchOperation::Create {
+                key: Some("a".into()),
+                title: "A".into(),
+                description: None,
+                state: None,
+                depends_on: vec!["missing".into()],
+                notes: vec![NoteInput {
+                    content: "should rollback".into(),
+                    category: None,
+                }],
+                indexes: None,
+            }])
+            .unwrap_err();
+        assert!(matches!(err, PiTaskerError::InvalidReference(_)));
+        assert!(store.list_tasks(None).unwrap().is_empty());
+        assert!(store.list_task_notes().unwrap().is_empty());
+        assert!(store.list_dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn plan_import_creates_all_tasks_then_wires_dependencies() {
+        let mut store = temp_store();
+        let result = store
+            .plan_import(vec![
+                PlanTask {
+                    key: "build".into(),
+                    title: "Build".into(),
+                    description: None,
+                    state: None,
+                    after: vec![],
+                    notes: vec![],
+                    indexes: None,
+                },
+                PlanTask {
+                    key: "test".into(),
+                    title: "Test".into(),
+                    description: Some("after build".into()),
+                    state: Some("todo".into()),
+                    after: vec!["build".into()],
+                    notes: vec![NoteInput {
+                        content: "remember".into(),
+                        category: Some("context".into()),
+                    }],
+                    indexes: Some(serde_json::json!([{ "type": "glob", "path": "tests/**" }])),
+                },
+            ])
+            .unwrap();
+        assert_eq!(result.task_count, 2);
+        assert_eq!(result.dependency_count, 1);
+        assert_eq!(result.dependencies[0].task_id, result.key_map["test"]);
+        assert_eq!(
+            result.dependencies[0].depends_on_id,
+            result.key_map["build"]
+        );
+        assert_eq!(store.list_task_notes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn plan_import_rejects_unknown_key_without_creating_tasks() {
+        let mut store = temp_store();
+        let err = store
+            .plan_import(vec![PlanTask {
+                key: "test".into(),
+                title: "Test".into(),
+                description: None,
+                state: None,
+                after: vec!["missing".into()],
+                notes: vec![],
+                indexes: None,
+            }])
+            .unwrap_err();
+        assert!(matches!(err, PiTaskerError::InvalidReference(_)));
+        assert!(store.list_tasks(None).unwrap().is_empty());
     }
 }
