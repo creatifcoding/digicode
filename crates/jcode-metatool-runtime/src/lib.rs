@@ -312,4 +312,26 @@ mod tests {
             Err(MetaToolError::RuntimeUnavailable { .. })
         ));
     }
+
+    #[test]
+    fn sidecar_installs_guest_context_history_overlay_and_disabled_llm_bridge() {
+        assert!(SIDECAR_SOURCE.contains("HISTORY_LIMIT = 50"));
+        assert!(SIDECAR_SOURCE.contains("HISTORY_COLLECTION = \"jcode.session\""));
+        assert!(SIDECAR_SOURCE.contains("get context() { return contextSnapshot(); }"));
+        assert!(SIDECAR_SOURCE.contains("history: readHistory"));
+        assert!(SIDECAR_SOURCE.contains("recordHistory: writeHistory"));
+        assert!(SIDECAR_SOURCE.contains("loadMetatoolPlugin"));
+        assert!(SIDECAR_SOURCE.contains("metatoolPlugin(\"/data\", NodeFileSystemLayer)"));
+        assert!(SIDECAR_SOURCE.contains("llm: disabledProvider(\"llm\")"));
+        assert!(SIDECAR_SOURCE.contains("llm_batch: disabledProvider(\"llm_batch\")"));
+        assert!(SIDECAR_SOURCE.contains("provider authority is brokered"));
+    }
+
+    #[test]
+    fn sidecar_does_not_mount_or_reference_host_workspace() {
+        assert!(SIDECAR_SOURCE.contains("path: \"/data\""));
+        assert!(!SIDECAR_SOURCE.contains("working_dir"));
+        assert!(!SIDECAR_SOURCE.contains("process.cwd()"));
+        assert!(!SIDECAR_SOURCE.contains("/home/getbygenius/.jcode/source/jcode"));
+    }
 }

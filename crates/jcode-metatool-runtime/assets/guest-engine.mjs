@@ -2574,6 +2574,9 @@ var try_ = (options) => {
     }
   });
 };
+var promise = (evaluate2) => callbackOptions(function(resume, signal) {
+  internalCall(() => evaluate2(signal)).then((a) => resume(succeed3(a)), (e) => resume(die(e)));
+}, evaluate2.length !== 0);
 var tryPromise = (options) => {
   const f = typeof options === "function" ? options : options.try;
   const catcher = typeof options === "function" ? (cause) => new UnknownError(cause, "An error occurred in Effect.tryPromise") : options.catch;
@@ -3300,8 +3303,8 @@ var runPromiseExitWith = (context3) => {
   const runFork3 = runForkWith(context3);
   return (effect2, options) => {
     const fiber2 = runFork3(effect2, options);
-    return new Promise((resolve2) => {
-      fiber2.addObserver((exit3) => resolve2(exit3));
+    return new Promise((resolve3) => {
+      fiber2.addObserver((exit3) => resolve3(exit3));
     });
   };
 };
@@ -3903,6 +3906,7 @@ var filterDoneLeftover = /* @__PURE__ */ composePassthrough(findError2, (e) => i
 var isEffect2 = isEffect;
 var all2 = all;
 var forEach2 = forEach;
+var promise2 = promise;
 var tryPromise2 = tryPromise;
 var succeed5 = succeed3;
 var succeedNone2 = succeedNone;
@@ -3920,6 +3924,7 @@ var withFiber2 = withFiber;
 var fromResult2 = fromResult;
 var flatMap3 = flatMap2;
 var flatten2 = flatten;
+var andThen2 = andThen;
 var tap2 = tap;
 var exit2 = exit;
 var map5 = map3;
@@ -4303,14 +4308,14 @@ function toDefaultIssues(issue, path, leafHook, checkHook) {
       }];
   }
 }
-function formatCheck(check2) {
-  const expected = check2.annotations?.expected;
+function formatCheck(check3) {
+  const expected = check3.annotations?.expected;
   if (typeof expected === "string") return expected;
-  switch (check2._tag) {
+  switch (check3._tag) {
     case "Filter":
       return "<filter>";
     case "FilterGroup":
-      return check2.checks.map((check3) => formatCheck(check3)).join(" & ");
+      return check3.checks.map((check4) => formatCheck(check4)).join(" & ");
   }
 }
 function makeFormatterDefault() {
@@ -4856,7 +4861,7 @@ function hasCheck(checks, tag2) {
   });
 }
 var number2 = /* @__PURE__ */ new Number4();
-var Boolean = class extends Base2 {
+var Boolean2 = class extends Base2 {
   _tag = "Boolean";
   /** @internal */
   getParser() {
@@ -4867,7 +4872,7 @@ var Boolean = class extends Base2 {
     return "boolean";
   }
 };
-var boolean = /* @__PURE__ */ new Boolean();
+var boolean = /* @__PURE__ */ new Boolean2();
 var Arrays = class _Arrays extends Base2 {
   _tag = "Arrays";
   isMutable;
@@ -5874,14 +5879,14 @@ var REGEXP_PATTERN = "Symbol\\((.*)\\)";
 var isStringSymbolRegExp = /* @__PURE__ */ new globalThis.RegExp(`^${REGEXP_PATTERN}$`);
 function collectIssues(checks, value, issues, ast, options) {
   for (let i = 0; i < checks.length; i++) {
-    const check2 = checks[i];
-    if (check2._tag === "FilterGroup") {
-      collectIssues(check2.checks, value, issues, ast, options);
+    const check3 = checks[i];
+    if (check3._tag === "FilterGroup") {
+      collectIssues(check3.checks, value, issues, ast, options);
     } else {
-      const issue = check2.run(value, ast, options);
+      const issue = check3.run(value, ast, options);
       if (issue) {
-        issues.push(new Filter(value, check2, issue));
-        if (check2.aborted || options?.errors !== "all") {
+        issues.push(new Filter(value, check3, issue));
+        if (check3.aborted || options?.errors !== "all") {
           return;
         }
       }
@@ -6535,7 +6540,7 @@ var recur = /* @__PURE__ */ memoize((ast) => {
     };
   }
   const isStructural = isArrays(ast) || isObjects(ast) || isDeclaration(ast) && ast.typeParameters.length > 0;
-  const structuralChecks = checks && isStructural ? checks.filter((check2) => check2.annotations?.[STRUCTURAL_ANNOTATION_KEY]) : void 0;
+  const structuralChecks = checks && isStructural ? checks.filter((check3) => check3.annotations?.[STRUCTURAL_ANNOTATION_KEY]) : void 0;
   return (ou, options) => {
     if (astOptions) {
       options = {
@@ -6727,7 +6732,7 @@ var Null2 = /* @__PURE__ */ make15(null_);
 var Undefined2 = /* @__PURE__ */ make15(undefined_2);
 var String4 = /* @__PURE__ */ make15(string2);
 var Number5 = /* @__PURE__ */ make15(number2);
-var Boolean2 = /* @__PURE__ */ make15(boolean);
+var Boolean3 = /* @__PURE__ */ make15(boolean);
 function makeStruct(ast, fields) {
   return make15(ast, {
     fields,
@@ -7259,7 +7264,7 @@ var RuntimeExecResult = Struct({
   stderr: String4,
   exitCode: Number5,
   command: String4,
-  timedOut: Boolean2
+  timedOut: Boolean3
 });
 var RuntimeError = Struct({
   _tag: Literal2("RuntimeError"),
@@ -7320,7 +7325,7 @@ function makeNodeRuntimeLayer(defaultCwd) {
           const command = renderCommand(input);
           const options = rawOptions == null ? void 0 : validateRuntimeExecOptions(rawOptions);
           return tryPromise2({
-            try: () => new Promise((resolve2) => {
+            try: () => new Promise((resolve3) => {
               exec(
                 command,
                 {
@@ -7333,7 +7338,7 @@ function makeNodeRuntimeLayer(defaultCwd) {
                   const maybeError = err;
                   const rawCode = maybeError?.code;
                   const exitCode = typeof rawCode === "number" ? rawCode : rawCode == null ? 0 : 1;
-                  resolve2(validateRuntimeExecResult({
+                  resolve3(validateRuntimeExecResult({
                     stdout: stdout ?? "",
                     stderr: stderr ?? "",
                     exitCode,
@@ -11114,7 +11119,7 @@ var ExportOptions = Struct({
   path: String4,
   glob: optional(String4),
   format: optional(ExportFormat),
-  pretty: optional(Boolean2),
+  pretty: optional(Boolean3),
   keys: optional(ArraySchema(String4)),
   keyGlob: optional(String4),
   /** Name this export — embedded in manifest, used as default profile name on import */
@@ -13005,11 +13010,11 @@ async function resolveThenable(value, path, depth, state) {
   state.warnings.push(`Resolved unawaited Promise at ${path}; prefer await/Promise.all before returning from mt code`);
   let timer;
   let abortHandler;
-  const timeout2 = new Promise((resolve2) => {
-    timer = setTimeout(() => resolve2(TIMEOUT), state.options.promiseTimeoutMs);
+  const timeout2 = new Promise((resolve3) => {
+    timer = setTimeout(() => resolve3(TIMEOUT), state.options.promiseTimeoutMs);
   });
-  const abort = state.options.signal ? new Promise((resolve2) => {
-    abortHandler = () => resolve2(ABORTED);
+  const abort = state.options.signal ? new Promise((resolve3) => {
+    abortHandler = () => resolve3(ABORTED);
     state.options.signal?.addEventListener("abort", abortHandler, { once: true });
   }) : void 0;
   try {
@@ -13114,9 +13119,1103 @@ function formatKey(key) {
 function describeError(err) {
   return err instanceof Error ? err.message : String(err);
 }
+
+// src/plugins/metatool-services/skill-config.ts
+import { join as join4 } from "node:path";
+var SkillConfig = class extends Service()(
+  "@gbg/metatool-metatool/SkillConfig"
+) {
+};
+function makeSkillConfigLayer(cwd) {
+  return succeed4(
+    SkillConfig,
+    SkillConfig.of({
+      cwd,
+      skillsDir: join4(cwd, ".pi", "skills"),
+      metatoolDir: join4(cwd, ".pi", "skills", "metatool")
+    })
+  );
+}
+
+// src/plugins/metatool-services/skill-discovery.ts
+import { join as join6, relative } from "node:path";
+
+// src/plugins/metatool-services/fs-ops.ts
+import { join as join5 } from "node:path";
+
+// src/plugins/metatool-services/errors.ts
+var SkillNotFound = class extends TaggedErrorClass()("SkillNotFound", {
+  name: String4
+}) {
+};
+var FileReadError = class extends TaggedErrorClass()("FileReadError", {
+  path: String4,
+  detail: optional(String4)
+}) {
+};
+var ParseError = class extends TaggedErrorClass()("ParseError", {
+  file: String4,
+  detail: optional(String4)
+}) {
+};
+var ProtocolNotFound = class extends TaggedErrorClass()("ProtocolNotFound", {
+  key: String4
+}) {
+};
+var UtilNotFound = class extends TaggedErrorClass()("UtilNotFound", {
+  name: String4
+}) {
+};
+var ExecutionError = class extends TaggedErrorClass()("ExecutionError", {
+  command: String4,
+  detail: optional(String4)
+}) {
+};
+var JournalError = class extends TaggedErrorClass()("JournalError", {
+  reason: Literals([
+    "PathOutsideCwd",
+    "InvalidJournalPath",
+    "FileNotFound",
+    "InvalidInput",
+    "DuplicateEntryId",
+    "EntryNotFound",
+    "EnrichmentMarkerNotFound",
+    "WriteFailed"
+  ]),
+  path: optional(String4),
+  detail: optional(String4)
+}) {
+};
+var MetatoolError = Union2([
+  SkillNotFound,
+  FileReadError,
+  ParseError,
+  ProtocolNotFound,
+  UtilNotFound,
+  ExecutionError,
+  JournalError
+]);
+
+// src/plugins/metatool-services/fs-ops.ts
+var exists = (fs, path) => fs.exists(path).pipe(catchTag2("PlatformError", () => succeed5(false)));
+var stat2 = (fs, path) => fs.stat(path).pipe(
+  map5((info) => ({ type: info.type })),
+  catchTag2("PlatformError", () => succeed5(null))
+);
+var readFileSafe = (fs, path) => fs.readFileString(path).pipe(catchTag2("PlatformError", () => succeed5("")));
+var readHead = (fs, path, n = 500) => fs.readFileString(path).pipe(
+  map5((c) => c.slice(0, n)),
+  catchTag2("PlatformError", () => succeed5(""))
+);
+var readLinesSafe = (fs, path) => fs.readFileString(path).pipe(
+  map5((c) => c.split("\n")),
+  catchTag2("PlatformError", () => succeed5([]))
+);
+var readDirSafe = (fs, path, opts) => fs.readDirectory(path, opts).pipe(catchTag2("PlatformError", () => succeed5([])));
+var readFile2 = (fs, path) => fs.readFileString(path).pipe(
+  mapError3((e) => new FileReadError({ path, detail: e.message }))
+);
+var writeFile2 = (fs, path, data) => fs.writeFileString(path, data).pipe(
+  mapError3((e) => new FileReadError({ path, detail: e.message }))
+);
+var mkDir = (fs, path) => fs.makeDirectory(path, { recursive: true }).pipe(
+  mapError3((e) => new FileReadError({ path, detail: e.message }))
+);
+var findMd = (fs, dir) => gen2(function* () {
+  const dirExists = yield* exists(fs, dir);
+  if (!dirExists) return [];
+  const entries = yield* readDirSafe(fs, dir, { recursive: true });
+  return entries.filter((f) => f.endsWith(".md")).map((f) => join5(dir, f));
+});
+var hasFrontmatter = (fs, path) => readLinesSafe(fs, path).pipe(map5((lines) => {
+  if (lines[0]?.trim() !== "---") return false;
+  return lines.slice(1).some((l) => l.trim() === "---");
+}));
+var parseFrontmatter = (lines) => {
+  if (lines[0]?.trim() !== "---") return {};
+  const endIdx = lines.slice(1).findIndex((l) => l.trim() === "---");
+  if (endIdx === -1) return {};
+  const result2 = {};
+  for (const line of lines.slice(1, endIdx + 1)) {
+    const match6 = line.match(/^(\w[\w-]*)\s*:\s*(.*)$/);
+    if (match6) result2[match6[1]] = match6[2].trim();
+  }
+  return result2;
+};
+
+// src/plugins/metatool-services/skill-discovery.ts
+var SkillDiscovery = class extends Service()(
+  "@gbg/metatool-metatool/SkillDiscovery"
+) {
+};
+function classifySkill(_fileCount, hasUtils, hasRefs) {
+  if (hasUtils) return "operational";
+  if (hasRefs) return "reference";
+  return "leaf";
+}
+var SkillDiscoveryLive = effect(
+  SkillDiscovery,
+  gen2(function* () {
+    const config = yield* SkillConfig;
+    const fs = yield* FileSystem;
+    const infoFor = (name) => gen2(function* () {
+      const dir = join6(config.skillsDir, name);
+      const files = yield* findMd(fs, dir);
+      const rels = files.map((f) => relative(dir, f));
+      const head = yield* readHead(fs, join6(dir, "SKILL.md"));
+      const hasUtils = yield* exists(fs, join6(dir, "utils"));
+      const hasRefs = rels.some((f) => f.startsWith("references/"));
+      return {
+        name,
+        path: dir,
+        type: classifySkill(files.length, hasUtils, hasRefs),
+        governed: head.includes("governed-by: metatool"),
+        fileCount: files.length,
+        files: rels,
+        hasChangelog: yield* exists(fs, join6(dir, "CHANGELOG.md")),
+        hasGraph: yield* exists(fs, join6(dir, "GRAPH.md")),
+        hasUtils,
+        hasRefs,
+        hasTemplate: yield* exists(fs, join6(dir, "TEMPLATE.md"))
+      };
+    });
+    return SkillDiscovery.of({
+      discover: gen2(function* () {
+        const dirExists = yield* exists(fs, config.skillsDir);
+        if (!dirExists) return [];
+        const entries = yield* readDirSafe(fs, config.skillsDir);
+        const dirs = [];
+        for (const entry of entries) {
+          const info = yield* stat2(fs, join6(config.skillsDir, entry));
+          if (info && info.type === "Directory") dirs.push(entry);
+        }
+        const skills = yield* all2(dirs.sort().map((name) => infoFor(name)));
+        return skills;
+      }),
+      info: (name) => infoFor(name)
+    });
+  })
+);
+
+// src/plugins/metatool-services/skill-inspector.ts
+import { join as join7, relative as relative2 } from "node:path";
+var SkillInspector = class extends Service()(
+  "@gbg/metatool-metatool/SkillInspector"
+) {
+};
+function check2(name, pass, detail) {
+  return { name, pass, detail: pass ? void 0 : detail };
+}
+function report(skill, path, checks) {
+  const passed = checks.filter((c) => c.pass).length;
+  return {
+    skill,
+    path,
+    checks,
+    passed,
+    total: checks.length,
+    clean: passed === checks.length,
+    summary: `${passed}/${checks.length} checks passed`
+  };
+}
+function classifySkill2(_n, hasUtils, hasRefs) {
+  if (hasUtils) return "operational";
+  if (hasRefs) return "reference";
+  return "leaf";
+}
+var SkillInspectorLive = effect(
+  SkillInspector,
+  gen2(function* () {
+    const config = yield* SkillConfig;
+    const discovery = yield* SkillDiscovery;
+    const fs = yield* FileSystem;
+    const findOrphans = (dir, files) => readLinesSafe(fs, join7(dir, "GRAPH.md")).pipe(map5((graph) => {
+      const rels = files.map((f) => relative2(dir, f));
+      const graphEntries = graph.filter((l) => l.match(/^\s*-\s+\[/)).map((l) => l.replace(/.*\[([^\]]+)\].*/, "$1"));
+      return rels.filter((f) => f !== "SKILL.md" && f !== "CHANGELOG.md" && f !== "GRAPH.md" && !graphEntries.some((g) => f.endsWith(g) || f.includes(g)));
+    }));
+    const findDeadLinks = (dir, files) => gen2(function* () {
+      const dead = [];
+      for (const f of files) {
+        const content = yield* readFileSafe(fs, f);
+        const links = content.match(/\[([^\]]*)\]\(([^)]+)\)/g) ?? [];
+        for (const link3 of links) {
+          const href = link3.replace(/.*\(([^)]+)\)/, "$1");
+          if (href.startsWith("http") || href.startsWith("#")) continue;
+          const target = join7(dir, href.split("#")[0]);
+          const targetExists = yield* exists(fs, target);
+          if (!targetExists) dead.push(`${relative2(dir, f)} \u2192 ${href}`);
+        }
+      }
+      return dead;
+    });
+    const inspectFor = (name) => gen2(function* () {
+      const dir = join7(config.skillsDir, name);
+      const dirExists = yield* exists(fs, dir);
+      if (!dirExists) {
+        return report(name, dir, [{ name: "exists", pass: false, detail: "Not found" }]);
+      }
+      const files = yield* findMd(fs, dir);
+      const rels = files.map((f) => relative2(dir, f));
+      const checks = [];
+      const head = yield* readHead(fs, join7(dir, "SKILL.md"));
+      checks.push(check2(
+        "governance",
+        head.includes("governed-by: metatool"),
+        "Missing governed-by: metatool"
+      ));
+      checks.push(check2("changelog", yield* exists(fs, join7(dir, "CHANGELOG.md"))));
+      const fmResults = yield* all2(files.map(
+        (f) => hasFrontmatter(fs, f).pipe(map5((has) => ({ file: relative2(dir, f), has })))
+      ));
+      const fmGaps = fmResults.filter((r) => !r.has).map((r) => r.file);
+      checks.push(check2(
+        "frontmatter",
+        fmGaps.length === 0,
+        fmGaps.length > 0 ? `Missing: ${fmGaps.join(", ")}` : void 0
+      ));
+      const orphans = yield* findOrphans(dir, files);
+      checks.push(check2(
+        "orphans",
+        orphans.length === 0,
+        orphans.length > 0 ? orphans.join(", ") : void 0
+      ));
+      const deadLinks = yield* findDeadLinks(dir, files);
+      checks.push(check2(
+        "dead-links",
+        deadLinks.length === 0,
+        deadLinks.length > 0 ? deadLinks.join(", ") : void 0
+      ));
+      const graph = yield* readLinesSafe(fs, join7(dir, "GRAPH.md"));
+      const graphEntries = graph.filter((l) => l.match(/^\s*-\s+\[/)).length;
+      const expectedEntries = rels.filter((f) => f !== "SKILL.md" && f !== "CHANGELOG.md" && f !== "GRAPH.md").length;
+      checks.push(check2(
+        "children-sync",
+        graphEntries >= expectedEntries,
+        `GRAPH.md has ${graphEntries} entries, found ${expectedEntries} files`
+      ));
+      checks.push(check2("cross-symmetry", true));
+      checks.push(check2("graph", yield* exists(fs, join7(dir, "GRAPH.md"))));
+      const clLines = yield* readLinesSafe(fs, join7(dir, "CHANGELOG.md"));
+      checks.push(check2("changelog-content", clLines.length > 3, "Changelog is too short"));
+      const policyCount = (yield* all2(files.map(
+        (f) => readLinesSafe(fs, f).pipe(map5(
+          (lines) => lines.some((l) => l.startsWith("update-strategy:")) ? 1 : 0
+        ))
+      ))).reduce((a, b) => a + b, 0);
+      checks.push(check2(
+        "update-freshness",
+        policyCount > 0,
+        "No files declare update-strategy"
+      ));
+      return report(name, dir, checks);
+    });
+    const conformanceFor = (name) => gen2(function* () {
+      const dir = join7(config.skillsDir, name);
+      const skillMdExists = yield* exists(fs, join7(dir, "SKILL.md"));
+      if (!skillMdExists) {
+        return { name, level: -1, label: "missing", type: "leaf", detail: ["No SKILL.md"] };
+      }
+      const files = yield* findMd(fs, dir);
+      const hasUtils = yield* exists(fs, join7(dir, "utils"));
+      const hasRefs = files.some((f) => relative2(dir, f).startsWith("references/"));
+      const type = classifySkill2(files.length, hasUtils, hasRefs);
+      const head = yield* readHead(fs, join7(dir, "SKILL.md"));
+      const governed = head.includes("governed-by: metatool");
+      const hasCl = yield* exists(fs, join7(dir, "CHANGELOG.md"));
+      const fmResults = yield* all2(files.map((f) => hasFrontmatter(fs, f)));
+      const fmCount = fmResults.filter(Boolean).length;
+      const detail = [];
+      if (!governed && !hasCl) {
+        return { name, level: 0, label: "exists", type, detail: ["Has SKILL.md but not governed"] };
+      }
+      if (!governed) detail.push("Not governed");
+      if (!hasCl) detail.push("No changelog");
+      if (fmCount < files.length) detail.push(`Frontmatter: ${fmCount}/${files.length}`);
+      if (detail.length > 0) {
+        return { name, level: 0, label: "exists", type, detail };
+      }
+      const health = yield* inspectFor(name);
+      if (!health.clean) {
+        return {
+          name,
+          level: 1,
+          label: "governed",
+          type,
+          detail: health.checks.filter((c) => !c.pass).map((c) => `${c.name}: ${c.detail ?? "failed"}`)
+        };
+      }
+      if (type === "leaf") {
+        return { name, level: 2, label: "clean", type, detail: ["Leaf ceiling reached"] };
+      }
+      const hasGraph = yield* exists(fs, join7(dir, "GRAPH.md"));
+      if (type === "reference" && hasGraph) {
+        return { name, level: 3, label: "complete", type, detail: [] };
+      }
+      if (type === "operational" && hasGraph && hasUtils) {
+        return { name, level: 3, label: "complete", type, detail: [] };
+      }
+      return {
+        name,
+        level: 2,
+        label: "clean",
+        type,
+        detail: type === "reference" ? ["Needs GRAPH.md"] : ["Needs utils/ + GRAPH.md"]
+      };
+    });
+    return SkillInspector.of({
+      inspect: (name) => inspectFor(name),
+      audit: gen2(function* () {
+        const skills = yield* discovery.discover;
+        return yield* all2(skills.map(
+          (s) => gen2(function* () {
+            const files = yield* findMd(fs, s.path);
+            const fmResults = yield* all2(files.map((f) => hasFrontmatter(fs, f)));
+            const fmMissing = fmResults.filter((x) => !x).length;
+            return { name: s.name, governed: s.governed, fileCount: s.fileCount, hasChangelog: s.hasChangelog, fmMissing };
+          })
+        ));
+      }),
+      conformance: (name) => conformanceFor(name),
+      conformanceAudit: gen2(function* () {
+        const skills = yield* discovery.discover;
+        return yield* all2(skills.map((s) => conformanceFor(s.name)));
+      })
+    });
+  })
+);
+
+// src/plugins/metatool-services/frontmatter-service.ts
+import { join as join8, relative as relative3 } from "node:path";
+var FrontmatterService = class extends Service()(
+  "@gbg/metatool-metatool/FrontmatterService"
+) {
+};
+var FrontmatterServiceLive = effect(
+  FrontmatterService,
+  gen2(function* () {
+    const config = yield* SkillConfig;
+    const fs = yield* FileSystem;
+    return FrontmatterService.of({
+      frontmatter: (name) => gen2(function* () {
+        const dir = join8(config.skillsDir, name);
+        const files = yield* findMd(fs, dir);
+        const result2 = {};
+        for (const f of files) {
+          const content = yield* readFileSafe(fs, f);
+          const fm = parseFrontmatter(content.split("\n"));
+          if (Object.keys(fm).length > 0) result2[relative3(dir, f)] = fm;
+        }
+        return result2;
+      }),
+      setFrontmatter: (path, field, value) => gen2(function* () {
+        const abs = path.startsWith("/") ? path : join8(config.cwd, path);
+        const content = yield* readFile2(fs, abs);
+        const lines = content.split("\n");
+        let newContent;
+        if (lines[0]?.trim() === "---") {
+          const endIdx = lines.slice(1).findIndex((l) => l.trim() === "---");
+          if (endIdx !== -1) {
+            const fmLines = lines.slice(1, endIdx + 1);
+            const existing = fmLines.findIndex((l) => l.startsWith(`${field}:`));
+            if (existing !== -1) {
+              fmLines[existing] = `${field}: ${value}`;
+            } else {
+              fmLines.push(`${field}: ${value}`);
+            }
+            newContent = ["---", ...fmLines, "---", ...lines.slice(endIdx + 2)].join("\n");
+          } else {
+            newContent = ["---", `${field}: ${value}`, "---", "", ...lines].join("\n");
+          }
+        } else {
+          newContent = ["---", `${field}: ${value}`, "---", "", ...lines].join("\n");
+        }
+        yield* writeFile2(fs, abs, newContent);
+      })
+    });
+  })
+);
+
+// src/plugins/metatool-services/protocol-service.ts
+import { join as join9 } from "node:path";
+var ProtocolService = class extends Service()(
+  "@gbg/metatool-metatool/ProtocolService"
+) {
+};
+var ProtocolServiceLive = effect(
+  ProtocolService,
+  gen2(function* () {
+    const config = yield* SkillConfig;
+    const fs = yield* FileSystem;
+    const skillMd = join9(config.metatoolDir, "SKILL.md");
+    const parseProtocols = () => readFileSafe(fs, skillMd).pipe(
+      map5((content) => {
+        const lines = content.split("\n");
+        const protocols = /* @__PURE__ */ new Map();
+        let currentKey = "";
+        let currentBody = [];
+        for (const line of lines) {
+          const match6 = line.match(/^#{2,4}\s+(§\s+[\w:./-]+)/);
+          if (match6) {
+            if (currentKey) protocols.set(currentKey, currentBody.join("\n").trim());
+            currentKey = match6[1];
+            currentBody = [];
+          } else if (currentKey) {
+            currentBody.push(line);
+          }
+        }
+        if (currentKey) protocols.set(currentKey, currentBody.join("\n").trim());
+        return protocols;
+      })
+    );
+    return ProtocolService.of({
+      protocol: (key) => parseProtocols().pipe(
+        map5((protocols) => protocols.get(key) ?? `Protocol not found: ${key}`)
+      ),
+      protocols: parseProtocols().pipe(
+        map5((protocols) => Array.from(protocols.keys()))
+      )
+    });
+  })
+);
+
+// src/plugins/metatool-services/util-service.ts
+import { join as join10 } from "node:path";
+import { exec as exec2 } from "node:child_process";
+var UtilService = class extends Service()(
+  "@gbg/metatool-metatool/UtilService"
+) {
+};
+var UtilServiceLive = effect(
+  UtilService,
+  gen2(function* () {
+    const config = yield* SkillConfig;
+    const fs = yield* FileSystem;
+    const utilsDir = join10(config.metatoolDir, "utils");
+    return UtilService.of({
+      utils: gen2(function* () {
+        const dirExists = yield* exists(fs, utilsDir);
+        if (!dirExists) return [];
+        const entries = yield* readDirSafe(fs, utilsDir);
+        const mdFiles = entries.filter((f) => f.endsWith(".md"));
+        return yield* all2(mdFiles.map(
+          (f) => readFileSafe(fs, join10(utilsDir, f)).pipe(
+            map5((content) => {
+              const desc = content.split("\n").find((l) => l.startsWith("description:"));
+              return {
+                name: f.replace(".md", ""),
+                file: f,
+                description: desc?.replace("description:", "").trim() ?? ""
+              };
+            })
+          )
+        ));
+      }),
+      runUtil: (utilName, skillName) => gen2(function* () {
+        const utilPath = join10(utilsDir, `${utilName}.md`);
+        const utilExists = yield* exists(fs, utilPath);
+        if (!utilExists) {
+          return { util: utilName, skill: skillName, output: `Util not found: ${utilName}`, exitCode: 1 };
+        }
+        const content = yield* readFileSafe(fs, utilPath);
+        const codeMatch = content.match(/```(?:bash|sh)\n([\s\S]*?)```/);
+        if (!codeMatch) {
+          return { util: utilName, skill: skillName, output: "No executable code block found", exitCode: 1 };
+        }
+        const cmd = codeMatch[1].trim().replace(/\$SKILL/g, skillName);
+        return yield* promise2(() => new Promise((resolve3) => {
+          exec2(cmd, { cwd: config.cwd, encoding: "utf-8", timeout: 15e3 }, (err, stdout, stderr) => {
+            resolve3({
+              util: utilName,
+              skill: skillName,
+              output: `${stdout ?? ""}${stderr ?? ""}`.trim(),
+              exitCode: err?.code ?? err?.status ?? 0
+            });
+          });
+        }));
+      })
+    });
+  })
+);
+
+// src/plugins/metatool-services/skill-mutations.ts
+import { join as join11 } from "node:path";
+var SkillMutations = class extends Service()(
+  "@gbg/metatool-metatool/SkillMutations"
+) {
+};
+var SkillMutationsLive = effect(
+  SkillMutations,
+  gen2(function* () {
+    const config = yield* SkillConfig;
+    const fs = yield* FileSystem;
+    return SkillMutations.of({
+      adopt: (name) => gen2(function* () {
+        const skillMd = join11(config.skillsDir, name, "SKILL.md");
+        const fileExists = yield* exists(fs, skillMd);
+        if (!fileExists) return `SKILL.md not found for ${name}`;
+        const content = yield* readFile2(fs, skillMd);
+        if (content.includes("governed-by: metatool")) return `${name} already governed`;
+        const lines = content.split("\n");
+        if (lines[0]?.trim() === "---") {
+          const endIdx = lines.slice(1).findIndex((l) => l.trim() === "---");
+          if (endIdx !== -1) {
+            lines.splice(endIdx + 1, 0, "governed-by: metatool");
+            yield* writeFile2(fs, skillMd, lines.join("\n"));
+            return `Added governance to ${name}`;
+          }
+        }
+        yield* writeFile2(fs, skillMd, `---
+governed-by: metatool
+---
+
+${content}`);
+        return `Added governance frontmatter to ${name}`;
+      }),
+      scaffold: (name, opts) => gen2(function* () {
+        const dir = join11(config.skillsDir, name);
+        yield* mkDir(fs, dir);
+        const created = [];
+        const skillMd = join11(dir, "SKILL.md");
+        const skillExists = yield* exists(fs, skillMd);
+        if (!skillExists) {
+          yield* writeFile2(fs, skillMd, [
+            "---",
+            "governed-by: metatool",
+            `description: ${name} skill`,
+            "update-strategy: manual",
+            "update-trigger: content-change",
+            "update-status: current",
+            "---",
+            "",
+            `# ${name}`,
+            "",
+            "TODO: Add skill description."
+          ].join("\n"));
+          created.push("SKILL.md");
+        }
+        const clMd = join11(dir, "CHANGELOG.md");
+        const clExists = yield* exists(fs, clMd);
+        if (!clExists) {
+          yield* writeFile2(fs, clMd, [
+            "---",
+            "up: SKILL.md",
+            "---",
+            "",
+            `# ${name} Changelog`,
+            "",
+            `## ${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}`,
+            "- Initial scaffold"
+          ].join("\n"));
+          created.push("CHANGELOG.md");
+        }
+        if (opts?.refs) {
+          const refsDir = join11(dir, "references");
+          yield* mkDir(fs, refsDir);
+          const indexMd = join11(refsDir, "INDEX.md");
+          const indexExists = yield* exists(fs, indexMd);
+          if (!indexExists) {
+            yield* writeFile2(fs, indexMd, [
+              "---",
+              "up: ../SKILL.md",
+              "---",
+              "",
+              "# References",
+              "",
+              "TODO: Add reference docs."
+            ].join("\n"));
+            created.push("references/INDEX.md");
+          }
+        }
+        return created;
+      })
+    });
+  })
+);
+
+// src/plugins/metatool-services/freshness-service.ts
+import { join as join12 } from "node:path";
+var FreshnessService = class extends Service()(
+  "@gbg/metatool-metatool/FreshnessService"
+) {
+};
+var extractPolicy = (fs, path, skillName) => readFileSafe(fs, path).pipe(
+  map5((content) => {
+    const lines = content.split("\n");
+    const strategyLine = lines.find((l) => l.startsWith("update-strategy:"));
+    if (!strategyLine) return null;
+    const strategy = strategyLine.replace("update-strategy:", "").trim();
+    const triggerLine = lines.find((l) => l.startsWith("update-trigger:"));
+    const trigger = triggerLine?.replace("update-trigger:", "").trim() ?? "";
+    const statusLine = lines.find((l) => l.startsWith("update-status:"));
+    const status = statusLine?.replace("update-status:", "").trim() ?? "current";
+    return { file: path, skill: skillName, status, strategy, trigger };
+  })
+);
+var FreshnessServiceLive = effect(
+  FreshnessService,
+  gen2(function* () {
+    const config = yield* SkillConfig;
+    const discovery = yield* SkillDiscovery;
+    const fs = yield* FileSystem;
+    const freshnessFor = (name) => gen2(function* () {
+      const dir = join12(config.skillsDir, name);
+      const files = yield* findMd(fs, dir);
+      const policies = (yield* all2(
+        files.map((f) => extractPolicy(fs, f, name))
+      )).filter((p) => p !== null);
+      return {
+        skill: name,
+        total: policies.length,
+        current: policies.filter((p) => p.status === "current").length,
+        stale: policies.filter((p) => p.status === "stale").length,
+        pending: policies.filter((p) => p.status === "pending").length,
+        policies
+      };
+    });
+    return FreshnessService.of({
+      freshness: (name) => freshnessFor(name),
+      setUpdateStatus: (path, status) => gen2(function* () {
+        const abs = path.startsWith("/") ? path : join12(config.cwd, path);
+        const content = yield* readFile2(fs, abs);
+        const updated = content.replace(
+          /update-status:\s*\w+/,
+          `update-status: ${status}`
+        );
+        yield* writeFile2(fs, abs, updated);
+      }),
+      freshnessAll: gen2(function* () {
+        const skills = yield* discovery.discover;
+        const reports = yield* all2(skills.map((s) => freshnessFor(s.name)));
+        const totals = reports.reduce((acc, f, i) => {
+          acc.total += f.total;
+          acc.current += f.current;
+          acc.stale += f.stale;
+          acc.pending += f.pending;
+          acc.fileCount += skills[i]?.fileCount ?? 0;
+          return acc;
+        }, { total: 0, current: 0, stale: 0, pending: 0, fileCount: 0 });
+        return {
+          total: totals.total,
+          current: totals.current,
+          stale: totals.stale,
+          pending: totals.pending,
+          untracked: totals.fileCount - totals.total
+        };
+      }),
+      staleAll: gen2(function* () {
+        const skills = yield* discovery.discover;
+        const reports = yield* all2(skills.map((s) => freshnessFor(s.name)));
+        return reports.flatMap((f) => f.policies.filter((p) => p.status === "stale"));
+      })
+    });
+  })
+);
+
+// src/plugins/metatool-services/journal-service.ts
+import { basename, isAbsolute, relative as relative4, resolve as resolve2, sep } from "node:path";
+var ENRICHMENT_MARKER = "*(enrichment below this line)*";
+var JournalService = class extends Service()(
+  "@gbg/metatool-metatool/JournalService"
+) {
+};
+var entryHeading = /^## (E\d+) · (\d{4}-\d{2}-\d{2}) · ([^\r\n]+)$/gm;
+var entryId = /^E\d+$/;
+var isoDate = /^\d{4}-\d{2}-\d{2}$/;
+function parseJournalEntries(content) {
+  const matches = Array.from(content.matchAll(entryHeading));
+  return matches.map((match6, index) => {
+    const start = match6.index ?? 0;
+    return {
+      id: match6[1],
+      date: match6[2],
+      title: match6[3],
+      start,
+      end: index + 1 < matches.length ? matches[index + 1].index ?? content.length : content.length,
+      hasEnrichmentMarker: content.slice(start, index + 1 < matches.length ? matches[index + 1].index ?? content.length : content.length).includes(ENRICHMENT_MARKER)
+    };
+  });
+}
+function isValidDate(value) {
+  if (!isoDate.test(value)) return false;
+  const date = /* @__PURE__ */ new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+function isJournalPath(path) {
+  return path.endsWith(".journal.md") || basename(path) === "infra-journal.md";
+}
+function validText(value, field, singleLine = false) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return new JournalError({ reason: "InvalidInput", detail: `${field} must be nonempty` });
+  }
+  if (singleLine && /[\r\n]/.test(value)) {
+    return new JournalError({ reason: "InvalidInput", detail: `${field} must be one line` });
+  }
+  return value;
+}
+function validateEntryInput(input) {
+  if (typeof input !== "object" || input === null) {
+    return new JournalError({ reason: "InvalidInput", detail: "entry input is required" });
+  }
+  if (typeof input.id !== "string" || !entryId.test(input.id)) {
+    return new JournalError({ reason: "InvalidInput", detail: "id must match E<digits>" });
+  }
+  if (typeof input.date !== "string" || !isValidDate(input.date)) {
+    return new JournalError({ reason: "InvalidInput", detail: "date must be ISO YYYY-MM-DD" });
+  }
+  for (const [field, singleLine] of [["title", true], ["author", true], ["context", true], ["body", false]]) {
+    const error = validText(input[field], field, singleLine);
+    if (error instanceof JournalError) return error;
+  }
+  return void 0;
+}
+function validateEnrichmentInput(input) {
+  if (typeof input !== "object" || input === null) {
+    return new JournalError({ reason: "InvalidInput", detail: "enrichment input is required" });
+  }
+  if (typeof input.date !== "string" || !isValidDate(input.date)) {
+    return new JournalError({ reason: "InvalidInput", detail: "date must be ISO YYYY-MM-DD" });
+  }
+  for (const [field, singleLine] of [["agent", true], ["body", false]]) {
+    const error = validText(input[field], field, singleLine);
+    if (error instanceof JournalError) return error;
+  }
+  return void 0;
+}
+function appendBlock(content, block) {
+  if (content.length === 0) return block;
+  return `${content}${content.endsWith("\n") ? "" : "\n"}
+${block}`;
+}
+function formatEntry(input) {
+  return [
+    `## ${input.id} \xB7 ${input.date} \xB7 ${input.title}`,
+    `**Author**: ${input.author}`,
+    `**Context**: ${input.context}`,
+    input.body,
+    ENRICHMENT_MARKER,
+    ""
+  ].join("\n");
+}
+function formatEnrichment(input) {
+  return [
+    `### Enrichment \xB7 ${input.date} \xB7 ${input.agent}`,
+    input.body,
+    ""
+  ].join("\n");
+}
+var JournalServiceLive = effect(
+  JournalService,
+  gen2(function* () {
+    const config = yield* SkillConfig;
+    const fs = yield* FileSystem;
+    const resolveJournalPath = (path) => gen2(function* () {
+      const absolute = resolve2(config.cwd, path);
+      const rel = relative4(config.cwd, absolute);
+      if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+        return yield* fail5(new JournalError({ reason: "PathOutsideCwd", path, detail: "path must resolve inside cwd" }));
+      }
+      if (!isJournalPath(absolute)) {
+        return yield* fail5(new JournalError({ reason: "InvalidJournalPath", path, detail: "expected *.journal.md or infra-journal.md" }));
+      }
+      const stat3 = yield* fs.stat(absolute).pipe(
+        mapError3((error) => new JournalError({ reason: "FileNotFound", path, detail: error.message }))
+      );
+      if (stat3.type !== "File") {
+        return yield* fail5(new JournalError({ reason: "FileNotFound", path, detail: "journal path is not a file" }));
+      }
+      const root = yield* fs.realPath(config.cwd).pipe(
+        mapError3((error) => new JournalError({ reason: "FileNotFound", path: config.cwd, detail: error.message }))
+      );
+      const canonical = yield* fs.realPath(absolute).pipe(
+        mapError3((error) => new JournalError({ reason: "FileNotFound", path, detail: error.message }))
+      );
+      const canonicalRel = relative4(root, canonical);
+      if (canonicalRel === ".." || canonicalRel.startsWith(`..${sep}`) || isAbsolute(canonicalRel)) {
+        return yield* fail5(new JournalError({ reason: "PathOutsideCwd", path, detail: "journal target resolves outside cwd" }));
+      }
+      return { absolute: canonical, display: rel || basename(absolute) };
+    });
+    const readJournal = (path) => gen2(function* () {
+      const resolved = yield* resolveJournalPath(path);
+      const content = yield* fs.readFileString(resolved.absolute).pipe(
+        mapError3((error) => new JournalError({ reason: "FileNotFound", path, detail: error.message }))
+      );
+      return { ...resolved, content };
+    });
+    const atomicWrite = (path, content) => {
+      const temporary = `${path}.metatool-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`;
+      return fs.writeFileString(temporary, content).pipe(
+        mapError3((error) => new JournalError({ reason: "WriteFailed", path, detail: error.message })),
+        andThen2(fs.rename(temporary, path)),
+        mapError3((error) => new JournalError({ reason: "WriteFailed", path, detail: error.message })),
+        as2(new TextEncoder().encode(content).byteLength)
+      );
+    };
+    return JournalService.of({
+      journalEntries: (path) => readJournal(path).pipe(
+        map5(({ content }) => parseJournalEntries(content).map(({ start: _start, end: _end, ...entry }) => entry))
+      ),
+      appendJournalEntry: (path, input) => gen2(function* () {
+        const inputError = validateEntryInput(input);
+        if (inputError) return yield* fail5(inputError);
+        const journal = yield* readJournal(path);
+        const entries = parseJournalEntries(journal.content);
+        if (entries.some((entry) => entry.id === input.id)) {
+          return yield* fail5(new JournalError({ reason: "DuplicateEntryId", path, detail: input.id }));
+        }
+        const bytes = yield* atomicWrite(journal.absolute, appendBlock(journal.content, formatEntry(input)));
+        return { path: journal.display, entryId: input.id, bytes, operation: "append-entry" };
+      }),
+      appendJournalEnrichment: (path, id, input) => gen2(function* () {
+        if (typeof id !== "string" || !entryId.test(id)) {
+          return yield* fail5(new JournalError({ reason: "InvalidInput", path, detail: "entryId must match E<digits>" }));
+        }
+        const inputError = validateEnrichmentInput(input);
+        if (inputError) return yield* fail5(inputError);
+        const journal = yield* readJournal(path);
+        const entry = parseJournalEntries(journal.content).find((candidate) => candidate.id === id);
+        if (!entry) return yield* fail5(new JournalError({ reason: "EntryNotFound", path, detail: id }));
+        const entryContent = journal.content.slice(entry.start, entry.end);
+        const markerOffset = entryContent.indexOf(ENRICHMENT_MARKER);
+        if (markerOffset === -1) {
+          return yield* fail5(new JournalError({ reason: "EnrichmentMarkerNotFound", path, detail: id }));
+        }
+        const beforeEntry = journal.content.slice(0, entry.end);
+        const afterEntry = journal.content.slice(entry.end);
+        const updatedEntry = appendBlock(beforeEntry, formatEnrichment(input));
+        const bytes = yield* atomicWrite(journal.absolute, `${updatedEntry}${afterEntry}`);
+        return { path: journal.display, entryId: id, bytes, operation: "append-enrichment" };
+      })
+    });
+  })
+);
+
+// src/plugins/metatool-services/index.ts
+function makeMetatoolLayer(cwd) {
+  const configLayer = makeSkillConfigLayer(cwd);
+  const discoveryLayer = SkillDiscoveryLive.pipe(
+    provide2(configLayer)
+  );
+  const inspectorLayer = SkillInspectorLive.pipe(
+    provide2(discoveryLayer),
+    provide2(configLayer)
+  );
+  const freshnessLayer = FreshnessServiceLive.pipe(
+    provide2(discoveryLayer),
+    provide2(configLayer)
+  );
+  const frontmatterLayer = FrontmatterServiceLive.pipe(provide2(configLayer));
+  const protocolLayer = ProtocolServiceLive.pipe(provide2(configLayer));
+  const journalLayer = JournalServiceLive.pipe(provide2(configLayer));
+  const utilLayer = UtilServiceLive.pipe(provide2(configLayer));
+  const mutationsLayer = SkillMutationsLive.pipe(provide2(configLayer));
+  return mergeAll2(
+    configLayer,
+    discoveryLayer,
+    inspectorLayer,
+    freshnessLayer,
+    frontmatterLayer,
+    protocolLayer,
+    utilLayer,
+    mutationsLayer,
+    journalLayer
+  );
+}
+var profile = (name) => gen2(function* () {
+  const inspector = yield* SkillInspector;
+  const freshSvc = yield* FreshnessService;
+  const h = yield* inspector.inspect(name);
+  const c = yield* inspector.conformance(name);
+  const f = yield* freshSvc.freshness(name);
+  return {
+    name,
+    health: h.summary,
+    level: c.level,
+    label: c.label,
+    type: c.type,
+    policies: f.total,
+    stale: f.stale,
+    clean: h.clean
+  };
+});
+var each = (fn2) => gen2(function* () {
+  const discovery = yield* SkillDiscovery;
+  const skills = yield* discovery.discover;
+  return skills.map(fn2);
+});
+var where = (pred, fn2) => gen2(function* () {
+  const discovery = yield* SkillDiscovery;
+  const skills = yield* discovery.discover;
+  return skills.filter(pred).map(fn2);
+});
+
+// src/plugins/metatool.ts
+function metatoolPlugin(cwd, fsLayer) {
+  const layer2 = makeMetatoolLayer(cwd).pipe(provide2(fsLayer));
+  const runtime = make16(layer2);
+  const run2 = (effect2) => runtime.runPromise(effect2);
+  return {
+    id: "metatool",
+    name: "Skill Governance",
+    methods: {
+      // ── Discovery (2) ────────────────────────────────
+      discover: () => run2(gen2(function* () {
+        const svc = yield* SkillDiscovery;
+        return yield* svc.discover;
+      })),
+      info: (name) => run2(gen2(function* () {
+        const svc = yield* SkillDiscovery;
+        return yield* svc.info(name);
+      })),
+      // ── Inspection (4) ───────────────────────────────
+      inspect: (name) => run2(gen2(function* () {
+        const svc = yield* SkillInspector;
+        return yield* svc.inspect(name);
+      })),
+      audit: () => run2(gen2(function* () {
+        const svc = yield* SkillInspector;
+        return yield* svc.audit;
+      })),
+      conformance: (name) => run2(gen2(function* () {
+        const svc = yield* SkillInspector;
+        return yield* svc.conformance(name);
+      })),
+      conformanceAudit: () => run2(gen2(function* () {
+        const svc = yield* SkillInspector;
+        return yield* svc.conformanceAudit;
+      })),
+      // ── Freshness (4) ────────────────────────────────
+      freshness: (name) => run2(gen2(function* () {
+        const svc = yield* FreshnessService;
+        return yield* svc.freshness(name);
+      })),
+      setUpdateStatus: (path, status) => run2(gen2(function* () {
+        const svc = yield* FreshnessService;
+        return yield* svc.setUpdateStatus(path, status);
+      })),
+      freshnessAll: () => run2(gen2(function* () {
+        const svc = yield* FreshnessService;
+        return yield* svc.freshnessAll;
+      })),
+      staleAll: () => run2(gen2(function* () {
+        const svc = yield* FreshnessService;
+        return yield* svc.staleAll;
+      })),
+      // ── Composed (3) ─────────────────────────────────
+      profile: (name) => run2(profile(name)),
+      each: (fn2) => run2(each(fn2)),
+      where: (pred, fn2) => run2(where(pred, fn2)),
+      // ── Frontmatter (2) ──────────────────────────────
+      frontmatter: (name) => run2(gen2(function* () {
+        const svc = yield* FrontmatterService;
+        return yield* svc.frontmatter(name);
+      })),
+      setFrontmatter: (path, field, value) => run2(gen2(function* () {
+        const svc = yield* FrontmatterService;
+        return yield* svc.setFrontmatter(path, field, value);
+      })),
+      // ── Protocols (2) ────────────────────────────────
+      protocol: (key) => run2(gen2(function* () {
+        const svc = yield* ProtocolService;
+        return yield* svc.protocol(key);
+      })),
+      protocols: () => run2(gen2(function* () {
+        const svc = yield* ProtocolService;
+        return yield* svc.protocols;
+      })),
+      // ── Utils (2) ────────────────────────────────────
+      utils: () => run2(gen2(function* () {
+        const svc = yield* UtilService;
+        return yield* svc.utils;
+      })),
+      runUtil: (utilName, skillName) => run2(gen2(function* () {
+        const svc = yield* UtilService;
+        return yield* svc.runUtil(utilName, skillName);
+      })),
+      // ── Journals (3) ─────────────────────────────────
+      journalEntries: (path) => run2(gen2(function* () {
+        const svc = yield* JournalService;
+        return yield* svc.journalEntries(path);
+      })),
+      appendJournalEntry: (path, input) => run2(gen2(function* () {
+        const svc = yield* JournalService;
+        return yield* svc.appendJournalEntry(path, input);
+      })),
+      appendJournalEnrichment: (path, entryId2, input) => run2(gen2(function* () {
+        const svc = yield* JournalService;
+        return yield* svc.appendJournalEnrichment(path, entryId2, input);
+      })),
+      // ── Mutations (2) ────────────────────────────────
+      adopt: (name) => run2(gen2(function* () {
+        const svc = yield* SkillMutations;
+        return yield* svc.adopt(name);
+      })),
+      scaffold: (name, opts) => run2(gen2(function* () {
+        const svc = yield* SkillMutations;
+        return yield* svc.scaffold(name, opts);
+      }))
+    },
+    dispose: () => runtime.dispose(),
+    guide: {
+      sections: [{
+        id: "metatool-ops",
+        slot: "api",
+        priority: 20,
+        content: () => [
+          "### Discovery",
+          "  cm.discover()                   \u2192 SkillInfo[]  (all skills with metadata)",
+          '  cm.info("name")                 \u2192 SkillInfo    (single skill)',
+          "",
+          "### Inspection",
+          '  cm.inspect("name")              \u2192 HealthReport (governance, frontmatter, orphans, dead links, children sync, cross symmetry, graph, changelog, update-freshness)',
+          "  cm.audit()                      \u2192 WorkspaceRow[] (one row per skill: governed, fileCount, fmMissing)",
+          "",
+          "### Frontmatter",
+          '  cm.frontmatter("name")          \u2192 { "file.md": { up: "...", prereqs: "..." } }',
+          "  cm.setFrontmatter(path, field, value)  \u2192 void",
+          "",
+          "### Protocols",
+          '  cm.protocol("\xA7 skill:inspect")  \u2192 string (protocol body from SKILL.md)',
+          "  cm.protocols()                  \u2192 string[] (all protocol keys)",
+          "",
+          "### Utils",
+          "  cm.utils()                      \u2192 UtilInfo[] (available utils)",
+          '  cm.runUtil("full-health", "nx-workspace") \u2192 { output, exitCode }',
+          "",
+          "### Mutations",
+          '  cm.adopt("name")                \u2192 string (adds governance line)',
+          '  cm.scaffold("name", { refs })   \u2192 string[] (created files)',
+          "",
+          "### Journals (append-only)",
+          "  await cm.journalEntries(path) \u2192 [{ id, date, title, hasEnrichmentMarker }]",
+          "  await cm.appendJournalEntry(path, { id, date, title, author, context, body })",
+          "  await cm.appendJournalEnrichment(path, entryId, { date, agent, body })",
+          "  Paths stay inside cwd; only *.journal.md and grandfathered infra-journal.md are accepted.",
+          "",
+          "### Conformance",
+          '  cm.conformance("name")          \u2192 { level: 0-3, label, type, detail[] }',
+          "  cm.conformanceAudit()           \u2192 { name, level, label, type }[]",
+          "",
+          "### Freshness",
+          '  cm.freshness("name")            \u2192 FreshnessReport (update-policy status per doc)',
+          '  cm.setUpdateStatus(path, "current"|"stale"|"pending")  \u2192 void',
+          "",
+          "### Composed",
+          '  cm.profile("name")              \u2192 { health, level, label, type, policies, stale, clean }',
+          "  cm.each(s => expr)              \u2192 T[]  (map over all skills \u2014 replaces discover().map())",
+          "  cm.where(pred, fn)              \u2192 T[]  (filter+map \u2014 replaces discover().filter().map())",
+          "  cm.staleAll()                   \u2192 UpdatePolicy[] (all stale docs workspace-wide)",
+          "  cm.freshnessAll()               \u2192 { total, current, stale, pending, untracked }"
+        ].join("\n")
+      }]
+    }
+  };
+}
 export {
   NodeFileSystemLayer,
   createMetatool,
+  metatoolPlugin,
   sanitizeForToolPayload,
   layer as sqliteNodeLayer,
   stringifyForToolContent

@@ -98,7 +98,23 @@ try {
     {
       path: "/opt/jcode-mt/run.mjs",
       content: `
-import { createMetatool, sqliteNodeLayer, NodeFileSystemLayer, sanitizeForToolPayload, stringifyForToolContent } from "/opt/jcode-mt/engine.mjs";
+	import { createMetatool, sqliteNodeLayer, NodeFileSystemLayer, sanitizeForToolPayload, stringifyForToolContent, metatoolPlugin } from "/opt/jcode-mt/engine.mjs";
+
+	const HISTORY_COLLECTION = "jcode.session";
+	const HISTORY_KEY = "mt-history";
+	const HISTORY_LIMIT = 50;
+	const RESULT_TRUNCATE_LENGTH = 500;
+
+	function truncateResult(value) {
+	  const text = typeof value === "string" ? value : stringifyForToolContent(value);
+	  return text.length > RESULT_TRUNCATE_LENGTH ? text.slice(0, RESULT_TRUNCATE_LENGTH - 3) + "..." : text;
+	}
+
+	function disabledProvider(name) {
+	  return async () => {
+	    throw new Error("mt." + name + " is disabled in native codemode until provider authority is brokered");
+	  };
+	}
 
 export async function run(request) {
   const consoleLines = [];
@@ -120,10 +136,55 @@ export async function run(request) {
       cwd: "/data",
     });
 
-    const extensionMethods = {
-      inputs: request.inputs,
-      history: (n) => (request.history ?? []).slice(-(n ?? 10)),
-    };
+	    let metatoolOverlayLoaded = false;
+	    const bounded = (n, fallback = 10) => Math.max(0, Math.min(Number.isFinite(Number(n)) ? Number(n) : fallback, HISTORY_LIMIT));
+	    async function readHistory(n) {
+	      const record = await metatool.get(HISTORY_COLLECTION, HISTORY_KEY).catch(() => undefined);
+	      const entries = Array.isArray(record?.entries) ? record.entries : [];
+	      return entries.slice(-bounded(n));
+	    }
+	    async function writeHistory(entry) {
+	      const record = await metatool.get(HISTORY_COLLECTION, HISTORY_KEY).catch(() => undefined);
+	      const entries = Array.isArray(record?.entries) ? record.entries : [];
+	      entries.push(entry);
+	      await metatool.put(HISTORY_COLLECTION, HISTORY_KEY, {
+	        _meta: { summary: "Bounded native MetaTool codemode evaluation history" },
+	        entries: entries.slice(-HISTORY_LIMIT),
+	      });
+	    }
+	    async function contextSnapshot() {
+	      const collections = await metatool.collections().catch(() => []);
+	      const overlayIds = metatool.overlays?.() ?? [];
+	      return {
+	        cwd: "/data",
+	        project: "agentos-codemode",
+	        inputs: request.inputs ?? {},
+	        profiles: {
+	          current: request.profile ?? "pure",
+	          workspaceRead: "blocked until a native capability broker grants authority",
+	          workspaceMutate: "blocked until a native capability broker grants authority",
+	        },
+	        skills: { count: 0, names: [] },
+	        overlays: { count: overlayIds.length, ids: overlayIds },
+	        collections,
+	        history: { limit: HISTORY_LIMIT, count: (await readHistory(HISTORY_LIMIT)).length },
+	      };
+	    }
+	    const extensionMethods = {
+	      inputs: request.inputs,
+	      get context() { return contextSnapshot(); },
+	      history: readHistory,
+	      recordHistory: writeHistory,
+	      loadMetatoolPlugin: async () => {
+	        if (!metatoolOverlayLoaded) {
+	          await metatool.loadOverlay(metatoolPlugin("/data", NodeFileSystemLayer));
+	          metatoolOverlayLoaded = true;
+	        }
+	      },
+	      llm: disabledProvider("llm"),
+	      llm_batch: disabledProvider("llm_batch"),
+	      ask: disabledProvider("ask"),
+	    };
     const mt = new Proxy(extensionMethods, {
       get(target, property, receiver) {
         if (Reflect.has(target, property)) return Reflect.get(target, property, receiver);
@@ -142,14 +203,21 @@ export async function run(request) {
     });
 
     const fn = new Function("mt", "inputs", '"use strict"; return (async () => { ' + request.source + ' })()');
-    const rawResult = await fn(mt, request.inputs);
+	    const rawResult = await fn(mt, request.inputs);
     const { value, warnings } = await sanitizeForToolPayload(rawResult, {
       promiseTimeoutMs: request.promise_timeout_ms ?? 10_000,
       maxArrayItems: 200,
       maxObjectKeys: 200,
       maxDepth: 8,
     });
-    const allWarnings = consoleLines.length > 0
+	    await writeHistory({
+	      code: request.source,
+	      result: truncateResult(value),
+	      timestamp: new Date().toISOString(),
+	    }).catch((error) => {
+	      warnings.push("Failed to record mt.history entry: " + (error?.message ?? String(error)));
+	    });
+	    const allWarnings = consoleLines.length > 0
       ? [...warnings, "Captured " + consoleLines.length + " console message(s): " + consoleLines.slice(0, 3).join(" | ")]
       : warnings;
     return {
@@ -178,11 +246,11 @@ export async function run(request) {
 (async () => {
   const { run } = await import("/opt/jcode-mt/run.mjs");
   return await run(${JSON.stringify({
-    source: request.source,
-    inputs: request.inputs,
-    history: request.history ?? [],
-    promise_timeout_ms: request.promise_timeout_ms,
-  })});
+	    source: request.source,
+	    inputs: request.inputs,
+	    profile: request.profile ?? "pure",
+	    promise_timeout_ms: request.promise_timeout_ms,
+	  })});
 })()`;
 
   const evaluation = await runtime.javascript.evaluate(guestProgram, {
