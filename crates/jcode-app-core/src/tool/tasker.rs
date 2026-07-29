@@ -2,15 +2,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use jcode_tasker_store::TaskerStore;
-use jcode_tasker_types::{
-    AddTaskDependency, CreateFeature, CreateProject, CreateTask, Project, ProjectRevision,
-    SetTaskState, TaskPriority, TaskState,
+use jcode_tasker_pi::{
+    CreateFeature, CreateTask, PiTaskerStore, ProjectPartition, Task, UpdateFeature, UpdateTask,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolContext, ToolOutput};
+
+const BACKEND: &str = "jcode-tasker-pi";
+const TASK_STATES: &[&str] = &["todo", "in_progress", "blocked", "done", "cancelled"];
+const FEATURE_STATES: &[&str] = &["open", "active", "closed", "archived"];
+const DEFAULT_LIMIT: usize = 100;
+const MAX_LIMIT: usize = 500;
+const FEATURE_PRIORITIES: &[&str] = &["low", "medium", "high", "critical"];
 
 pub struct TaskerTool {
     database_path: Option<PathBuf>,
@@ -30,17 +35,10 @@ impl TaskerTool {
         }
     }
 
-    fn database_path(&self) -> Result<PathBuf> {
-        match &self.database_path {
-            Some(path) => Ok(path.clone()),
-            None => Ok(crate::storage::jcode_dir()?.join("tasker/tasks.db")),
-        }
-    }
-
-    async fn open_store(&self) -> Result<TaskerStore> {
-        TaskerStore::open(self.database_path()?)
-            .await
-            .context("open native Tasker database")
+    fn database_path(&self) -> PathBuf {
+        self.database_path
+            .clone()
+            .unwrap_or_else(jcode_tasker_pi::default_db_path)
     }
 }
 
@@ -60,13 +58,31 @@ struct TaskerInput {
     #[serde(default)]
     depends_on_task_id: Option<String>,
     #[serde(default)]
-    state: Option<TaskState>,
+    state: Option<String>,
     #[serde(default)]
-    priority: Option<TaskPriority>,
+    priority: Option<String>,
     #[serde(default)]
     rank: Option<i64>,
     #[serde(default)]
-    expected_revision: Option<ProjectRevision>,
+    query: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tags: Option<Value>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    acceptance: Option<Value>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    gates: Option<Value>,
+    #[serde(default)]
+    indexes: Option<Value>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 fn required<T>(value: Option<T>, field: &'static str, action: &str) -> Result<T> {
@@ -82,40 +98,87 @@ fn canonical_root(ctx: &ToolContext) -> Result<PathBuf> {
         .with_context(|| format!("canonicalize Tasker project root {}", root.display()))
 }
 
-fn project_name(root: &Path) -> String {
-    root.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("project")
-        .to_string()
+fn validate_enum(value: &str, allowed: &[&str], field: &str) -> Result<()> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "invalid {field}: {value}; expected one of {}",
+            allowed.join(", ")
+        ))
+    }
 }
 
-async fn project_for_root(
-    store: &TaskerStore,
-    root: &Path,
-    create: bool,
-) -> Result<Option<Project>> {
-    let root_text = root.to_string_lossy().into_owned();
-    if let Some(project) = store.project_by_root(root_text.clone()).await? {
-        return Ok(Some(project));
-    }
-    if !create {
-        return Ok(None);
-    }
-    let created = store
-        .create_project(CreateProject {
-            id: None,
-            name: project_name(root),
-            canonical_root: Some(root_text),
-        })
-        .await?;
-    Ok(Some(created.value))
+fn task_title(task: &Task) -> String {
+    format!("#{} {}", task.display_id, task.title)
+}
+
+fn bounded_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
 fn output(title: impl Into<String>, metadata: Value) -> Result<ToolOutput> {
     Ok(ToolOutput::new(serde_json::to_string_pretty(&metadata)?)
         .with_title(title)
         .with_metadata(metadata))
+}
+
+fn provider_metadata(store: &PiTaskerStore) -> Result<Value> {
+    let partition = store.partition();
+    Ok(json!({
+        "backend": BACKEND,
+        "database_path": partition.db_path,
+        "list_id": partition.list_id,
+        "project_root": partition.project_root,
+        "schema_fingerprint": store.schema_fingerprint()?,
+    }))
+}
+
+fn resolve_task(store: &PiTaskerStore, reference: String, action: &str) -> Result<String> {
+    store
+        .resolve_task_id(&reference)?
+        .ok_or_else(|| anyhow!("task_id {reference:?} was not found for {action}"))
+}
+
+fn resolve_feature(store: &PiTaskerStore, reference: String, action: &str) -> Result<String> {
+    store
+        .resolve_feature_id(&reference)?
+        .ok_or_else(|| anyhow!("feature_id {reference:?} was not found for {action}"))
+}
+
+fn task_ready(store: &PiTaskerStore, task_id: &str) -> Result<Value> {
+    let tasks = store.list_tasks(None)?;
+    let deps = store.list_dependencies()?;
+    let done = tasks.iter().filter(|t| t.state == "done").map(|t| &t.id);
+    let done = done.collect::<std::collections::BTreeSet<_>>();
+    let blocking = deps
+        .iter()
+        .filter(|dep| dep.task_id == task_id && !done.contains(&dep.depends_on_id))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ready": blocking.is_empty(),
+        "blocked_by": blocking,
+    }))
+}
+
+fn run_pi<R, F>(db_path: PathBuf, root: PathBuf, f: F) -> tokio::task::JoinHandle<Result<R>>
+where
+    R: Send + 'static,
+    F: FnOnce(&mut PiTaskerStore) -> Result<R> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create Pi tasker database directory {}", parent.display())
+            })?;
+        }
+        let partition = ProjectPartition::with_db_path(
+            db_path,
+            jcode_tasker_pi::canonical_project_root(root.as_path()),
+        );
+        let mut store = PiTaskerStore::open(partition).context("open Pi Tasker database")?;
+        f(&mut store)
+    })
 }
 
 #[async_trait]
@@ -125,172 +188,437 @@ impl Tool for TaskerTool {
     }
 
     fn description(&self) -> &str {
-        "Manage durable, dependency-aware project work in Jcode's native Tasker database. This is distinct from session-local todo planning."
+        "Manage durable, dependency-aware project work in the canonical Pi-compatible Tasker SQLite backend at ~/.pi/tasker/tasks.db, partitioned exactly like Pi by list_id and project_root. This public tool uses Pi compatibility while Jcode-native Tasker crates remain for the future native-superset direction."
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "required": ["action"],
+            "additionalProperties": false,
             "properties": {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["status", "ready", "show", "create_feature", "create", "add_dependency", "set_state"]
+                    "enum": [
+                        "status", "ready", "show", "create_feature", "create", "add_dependency", "set_state",
+                        "list", "search", "update", "add_note", "feature_list", "feature_update", "feature_status",
+                        "link", "unlink"
+                    ]
                 },
                 "title": {"type": "string"},
                 "description": {"type": "string"},
-                "feature_id": {"type": "string", "description": "Feature reference: feat_<uuid> or #F<number>."},
+                "feature_id": {"type": "string", "description": "Feature reference: feat_<id>, F<number>, or #F<number>."},
                 "parent_feature_id": {"type": "string", "description": "Optional parent feature reference."},
-                "task_id": {"type": "string", "description": "Task reference: task_<uuid> or #<number>."},
+                "task_id": {"type": "string", "description": "Task reference: task_<id>, <number>, or #<number>."},
                 "depends_on_task_id": {"type": "string", "description": "Prerequisite task reference."},
-                "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done", "cancelled"]},
-                "priority": {"type": "string", "enum": ["low", "normal", "high", "critical"]},
-                "rank": {"type": "integer"},
-                "expected_revision": {"type": "integer", "minimum": 0}
+                "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done", "open", "active", "closed", "archived"]},
+                "priority": {"type": "string", "enum": ["low", "normal", "medium", "high", "critical"]},
+                "rank": {"type": "integer", "description": "Accepted for compatibility; Pi stores order as display_id."},
+                "query": {"type": "string"},
+                "category": {"type": "string"},
+                "content": {"type": "string"},
+                "tags": {"type": ["array", "object"]},
+                "brief": {"type": "string"},
+                "acceptance": {"type": ["array", "object"]},
+                "owner": {"type": "string"},
+                "gates": {"type": ["array", "object"]},
+                "indexes": {"type": ["array", "object"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum records returned by bounded list, search, and status projections."}
             }
         })
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let params: TaskerInput = serde_json::from_value(input)?;
+        let _compat_ignored = params.rank;
         let root = canonical_root(&ctx)?;
-        let store = self.open_store().await?;
-        let create_project = matches!(
-            params.action.as_str(),
-            "create_feature" | "create" | "add_dependency" | "set_state"
-        );
-        let Some(project) = project_for_root(&store, &root, create_project).await? else {
-            return output(
-                "Tasker not initialized",
-                json!({
-                    "initialized": false,
-                    "canonical_root": root,
-                    "message": "Create a feature or task to initialize durable project state."
-                }),
-            );
-        };
+        let db_path = self.database_path();
+        let action = params.action.clone();
+        run_pi(db_path, root, move |store| {
+            let base = provider_metadata(store)?;
+            let limit = bounded_limit(params.limit);
+            let with_base = |payload: Value| -> Value {
+                let mut merged = base.clone();
+                if let (Some(dst), Some(src)) = (merged.as_object_mut(), payload.as_object()) {
+                    dst.extend(src.clone());
+                }
+                merged
+            };
 
-        match params.action.as_str() {
-            "status" => {
-                let snapshot = store.snapshot(project.id).await?;
-                output(
-                    format!("Tasker revision {}", snapshot.revision),
-                    serde_json::to_value(snapshot)?,
-                )
-            }
-            "ready" => {
-                let ready = store.list_ready(project.id).await?;
-                output(
-                    format!("{} ready tasks", ready.len()),
-                    json!({"project": project, "ready": ready}),
-                )
-            }
-            "show" => {
-                let task_reference = required(params.task_id, "task_id", "show")?;
-                let task = store.resolve_task(project.id, task_reference).await?;
-                let task_id = task.id;
-                let readiness = store.task_readiness(project.id, task_id).await?;
-                let dependencies = store.task_dependencies(project.id, task_id).await?;
-                output(
-                    format!("{} {}", task.alias, task.title),
-                    json!({
-                        "project": project,
-                        "task": task,
-                        "readiness": readiness,
-                        "dependencies": dependencies
-                    }),
-                )
-            }
-            "create_feature" => {
-                let title = required(params.title, "title", "create_feature")?;
-                let parent_id = match params.parent_feature_id {
-                    Some(reference) => Some(store.resolve_feature(project.id, reference).await?.id),
-                    None => None,
-                };
-                let mutation = store
-                    .create_feature(CreateFeature {
-                        project_id: project.id,
-                        id: None,
-                        parent_id,
-                        title,
-                        description: params.description.unwrap_or_default(),
-                        expected_revision: params.expected_revision.or(Some(project.revision)),
-                    })
-                    .await?;
-                output(
-                    format!("Created {}", mutation.value.alias),
-                    json!({"feature": mutation.value, "revision": mutation.revision, "event_id": mutation.event_id}),
-                )
-            }
-            "create" => {
-                let title = required(params.title, "title", "create")?;
-                let feature_reference = required(params.feature_id, "feature_id", "create")?;
-                let feature_id = store
-                    .resolve_feature(project.id, feature_reference)
-                    .await?
-                    .id;
-                let mutation = store
-                    .create_task(CreateTask {
-                        project_id: project.id,
+            match action.as_str() {
+                "status" => {
+                    let snapshot = store.snapshot()?;
+                    let task_count = snapshot.tasks.len();
+                    let feature_count = snapshot.features.len();
+                    let dependency_count = snapshot.dependencies.len();
+                    let note_count = snapshot.task_notes.len() + snapshot.feature_notes.len();
+                    let ready_tasks = store.ready_tasks()?;
+                    let ready_count = ready_tasks.len();
+                    output(
+                        format!("Pi Tasker {task_count} tasks"),
+                        with_base(json!({
+                            "initialized": snapshot.list_meta.is_some(),
+                            "list_meta": snapshot.list_meta,
+                            "counts": {
+                                "tasks": task_count,
+                                "features": feature_count,
+                                "dependencies": dependency_count,
+                                "notes": note_count,
+                                "ready": ready_count,
+                            },
+                            "ready_tasks": ready_tasks.into_iter().take(limit).collect::<Vec<_>>(),
+                            "truncated": ready_count > limit,
+                            "limit": limit,
+                        })),
+                    )
+                }
+                "ready" => {
+                    let ready = store.ready_tasks()?;
+                    let total = ready.len();
+                    output(
+                        format!("{total} ready tasks"),
+                        with_base(json!({
+                            "ready": ready.into_iter().take(limit).collect::<Vec<_>>(),
+                            "total": total,
+                            "truncated": total > limit,
+                            "limit": limit,
+                        })),
+                    )
+                }
+                "list" => {
+                    if let Some(state) = params.state.as_deref() {
+                        validate_enum(state, TASK_STATES, "state")?;
+                    }
+                    let tasks = store.list_tasks(params.state.as_deref())?;
+                    let total = tasks.len();
+                    output(
+                        format!("{total} tasks"),
+                        with_base(json!({
+                            "tasks": tasks.into_iter().take(limit).collect::<Vec<_>>(),
+                            "total": total,
+                            "truncated": total > limit,
+                            "limit": limit,
+                        })),
+                    )
+                }
+                "search" => {
+                    let query = required(params.query, "query", "search")?;
+                    if let Some(state) = params.state.as_deref() {
+                        validate_enum(state, TASK_STATES, "state")?;
+                    }
+                    let tasks = store.search_tasks(&query, params.state.as_deref())?;
+                    let total = tasks.len();
+                    output(
+                        format!("{total} matching tasks"),
+                        with_base(json!({
+                            "query": query,
+                            "tasks": tasks.into_iter().take(limit).collect::<Vec<_>>(),
+                            "total": total,
+                            "truncated": total > limit,
+                            "limit": limit,
+                        })),
+                    )
+                }
+                "show" => {
+                    let task_id =
+                        resolve_task(store, required(params.task_id, "task_id", "show")?, "show")?;
+                    let task = store
+                        .list_tasks(None)?
+                        .into_iter()
+                        .find(|t| t.id == task_id)
+                        .ok_or_else(|| anyhow!("task disappeared while showing it"))?;
+                    let dependencies = store
+                        .list_dependencies()?
+                        .into_iter()
+                        .filter(|dep| dep.task_id == task.id)
+                        .collect::<Vec<_>>();
+                    let notes = store
+                        .list_task_notes()?
+                        .into_iter()
+                        .filter(|note| note.task_id == task.id)
+                        .collect::<Vec<_>>();
+                    output(
+                        task_title(&task),
+                        with_base(json!({
+                            "task": task,
+                            "readiness": task_ready(store, &task_id)?,
+                            "dependencies": dependencies,
+                            "notes": notes,
+                        })),
+                    )
+                }
+                "create_feature" => {
+                    let parent_feature_id = match params.parent_feature_id {
+                        Some(reference) => {
+                            Some(resolve_feature(store, reference, "create_feature")?)
+                        }
+                        None => None,
+                    };
+                    if let Some(state) = params.state.as_deref() {
+                        validate_enum(state, FEATURE_STATES, "state")?;
+                    }
+                    if let Some(priority) = params.priority.as_deref() {
+                        validate_enum(priority, FEATURE_PRIORITIES, "priority")?;
+                    }
+                    let feature = store.create_feature(CreateFeature {
+                        title: required(params.title, "title", "create_feature")?,
+                        description: params.description,
+                        parent_feature_id,
+                        state: params.state,
+                        priority: params.priority,
+                        tags: params.tags.unwrap_or_else(|| json!([])),
+                        brief: params.brief,
+                        acceptance: params.acceptance.unwrap_or_else(|| json!([])),
+                        owner: params.owner,
+                        gates: params.gates.unwrap_or_else(|| json!([])),
+                        indexes: params.indexes.unwrap_or_else(|| json!([])),
+                    })?;
+                    output(
+                        format!("Created F{}", feature.display_id),
+                        with_base(json!({"feature": feature})),
+                    )
+                }
+                "create" => {
+                    if let Some(state) = params.state.as_deref() {
+                        validate_enum(state, TASK_STATES, "state")?;
+                    }
+                    let feature_id = match params.feature_id {
+                        Some(reference) => Some(resolve_feature(store, reference, "create")?),
+                        None => None,
+                    };
+                    let depends_on = match params.depends_on_task_id {
+                        Some(reference) => vec![resolve_task(store, reference, "create")?],
+                        None => Vec::new(),
+                    };
+                    let task = store.create_task(CreateTask {
+                        title: required(params.title, "title", "create")?,
+                        description: params.description,
+                        state: params.state,
                         feature_id,
-                        id: None,
-                        title,
-                        description: params.description.unwrap_or_default(),
-                        priority: params.priority.unwrap_or_default(),
-                        rank: params.rank.unwrap_or_default(),
-                        expected_revision: params.expected_revision.or(Some(project.revision)),
-                    })
-                    .await?;
-                output(
-                    format!("Created {}", mutation.value.alias),
-                    json!({"task": mutation.value, "revision": mutation.revision, "event_id": mutation.event_id}),
-                )
+                        indexes: params.indexes,
+                        depends_on,
+                    })?;
+                    output(
+                        format!("Created #{}", task.display_id),
+                        with_base(json!({"task": task})),
+                    )
+                }
+                "update" | "set_state" => {
+                    let task_id = resolve_task(
+                        store,
+                        required(params.task_id, "task_id", action.as_str())?,
+                        action.as_str(),
+                    )?;
+                    if let Some(state) = params.state.as_deref() {
+                        validate_enum(state, TASK_STATES, "state")?;
+                    }
+                    let feature_id = match params.feature_id {
+                        Some(reference) => {
+                            Some(Some(resolve_feature(store, reference, action.as_str())?))
+                        }
+                        None => None,
+                    };
+                    if action == "set_state" && params.state.is_none() {
+                        return Err(anyhow!("state is required for set_state"));
+                    }
+                    let task = store.update_task(
+                        &task_id,
+                        UpdateTask {
+                            title: params.title,
+                            description: params.description.map(Some),
+                            state: params.state,
+                            feature_id,
+                            indexes: params.indexes,
+                        },
+                    )?;
+                    output(
+                        format!("Updated #{}", task.display_id),
+                        with_base(json!({"task": task})),
+                    )
+                }
+                "add_dependency" => {
+                    let task_id = resolve_task(
+                        store,
+                        required(params.task_id, "task_id", "add_dependency")?,
+                        "add_dependency",
+                    )?;
+                    let dependency = resolve_task(
+                        store,
+                        required(
+                            params.depends_on_task_id,
+                            "depends_on_task_id",
+                            "add_dependency",
+                        )?,
+                        "add_dependency",
+                    )?;
+                    let existing = store
+                        .list_dependencies()?
+                        .into_iter()
+                        .filter(|dep| dep.task_id == task_id)
+                        .map(|dep| dep.depends_on_id)
+                        .chain(std::iter::once(dependency))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let dependencies = store.set_dependencies(&task_id, &existing)?;
+                    output(
+                        "Added task dependency",
+                        with_base(json!({"dependencies": dependencies})),
+                    )
+                }
+                "add_note" => {
+                    let content = required(params.content, "content", "add_note")?;
+                    match (params.task_id, params.feature_id) {
+                        (Some(task_reference), None) => {
+                            let task_id = resolve_task(store, task_reference, "add_note")?;
+                            let note = store.append_task_note(
+                                &task_id,
+                                params.category.as_deref(),
+                                &content,
+                            )?;
+                            output("Added task note", with_base(json!({"note": note})))
+                        }
+                        (None, Some(feature_reference)) => {
+                            let feature_id = resolve_feature(store, feature_reference, "add_note")?;
+                            let note = store.append_feature_note(
+                                &feature_id,
+                                params.category.as_deref(),
+                                &content,
+                            )?;
+                            output("Added feature note", with_base(json!({"note": note})))
+                        }
+                        _ => Err(anyhow!(
+                            "add_note requires exactly one of task_id or feature_id"
+                        )),
+                    }
+                }
+                "feature_list" => {
+                    let features = store.list_features()?;
+                    let total = features.len();
+                    output(
+                        format!("{total} features"),
+                        with_base(json!({
+                            "features": features.into_iter().take(limit).collect::<Vec<_>>(),
+                            "total": total,
+                            "truncated": total > limit,
+                            "limit": limit,
+                        })),
+                    )
+                }
+                "feature_status" => {
+                    let feature_id = resolve_feature(
+                        store,
+                        required(params.feature_id, "feature_id", "feature_status")?,
+                        "feature_status",
+                    )?;
+                    let feature = store
+                        .list_features()?
+                        .into_iter()
+                        .find(|f| f.id == feature_id)
+                        .ok_or_else(|| anyhow!("feature disappeared while showing it"))?;
+                    let tasks = store
+                        .list_tasks(None)?
+                        .into_iter()
+                        .filter(|task| task.feature_id.as_deref() == Some(feature_id.as_str()))
+                        .collect::<Vec<_>>();
+                    let dependencies = store
+                        .list_feature_dependencies()?
+                        .into_iter()
+                        .filter(|dep| dep.feature_id == feature_id)
+                        .collect::<Vec<_>>();
+                    let notes = store
+                        .list_feature_notes()?
+                        .into_iter()
+                        .filter(|note| note.feature_id == feature_id)
+                        .collect::<Vec<_>>();
+                    output(
+                        format!("F{} {}", feature.display_id, feature.title),
+                        with_base(json!({
+                            "feature": feature,
+                            "tasks": tasks,
+                            "dependencies": dependencies,
+                            "notes": notes,
+                        })),
+                    )
+                }
+                "feature_update" => {
+                    let feature_id = resolve_feature(
+                        store,
+                        required(params.feature_id, "feature_id", "feature_update")?,
+                        "feature_update",
+                    )?;
+                    if let Some(state) = params.state.as_deref() {
+                        validate_enum(state, FEATURE_STATES, "state")?;
+                    }
+                    if let Some(priority) = params.priority.as_deref() {
+                        validate_enum(priority, FEATURE_PRIORITIES, "priority")?;
+                    }
+                    let parent_feature_id = match params.parent_feature_id {
+                        Some(reference) => {
+                            Some(Some(resolve_feature(store, reference, "feature_update")?))
+                        }
+                        None => None,
+                    };
+                    let feature = store.update_feature(
+                        &feature_id,
+                        UpdateFeature {
+                            title: params.title,
+                            description: params.description.map(Some),
+                            parent_feature_id,
+                            state: params.state,
+                            priority: params.priority,
+                            tags: params.tags,
+                            brief: params.brief.map(Some),
+                            acceptance: params.acceptance,
+                            owner: params.owner.map(Some),
+                            gates: params.gates,
+                            indexes: params.indexes,
+                        },
+                    )?;
+                    output(
+                        format!("Updated F{}", feature.display_id),
+                        with_base(json!({"feature": feature})),
+                    )
+                }
+                "link" => {
+                    let task_id =
+                        resolve_task(store, required(params.task_id, "task_id", "link")?, "link")?;
+                    let feature_id = resolve_feature(
+                        store,
+                        required(params.feature_id, "feature_id", "link")?,
+                        "link",
+                    )?;
+                    store.link_task(&task_id, &feature_id)?;
+                    let task = store
+                        .list_tasks(None)?
+                        .into_iter()
+                        .find(|task| task.id == task_id)
+                        .ok_or_else(|| anyhow!("task disappeared after link"))?;
+                    output("Linked task to feature", with_base(json!({"task": task})))
+                }
+                "unlink" => {
+                    let task_id = resolve_task(
+                        store,
+                        required(params.task_id, "task_id", "unlink")?,
+                        "unlink",
+                    )?;
+                    store.unlink_task(&task_id)?;
+                    let task = store
+                        .list_tasks(None)?
+                        .into_iter()
+                        .find(|task| task.id == task_id)
+                        .ok_or_else(|| anyhow!("task disappeared after unlink"))?;
+                    output(
+                        "Unlinked task from feature",
+                        with_base(json!({"task": task})),
+                    )
+                }
+                action => Err(anyhow!("unsupported tasker action: {action}")),
             }
-            "add_dependency" => {
-                let task_reference = required(params.task_id, "task_id", "add_dependency")?;
-                let dependency_reference = required(
-                    params.depends_on_task_id,
-                    "depends_on_task_id",
-                    "add_dependency",
-                )?;
-                let task_id = store.resolve_task(project.id, task_reference).await?.id;
-                let depends_on_task_id = store
-                    .resolve_task(project.id, dependency_reference)
-                    .await?
-                    .id;
-                let mutation = store
-                    .add_task_dependency(AddTaskDependency {
-                        project_id: project.id,
-                        task_id,
-                        depends_on_task_id,
-                        expected_revision: params.expected_revision.or(Some(project.revision)),
-                    })
-                    .await?;
-                output(
-                    "Added task dependency",
-                    json!({"dependency": mutation.value, "revision": mutation.revision, "event_id": mutation.event_id}),
-                )
-            }
-            "set_state" => {
-                let task_reference = required(params.task_id, "task_id", "set_state")?;
-                let task_id = store.resolve_task(project.id, task_reference).await?.id;
-                let state = required(params.state, "state", "set_state")?;
-                let mutation = store
-                    .set_task_state(SetTaskState {
-                        project_id: project.id,
-                        task_id,
-                        state,
-                        expected_revision: params.expected_revision.or(Some(project.revision)),
-                    })
-                    .await?;
-                output(
-                    format!("Updated {}", mutation.value.alias),
-                    json!({"task": mutation.value, "revision": mutation.revision, "event_id": mutation.event_id}),
-                )
-            }
-            action => Err(anyhow!("unsupported tasker action: {action}")),
-        }
+        })
+        .await
+        .context("Pi Tasker blocking task panicked or was cancelled")?
     }
 }
 
@@ -298,6 +626,7 @@ impl Tool for TaskerTool {
 mod tests {
     use super::*;
     use jcode_tool_core::ToolExecutionMode;
+    use rusqlite::Connection;
 
     fn context(root: &Path) -> ToolContext {
         ToolContext {
@@ -311,82 +640,209 @@ mod tests {
         }
     }
 
+    fn install_pi_schema(path: &Path) {
+        let conn = Connection::open(path).expect("open temp pi db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE task_lists (list_id TEXT NOT NULL, project_root TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (list_id, project_root));
+            CREATE TABLE tasks (id TEXT PRIMARY KEY, list_id TEXT NOT NULL, project_root TEXT NOT NULL, display_id INTEGER NOT NULL, title TEXT NOT NULL, description TEXT, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, indexes TEXT DEFAULT '[]', feature_id TEXT);
+            CREATE TABLE task_dependencies (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, depends_on TEXT NOT NULL, list_id TEXT NOT NULL, project_root TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE task_notes (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, list_id TEXT NOT NULL, project_root TEXT NOT NULL, category TEXT, content TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE features (id TEXT PRIMARY KEY, list_id TEXT NOT NULL, project_root TEXT NOT NULL, display_id INTEGER NOT NULL, parent_feature_id TEXT, title TEXT NOT NULL, description TEXT, state TEXT NOT NULL DEFAULT 'open', priority TEXT DEFAULT 'medium', tags TEXT DEFAULT '[]', brief TEXT, acceptance TEXT DEFAULT '[]', owner TEXT, gates TEXT DEFAULT '[]', indexes TEXT DEFAULT '[]', depth INTEGER DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+            CREATE TABLE feature_dependencies (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, depends_on TEXT NOT NULL, list_id TEXT NOT NULL, project_root TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE feature_notes (id TEXT PRIMARY KEY, feature_id TEXT NOT NULL, list_id TEXT NOT NULL, project_root TEXT NOT NULL, category TEXT, content TEXT NOT NULL, created_at INTEGER NOT NULL);
+            CREATE TABLE tasker_session_instances (id TEXT PRIMARY KEY, list_id TEXT NOT NULL, project_root TEXT NOT NULL, agent_id TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT, pid INTEGER NOT NULL, model TEXT, leaf_id_at_start TEXT, current_leaf_id TEXT, started_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, ended_at INTEGER);
+            CREATE TABLE task_claims (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, list_id TEXT NOT NULL, project_root TEXT NOT NULL, agent_id TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT, session_instance_id TEXT NOT NULL, pid INTEGER NOT NULL, claim_kind TEXT NOT NULL, reason TEXT, claimed_at INTEGER NOT NULL, expires_at INTEGER, released_at INTEGER, release_reason TEXT, scope_feature_id TEXT);
+            CREATE TABLE work_units (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, claim_id TEXT, list_id TEXT NOT NULL, project_root TEXT NOT NULL, agent_id TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT, session_instance_id TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, note TEXT, created_at INTEGER NOT NULL, dispatched_at INTEGER, completed_at INTEGER, cancelled_at INTEGER, scope_feature_id TEXT);
+            CREATE TABLE visual_artifacts (id TEXT PRIMARY KEY, list_id TEXT NOT NULL, project_root TEXT NOT NULL, task_id TEXT, feature_id TEXT, work_unit_id TEXT, stage TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, path TEXT NOT NULL, mime_type TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}', created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+            "#,
+        )
+        .expect("install temp pi schema");
+    }
+
+    fn temp_tool() -> (tempfile::TempDir, TaskerTool) {
+        let database_dir = tempfile::tempdir().expect("database tempdir");
+        let path = database_dir.path().join("tasks.db");
+        install_pi_schema(&path);
+        (database_dir, TaskerTool::with_database_path(path))
+    }
+
     #[test]
-    fn schema_exposes_durable_actions_and_not_subagent_semantics() {
+    fn schema_exposes_pi_actions_and_provider_safe_shape() {
         let definition = TaskerTool::new().to_definition();
         assert_eq!(definition.name, "tasker");
-        assert!(definition.description.contains("dependency-aware"));
-        assert!(
-            definition.input_schema["properties"]["action"]["enum"]
-                .as_array()
-                .expect("action enum")
-                .contains(&json!("ready"))
-        );
+        assert!(definition.description.contains("Pi-compatible"));
+        assert!(definition.description.contains("native-superset"));
+        let schema = &definition.input_schema;
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(!schema.to_string().contains("expected_revision"));
+        for (_name, property) in schema["properties"].as_object().expect("properties") {
+            assert!(
+                property.get("type").is_some(),
+                "property lacks type: {property}"
+            );
+            assert!(
+                property.get("default").is_none(),
+                "property has default: {property}"
+            );
+        }
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        for action in [
+            "status",
+            "ready",
+            "show",
+            "create_feature",
+            "create",
+            "add_dependency",
+            "set_state",
+            "list",
+            "search",
+            "update",
+            "add_note",
+            "feature_list",
+            "feature_update",
+            "feature_status",
+            "link",
+            "unlink",
+        ] {
+            assert!(actions.contains(&json!(action)), "missing {action}");
+        }
     }
 
     #[tokio::test]
-    async fn initializes_project_and_round_trips_feature_task_and_status() {
+    async fn uses_temp_pi_schema_and_outputs_partition_metadata() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let database_dir = tempfile::tempdir().expect("database tempdir");
-        let tool = TaskerTool::with_database_path(database_dir.path().join("tasker.db"));
+        let (_database_dir, tool) = temp_tool();
         let ctx = context(workspace.path());
 
-        let empty = tool
+        let status = tool
             .execute(json!({"action": "status"}), ctx.clone())
             .await
-            .expect("empty status");
-        assert_eq!(
-            empty.metadata.expect("empty metadata")["initialized"],
-            false
+            .expect("empty status")
+            .metadata
+            .expect("status metadata");
+        assert_eq!(status["backend"], BACKEND);
+        assert_eq!(status["initialized"], false);
+        assert!(
+            status["database_path"]
+                .as_str()
+                .expect("database_path")
+                .contains("tasks.db")
         );
+        assert!(
+            status["list_id"]
+                .as_str()
+                .expect("list_id")
+                .starts_with("list_")
+        );
+        assert_eq!(
+            status["project_root"],
+            workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(status["schema_fingerprint"].as_str().unwrap().len(), 40);
+    }
+
+    #[tokio::test]
+    async fn round_trips_pi_feature_task_dependencies_notes_and_search() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (_database_dir, tool) = temp_tool();
+        let ctx = context(workspace.path());
 
         let feature = tool
             .execute(
-                json!({"action": "create_feature", "title": "Native Tasker"}),
+                json!({"action": "create_feature", "title": "Pi Tasker", "priority": "high", "tags": ["pi"]}),
                 ctx.clone(),
             )
             .await
-            .expect("create feature");
-        assert_eq!(
-            feature.metadata.expect("feature metadata")["feature"]["alias"],
-            1
-        );
+            .expect("create feature")
+            .metadata
+            .expect("feature metadata");
+        assert_eq!(feature["feature"]["displayId"], 1);
 
-        let task = tool
+        let setup = tool
             .execute(
-                json!({
-                    "action": "create",
-                    "feature_id": "#F1",
-                    "title": "Expose tasker tool",
-                    "priority": "critical"
-                }),
+                json!({"action": "create", "title": "Setup", "state": "done"}),
                 ctx.clone(),
             )
             .await
-            .expect("create task");
-        let task_metadata = task.metadata.expect("task metadata");
-        assert_eq!(task_metadata["task"]["alias"], 1);
-        assert_eq!(task_metadata["task"]["state"], "todo");
-
-        let shown = tool
-            .execute(json!({"action": "show", "task_id": "#1"}), ctx.clone())
-            .await
-            .expect("show task by alias")
+            .expect("create setup")
             .metadata
-            .expect("shown metadata");
-        assert_eq!(shown["task"]["title"], "Expose tasker tool");
+            .expect("setup metadata");
+        assert_eq!(setup["task"]["displayId"], 1);
 
-        let status = tool
-            .execute(json!({"action": "status"}), ctx)
+        let build = tool
+            .execute(
+                json!({"action": "create", "feature_id": "#F1", "title": "Build needle", "depends_on_task_id": "#1"}),
+                ctx.clone(),
+            )
             .await
-            .expect("populated status")
+            .expect("create build")
             .metadata
-            .expect("status metadata");
-        assert_eq!(status["features"].as_array().expect("features").len(), 1);
-        assert_eq!(status["tasks"].as_array().expect("tasks").len(), 1);
-        assert_eq!(
-            status["ready_tasks"].as_array().expect("ready tasks").len(),
-            1
-        );
+            .expect("build metadata");
+        assert_eq!(build["task"]["featureId"], feature["feature"]["id"]);
+
+        let ready = tool
+            .execute(json!({"action": "ready"}), ctx.clone())
+            .await
+            .expect("ready")
+            .metadata
+            .expect("ready metadata");
+        assert_eq!(ready["ready"].as_array().unwrap().len(), 1);
+
+        let note = tool
+            .execute(
+                json!({"action": "add_note", "task_id": "#2", "category": "context", "content": "note body"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("add note")
+            .metadata
+            .expect("note metadata");
+        assert_eq!(note["note"]["content"], "note body");
+
+        let search = tool
+            .execute(json!({"action": "search", "query": "needle"}), ctx.clone())
+            .await
+            .expect("search")
+            .metadata
+            .expect("search metadata");
+        assert_eq!(search["tasks"].as_array().unwrap().len(), 1);
+
+        let updated = tool
+            .execute(
+                json!({"action": "update", "task_id": "#2", "state": "in_progress", "description": "working"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("update")
+            .metadata
+            .expect("update metadata");
+        assert_eq!(updated["task"]["state"], "in_progress");
+
+        let feature_status = tool
+            .execute(
+                json!({"action": "feature_status", "feature_id": "F1"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("feature status")
+            .metadata
+            .expect("feature status metadata");
+        assert_eq!(feature_status["tasks"].as_array().unwrap().len(), 1);
+
+        let unlinked = tool
+            .execute(json!({"action": "unlink", "task_id": "#2"}), ctx)
+            .await
+            .expect("unlink")
+            .metadata
+            .expect("unlink metadata");
+        assert_eq!(unlinked["task"]["featureId"], Value::Null);
     }
 }
