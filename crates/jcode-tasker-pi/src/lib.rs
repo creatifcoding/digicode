@@ -111,6 +111,14 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+fn project_name(project_root: &str) -> &str {
+    Path::new(project_root)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(project_root)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskListMeta {
@@ -309,11 +317,7 @@ impl PiTaskerStore {
             return Ok(meta);
         }
         let now = now_ms();
-        let name = Path::new(&self.partition.project_root)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&self.partition.project_root);
+        let name = project_name(&self.partition.project_root);
         self.conn.execute("INSERT INTO task_lists (list_id, project_root, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![self.partition.list_id, self.partition.project_root, name, now, now])?;
         Ok(self.list_meta()?.expect("inserted list meta"))
     }
@@ -766,7 +770,8 @@ fn ensure_list_meta_tx(tx: &rusqlite::Transaction<'_>, p: &ProjectPartition) -> 
         .optional()?;
     if exists.is_none() {
         let now = now_ms();
-        tx.execute("INSERT INTO task_lists (list_id, project_root, name, created_at, updated_at) VALUES (?1,?2,?3,?4,?5)", params![p.list_id,p.project_root,p.project_root,now,now])?;
+        let name = project_name(&p.project_root);
+        tx.execute("INSERT INTO task_lists (list_id, project_root, name, created_at, updated_at) VALUES (?1,?2,?3,?4,?5)", params![p.list_id,p.project_root,name,now,now])?;
     }
     Ok(())
 }
@@ -1137,6 +1142,15 @@ mod tests {
     fn preflight_fingerprints_required_schema() {
         let store = temp_store();
         assert_eq!(store.schema_fingerprint().unwrap().len(), 40);
+    }
+
+    #[test]
+    fn first_transactional_write_uses_pi_project_name() {
+        let mut store = temp_store();
+        store
+            .create_feature(feature_input("Epic"))
+            .expect("create feature");
+        assert_eq!(store.list_meta().unwrap().unwrap().name, "root");
     }
 
     #[test]
