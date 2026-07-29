@@ -485,6 +485,7 @@ pub fn timeline_to_replay_events(timeline: &[TimelineEvent]) -> Vec<(u64, Replay
                         id,
                         name: name.clone(),
                         output: output.clone(),
+                        metadata: None,
                         error: if *is_error {
                             Some(output.clone())
                         } else {

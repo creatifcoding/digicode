@@ -526,9 +526,16 @@ impl Tool for SessionSearchTool {
                 .with_title("session_search"));
         }
 
+        let metadata = json!({
+            "kind": "session_search_results",
+            "query": params.query.trim(),
+            "report": report,
+        });
+
         Ok(
             ToolOutput::new(format_results(&params.query, &report, &options))
-                .with_title("session_search"),
+                .with_title("session_search")
+                .with_metadata(metadata),
         )
     }
 }
@@ -982,7 +989,7 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
         && let Ok(sessions) =
             crate::import::list_claude_code_sessions_lazy(options.max_scan_sessions)
     {
-        report.external_sources.push("claude");
+        report.external_sources.push("claude".to_string());
         let sessions: Vec<_> = sessions
             .into_iter()
             .take(options.max_scan_sessions)
@@ -1068,7 +1075,7 @@ fn collect_external_jsonl_source(
     if !root.exists() {
         return;
     }
-    report.external_sources.push(source);
+    report.external_sources.push(source.to_string());
     let paths = collect_recent_files_recursive(&root, "jsonl", options.max_scan_sessions);
     let mut candidates = external_index_candidate_paths(source, &paths, query);
     // Like the jcode path, cap how many candidate files get fully parsed.
@@ -1356,7 +1363,7 @@ fn collect_opencode_external_sessions(
     if !root.exists() {
         return;
     }
-    report.external_sources.push("opencode");
+    report.external_sources.push("opencode".to_string());
     let Ok(messages_base) = crate::storage::user_home_path(".local/share/opencode/storage/message")
     else {
         return;
@@ -1405,6 +1412,7 @@ fn append_external_session_results(
         results.push(SearchResult {
             source: session.source.to_string(),
             session_id: format!("{}:{}", session.source, session.session_id),
+            source_path: Some(session.path.display().to_string()),
             short_name: session.short_name.clone(),
             title: session.title.clone(),
             working_dir: session.working_dir.clone(),
@@ -1441,6 +1449,7 @@ fn append_external_session_results(
         results.push(SearchResult {
             source: session.source.to_string(),
             session_id: format!("{}:{}", session.source, session.session_id),
+            source_path: Some(session.path.display().to_string()),
             short_name: session.short_name.clone(),
             title: session.title.clone(),
             working_dir: session.working_dir.clone(),
@@ -1537,6 +1546,7 @@ fn append_session_results(
         results.push(SearchResult {
             source: "jcode".to_string(),
             session_id: session.id.clone(),
+            source_path: None,
             short_name: session.short_name.clone(),
             title: session.display_title().map(ToOwned::to_owned),
             working_dir: session.working_dir.clone(),
@@ -1591,6 +1601,7 @@ fn append_session_results(
         results.push(SearchResult {
             source: "jcode".to_string(),
             session_id: session.id.clone(),
+            source_path: None,
             short_name: session.short_name.clone(),
             title: session.display_title().map(ToOwned::to_owned),
             working_dir: session.working_dir.clone(),

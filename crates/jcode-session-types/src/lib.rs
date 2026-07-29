@@ -638,7 +638,7 @@ pub fn session_search_markdown_code_block(text: &str) -> String {
     format!("{fence}text\n{text}\n{fence}")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SessionSearchResultKind {
     Metadata,
     Message,
@@ -653,7 +653,7 @@ impl SessionSearchResultKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionSearchContextLine {
     pub message_index: usize,
     pub role: String,
@@ -661,10 +661,11 @@ pub struct SessionSearchContextLine {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionSearchResult {
     pub source: String,
     pub session_id: String,
+    pub source_path: Option<String>,
     pub short_name: Option<String>,
     pub title: Option<String>,
     pub working_dir: Option<String>,
@@ -683,13 +684,13 @@ pub struct SessionSearchResult {
     pub context: Vec<SessionSearchContextLine>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionSearchReport {
     pub results: Vec<SessionSearchResult>,
     pub scanned_jcode_sessions: usize,
     pub candidate_jcode_sessions: usize,
     pub scanned_external_sessions: usize,
-    pub external_sources: Vec<&'static str>,
+    pub external_sources: Vec<String>,
     pub read_errors: usize,
     pub parse_errors: usize,
     pub truncated: bool,
@@ -1062,5 +1063,71 @@ mod session_search_tests {
         let fenced = session_search_markdown_code_block("contains ``` fence");
         assert!(fenced.starts_with("````text\n"));
         assert!(fenced.ends_with("\n````"));
+    }
+
+    #[test]
+    fn report_serializes_hit_metadata_for_ui_deep_links() {
+        let updated_at = DateTime::parse_from_rfc3339("2026-07-29T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let report = SessionSearchReport {
+            results: vec![SessionSearchResult {
+                source: "jcode".to_string(),
+                session_id: "session-123".to_string(),
+                source_path: Some("/remote/sessions/session-123.jsonl".to_string()),
+                short_name: Some("short".to_string()),
+                title: Some("Title".to_string()),
+                working_dir: Some("/remote/project".to_string()),
+                provider_key: Some("claude".to_string()),
+                model: Some("model".to_string()),
+                updated_at,
+                kind: SessionSearchResultKind::Message,
+                role: "assistant".to_string(),
+                message_index: Some(7),
+                message_id: Some("msg-7".to_string()),
+                message_timestamp: Some(updated_at),
+                snippet: "needle".to_string(),
+                score: 42.0,
+                matched_terms: vec!["needle".to_string()],
+                exact_match: true,
+                context: vec![SessionSearchContextLine {
+                    message_index: 6,
+                    role: "user".to_string(),
+                    timestamp: Some(updated_at),
+                    text: "context".to_string(),
+                }],
+            }],
+            scanned_jcode_sessions: 1,
+            candidate_jcode_sessions: 1,
+            scanned_external_sessions: 0,
+            external_sources: vec!["jcode".to_string()],
+            read_errors: 0,
+            parse_errors: 0,
+            truncated: false,
+        };
+
+        let metadata = serde_json::json!({
+            "kind": "session_search_results",
+            "query": "needle",
+            "report": report,
+        });
+
+        assert_eq!(
+            metadata["report"]["results"][0]["session_id"],
+            "session-123"
+        );
+        assert_eq!(
+            metadata["report"]["results"][0]["source_path"],
+            "/remote/sessions/session-123.jsonl"
+        );
+        assert_eq!(metadata["report"]["results"][0]["message_index"], 7);
+        assert_eq!(
+            metadata["report"]["results"][0]["working_dir"],
+            "/remote/project"
+        );
+        assert_eq!(
+            metadata["report"]["results"][0]["context"][0]["message_index"],
+            6
+        );
     }
 }

@@ -612,6 +612,7 @@ impl Agent {
                             id: tool_use_id.clone(),
                             name: tool_name,
                             output: content.clone(),
+                            metadata: None,
                             error: if is_error {
                                 Some("Tool error".to_string())
                             } else {
@@ -1269,6 +1270,7 @@ impl Agent {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         output: error_msg.clone(),
+                        metadata: None,
                         error: Some(error_msg.clone()),
                     });
                     self.add_message(
@@ -1411,6 +1413,7 @@ impl Agent {
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),
                                 output: output.output.clone(),
+                                metadata: output.metadata.clone(),
                                 error: None,
                             });
 
@@ -1443,6 +1446,7 @@ impl Agent {
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),
                                 output: error_msg.clone(),
+                                metadata: None,
                                 error: Some(error_msg.clone()),
                             });
 
@@ -1477,6 +1481,7 @@ impl Agent {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         output: interrupted_msg.clone(),
+                        metadata: None,
                         error: if is_error {
                             Some("interrupted by reload".to_string())
                         } else {
@@ -1531,6 +1536,7 @@ impl Agent {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         output: bg_msg.clone(),
+                        metadata: None,
                         error: None,
                     });
 

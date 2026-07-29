@@ -46,6 +46,7 @@ fn test_remote_done_shows_footer_after_final_tool_result_without_trailing_text()
             id: "tool_read".to_string(),
             name: "read".to_string(),
             output: "1 fn main() {}".to_string(),
+            metadata: None,
             error: None,
         },
         &mut remote,

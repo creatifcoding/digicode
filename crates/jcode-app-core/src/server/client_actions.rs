@@ -344,6 +344,7 @@ pub(super) fn handle_run_subagent(
                     id: tool_call_id.clone(),
                     name: tool_name,
                     output: output_text,
+                    metadata: output.metadata.clone(),
                     error: None,
                 });
                 let persist = {
@@ -366,6 +367,7 @@ pub(super) fn handle_run_subagent(
                     id: tool_call_id.clone(),
                     name: tool_name,
                     output: error_msg.clone(),
+                    metadata: None,
                     error: Some(error_msg.clone()),
                 });
                 let persist = {

@@ -853,7 +853,12 @@ fn load_pi_family_external_session(
         source,
         session_id: session_id.to_string(),
         short_name: Some(format!("{source} {}", truncate_str(&session_id, 8))),
-        title: title.or_else(|| Some(format!("{display_name} session {}", truncate_str(&session_id, 8)))),
+        title: title.or_else(|| {
+            Some(format!(
+                "{display_name} session {}",
+                truncate_str(&session_id, 8)
+            ))
+        }),
         working_dir,
         provider_key,
         model,

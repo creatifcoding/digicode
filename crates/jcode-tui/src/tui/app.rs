@@ -389,6 +389,14 @@ pub(super) enum SessionPickerMode {
     ActiveSessions,
     /// First-run onboarding action picker.
     Onboarding,
+    /// Read-only inspector for the most recent session_search result set.
+    SearchResults,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct LatestSessionSearchHits {
+    pub query: String,
+    pub session_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1573,6 +1581,7 @@ pub struct App {
     session_picker_overlay: Option<RefCell<super::session_picker::SessionPicker>>,
     session_picker_mode: SessionPickerMode,
     pending_session_picker_load: Option<PendingSessionPickerLoad>,
+    latest_session_search_hits: Option<LatestSessionSearchHits>,
     catchup_return_stack: Vec<String>,
     pending_catchup_resume: Option<PendingCatchupResume>,
     in_flight_catchup_resume: Option<PendingCatchupResume>,

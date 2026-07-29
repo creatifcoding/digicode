@@ -775,6 +775,8 @@ pub enum ServerEvent {
         id: String,
         name: String,
         output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

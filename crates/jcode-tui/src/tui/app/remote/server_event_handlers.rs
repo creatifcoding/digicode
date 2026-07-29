@@ -6,8 +6,14 @@ pub(super) fn handle_tool_done(
     id: String,
     name: String,
     output: String,
+    metadata: Option<serde_json::Value>,
     error: Option<String>,
 ) -> bool {
+    if name == "session_search" && error.is_none() {
+        if let Some(metadata) = metadata.as_ref() {
+            app.record_session_search_metadata(metadata);
+        }
+    }
     let display_output = remote.handle_tool_done(&id, &name, &output);
     let display_output = if error.is_some()
         && !display_output.starts_with("Error:")

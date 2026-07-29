@@ -631,6 +631,51 @@ fn test_filter_matches_recent_message_content() {
 }
 
 #[test]
+fn test_session_search_results_filter_to_hit_set_and_close_without_selection() {
+    let sessions = vec![
+        make_session("session_hit_alpha", "alpha", false, SessionStatus::Closed),
+        make_session("session_hit_beta", "beta", false, SessionStatus::Closed),
+        make_session("session_miss", "miss", false, SessionStatus::Closed),
+    ];
+    let mut picker = SessionPicker::new(sessions);
+
+    picker.activate_search_results(
+        "session".to_string(),
+        vec![
+            "session_hit_beta".to_string(),
+            "session_hit_alpha".to_string(),
+        ],
+    );
+
+    let visible_ids: Vec<String> = picker
+        .visible_sessions
+        .iter()
+        .filter_map(|session_ref| picker.session_by_ref(*session_ref))
+        .map(|session| session.id.clone())
+        .collect();
+    assert_eq!(visible_ids.len(), 2);
+    assert!(visible_ids.contains(&"session_hit_alpha".to_string()));
+    assert!(visible_ids.contains(&"session_hit_beta".to_string()));
+    assert!(!visible_ids.contains(&"session_miss".to_string()));
+
+    let enter = picker
+        .handle_overlay_key(KeyCode::Enter, KeyModifiers::empty())
+        .expect("enter handled");
+    assert!(matches!(enter, OverlayAction::Selected(_)));
+
+    let esc = picker
+        .handle_overlay_key(KeyCode::Esc, KeyModifiers::empty())
+        .expect("escape handled");
+    assert!(matches!(esc, OverlayAction::Close));
+
+    picker.activate_search_results("session".to_string(), vec!["session_hit_alpha".to_string()]);
+    let back = picker
+        .handle_overlay_key(KeyCode::Backspace, KeyModifiers::empty())
+        .expect("backspace handled");
+    assert!(matches!(back, OverlayAction::Close));
+}
+
+#[test]
 fn test_loading_preview_refreshes_search_index_for_picker_filtering() {
     let _env_lock = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("temp dir");
