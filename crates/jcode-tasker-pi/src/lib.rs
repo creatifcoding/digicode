@@ -958,7 +958,7 @@ impl PiTaskerStore {
                 note: Some(reason),
             },
         )?;
-        if task.state == "todo" {
+        if task.state == "todo" && input.set_active != Some(false) {
             task.state = "in_progress".into();
             task.updated_at = now_ms();
             tx.execute("UPDATE tasks SET state=?1, updated_at=?2 WHERE id=?3 AND list_id=?4 AND project_root=?5", params![task.state, task.updated_at, task.id, self.partition.list_id, self.partition.project_root])?;
@@ -2333,6 +2333,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn next_work_unit_can_leave_a_todo_task_inactive() {
+        let mut store = temp_store();
+        let feature = store.create_feature(feature_input("Root")).unwrap();
+        let task = store
+            .create_task(CreateTask {
+                title: "Queued only".into(),
+                feature_id: Some(feature.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let next = store
+            .enqueue_next_work_unit(NextWorkUnitInput {
+                context: work_context("agent", "session"),
+                claim_kind: None,
+                reason: None,
+                lease_ms: None,
+                feature_id: Some(feature.id),
+                priority: None,
+                set_active: Some(false),
+            })
+            .unwrap();
+        assert!(next.ok);
+        assert_eq!(next.task.as_ref().unwrap().state, "todo");
+        assert_eq!(
+            store
+                .list_tasks(None)
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == task.id)
+                .unwrap()
+                .state,
+            "todo"
+        );
     }
 
     #[test]
