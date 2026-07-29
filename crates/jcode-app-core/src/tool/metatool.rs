@@ -221,12 +221,24 @@ impl Tool for MetaTool {
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
+            "required": ["action"],
             "properties": {
                 "intent": super::intent_schema_property(),
-                "action": {"type": "string", "enum": ["status", "evaluate"], "default": "evaluate"},
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "evaluate"],
+                    "description": "status inspects runtime availability; evaluate runs code. Defaults to evaluate when omitted."
+                },
                 "code": {"type": "string", "description": "Async JavaScript source. Required for evaluate."},
-                "inputs": {"description": "Clone-safe JSON value exposed to the guest as inputs."},
-                "profile": {"type": "string", "enum": ["pure", "workspace-read", "workspace-mutate"], "default": "pure"}
+                "inputs": {
+                    "type": "object",
+                    "description": "Optional JSON object exposed to the guest as `inputs`."
+                },
+                "profile": {
+                    "type": "string",
+                    "enum": ["pure", "workspace-read", "workspace-mutate"],
+                    "description": "Execution profile. Defaults to pure; only pure is currently executable."
+                }
             }
         })
     }
@@ -297,6 +309,28 @@ mod tests {
         assert_eq!(
             definition.input_schema["properties"]["action"]["enum"],
             json!(["status", "evaluate"])
+        );
+    }
+
+    #[test]
+    fn schema_conforms_to_provider_function_calling_conventions() {
+        let definition = MetaTool::new().to_definition();
+        let properties = definition.input_schema["properties"]
+            .as_object()
+            .expect("object properties");
+        for (name, schema) in properties {
+            assert!(
+                schema["type"].is_string(),
+                "property {name} must declare a JSON type for provider strict modes"
+            );
+            assert!(
+                schema.get("default").is_none(),
+                "property {name} must not carry a default keyword; providers reject it"
+            );
+        }
+        assert_eq!(
+            definition.input_schema["required"],
+            json!(["action", "intent"])
         );
     }
 
