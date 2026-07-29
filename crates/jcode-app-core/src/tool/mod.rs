@@ -18,6 +18,7 @@ mod invalid;
 mod ls;
 pub mod mcp;
 mod memory;
+mod metatool;
 mod multiedit;
 mod open;
 mod patch;
@@ -225,6 +226,7 @@ impl Registry {
                 session_search::SessionSearchTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "memory", memory::MemoryTool::new);
+            Self::insert_tool_timed(&mut m, &mut timings, "mt", metatool::MetaTool::new);
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,

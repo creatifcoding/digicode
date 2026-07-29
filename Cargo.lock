@@ -2807,7 +2807,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.19",
- "windows 0.58.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -3665,6 +3665,8 @@ dependencies = [
  "jcode-core",
  "jcode-import-core",
  "jcode-message-types",
+ "jcode-metatool-runtime",
+ "jcode-metatool-types",
  "jcode-notify-email",
  "jcode-overnight-core",
  "jcode-pdf",
@@ -3983,6 +3985,46 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "jcode-metatool-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jcode-metatool-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "jcode-metatool-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "jcode-metatool-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rusqlite",
+]
+
+[[package]]
+name = "jcode-metatool-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
