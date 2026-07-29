@@ -179,6 +179,82 @@ pub struct Feature {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct FeatureGate {
+    pub label: String,
+    pub resolver: Option<GateResolver>,
+    pub status: String,
+    pub resolved_by: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "_tag", rename_all = "camelCase")]
+pub enum GateResolver {
+    #[serde(rename = "command", rename_all = "camelCase")]
+    Command {
+        run: String,
+        cwd: Option<String>,
+        timeout: Option<i64>,
+        env: Option<BTreeMap<String, String>>,
+    },
+    #[serde(rename = "tool", rename_all = "camelCase")]
+    Tool { tool: String, args: Option<Value> },
+    #[serde(rename = "agent", rename_all = "camelCase")]
+    Agent {
+        agent: String,
+        task: String,
+        model: Option<String>,
+    },
+    #[serde(rename = "script", rename_all = "camelCase")]
+    Script { path: String, timeout: Option<i64> },
+}
+
+impl GateResolver {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Command { .. } => "command",
+            Self::Tool { .. } => "tool",
+            Self::Agent { .. } => "agent",
+            Self::Script { .. } => "script",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveFeatureGate {
+    pub status: String,
+    pub resolved_by: Option<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatureGateCheckResult {
+    pub status: String,
+    pub note: String,
+    pub full_log: String,
+    pub exit_code: i64,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureGateCheckMode {
+    FailFast,
+    CheckAll,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedFeatureGateCheck {
+    pub gate_index: usize,
+    pub gate: FeatureGate,
+    pub evidence_note: Option<FeatureNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskDependency {
     pub id: String,
     pub task_id: String,
@@ -1318,6 +1394,161 @@ impl PiTaskerStore {
         Ok(f)
     }
 
+    pub fn feature_gates(&self, feature_id: &str) -> Result<Vec<FeatureGate>> {
+        let feature = load_feature_conn(&self.conn, &self.partition, feature_id)?
+            .ok_or_else(|| PiTaskerError::NotFound(feature_id.into()))?;
+        feature_gates_from_value(feature.gates)
+    }
+
+    pub fn feature_gate(&self, feature_id: &str, gate_index: usize) -> Result<FeatureGate> {
+        self.feature_gates(feature_id)?
+            .into_iter()
+            .nth(gate_index)
+            .ok_or_else(|| PiTaskerError::InvalidReference(format!("gate index {gate_index}")))
+    }
+
+    pub fn pending_executable_gate_indexes(&self, feature_id: &str) -> Result<Vec<usize>> {
+        Ok(self
+            .feature_gates(feature_id)?
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, gate)| {
+                (gate.status == "pending" && gate.resolver.is_some()).then_some(index)
+            })
+            .collect())
+    }
+
+    pub fn resolve_feature_gate(
+        &mut self,
+        feature_id: &str,
+        gate_index: usize,
+        input: ResolveFeatureGate,
+    ) -> Result<Vec<FeatureGate>> {
+        let tx = self.conn.transaction()?;
+        let mut feature = load_feature_tx(&tx, &self.partition, feature_id)?
+            .ok_or_else(|| PiTaskerError::NotFound(feature_id.into()))?;
+        let mut gates = feature_gates_from_value(feature.gates)?;
+        let gate = gates
+            .get_mut(gate_index)
+            .ok_or_else(|| PiTaskerError::InvalidReference(format!("gate index {gate_index}")))?;
+        gate.status = input.status;
+        gate.resolved_by = input.resolved_by.or_else(|| gate.resolved_by.clone());
+        gate.resolved_at = Some(now_ms());
+        gate.note = input.note.or_else(|| gate.note.clone());
+        feature.updated_at = now_ms();
+        tx.execute(
+            "UPDATE features SET gates=?1, updated_at=?2 WHERE id=?3 AND list_id=?4 AND project_root=?5",
+            params![
+                serde_json::to_string(&gates)?,
+                feature.updated_at,
+                feature_id,
+                self.partition.list_id,
+                self.partition.project_root
+            ],
+        )?;
+        tx.commit()?;
+        Ok(gates)
+    }
+
+    pub fn apply_feature_gate_check(
+        &mut self,
+        feature_id: &str,
+        gate_index: usize,
+        result: FeatureGateCheckResult,
+    ) -> Result<AppliedFeatureGateCheck> {
+        let mut applied = self.apply_feature_gate_checks(
+            feature_id,
+            vec![(gate_index, result)],
+            FeatureGateCheckMode::FailFast,
+        )?;
+        applied
+            .pop()
+            .ok_or_else(|| PiTaskerError::InvalidReference(format!("gate index {gate_index}")))
+    }
+
+    pub fn apply_feature_gate_checks(
+        &mut self,
+        feature_id: &str,
+        results: Vec<(usize, FeatureGateCheckResult)>,
+        mode: FeatureGateCheckMode,
+    ) -> Result<Vec<AppliedFeatureGateCheck>> {
+        let tx = self.conn.transaction()?;
+        let mut feature = load_feature_tx(&tx, &self.partition, feature_id)?
+            .ok_or_else(|| PiTaskerError::NotFound(feature_id.into()))?;
+        let mut gates = feature_gates_from_value(feature.gates)?;
+        let mut applied = Vec::new();
+        let mut now = now_ms();
+
+        for (gate_index, result) in results {
+            let gate = gates.get_mut(gate_index).ok_or_else(|| {
+                PiTaskerError::InvalidReference(format!("gate index {gate_index}"))
+            })?;
+            let resolver_kind = gate
+                .resolver
+                .as_ref()
+                .ok_or_else(|| {
+                    PiTaskerError::InvalidReference(format!("manual gate {gate_index}"))
+                })?
+                .kind();
+            if gate.status != "pending" {
+                return Err(PiTaskerError::InvalidReference(format!(
+                    "gate {gate_index} already {}",
+                    gate.status
+                )));
+            }
+            gate.status = result.status.clone();
+            gate.resolved_by = Some(format!("resolver:{resolver_kind}"));
+            gate.resolved_at = Some(now);
+            gate.note = Some(truncate_chars(&result.note, 2_000));
+
+            let evidence_note = if result.full_log.is_empty() {
+                None
+            } else {
+                let note = FeatureNote {
+                    id: make_feature_note_id(),
+                    feature_id: feature_id.into(),
+                    list_id: self.partition.list_id.clone(),
+                    project_root: self.partition.project_root.clone(),
+                    category: Some("ref".into()),
+                    content: truncate_chars(
+                        &format!(
+                            "[gate:{gate_index}] {}\n\nExit: {} | Duration: {}ms\n\n{}",
+                            gate.label, result.exit_code, result.duration_ms, result.full_log
+                        ),
+                        10_000,
+                    ),
+                    created_at: now,
+                };
+                tx.execute("INSERT INTO feature_notes (id,feature_id,list_id,project_root,category,content,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![note.id, note.feature_id, note.list_id, note.project_root, note.category, note.content, note.created_at])?;
+                Some(note)
+            };
+            applied.push(AppliedFeatureGateCheck {
+                gate_index,
+                gate: gate.clone(),
+                evidence_note,
+            });
+
+            if mode == FeatureGateCheckMode::FailFast && result.status == "failed" {
+                break;
+            }
+            now = now_ms();
+        }
+
+        feature.updated_at = now_ms();
+        tx.execute(
+            "UPDATE features SET gates=?1, updated_at=?2 WHERE id=?3 AND list_id=?4 AND project_root=?5",
+            params![
+                serde_json::to_string(&gates)?,
+                feature.updated_at,
+                feature_id,
+                self.partition.list_id,
+                self.partition.project_root
+            ],
+        )?;
+        tx.commit()?;
+        Ok(applied)
+    }
+
     pub fn set_dependencies(
         &mut self,
         task_id: &str,
@@ -1484,6 +1715,46 @@ fn row_work_unit(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorkUnit> {
 fn json_or_empty_array(raw: Option<String>) -> Value {
     raw.and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| Value::Array(vec![]))
+}
+
+fn feature_gates_from_value(value: Value) -> Result<Vec<FeatureGate>> {
+    let Value::Array(raw_gates) = value else {
+        return Ok(Vec::new());
+    };
+    raw_gates
+        .into_iter()
+        .map(|raw| {
+            let mut gate: FeatureGate = match raw {
+                Value::Object(mut object) => {
+                    if let (false, Some(legacy_type)) =
+                        (object.contains_key("label"), object.get("type").cloned())
+                    {
+                        object.insert("label".into(), legacy_type);
+                    }
+                    object
+                        .entry("label")
+                        .or_insert_with(|| Value::String("Unknown".into()));
+                    object.entry("resolver").or_insert_with(|| Value::Null);
+                    object
+                        .entry("status")
+                        .or_insert_with(|| Value::String("pending".into()));
+                    serde_json::from_value(Value::Object(object))?
+                }
+                other => serde_json::from_value(other)?,
+            };
+            if gate.status.is_empty() {
+                gate.status = "pending".into();
+            }
+            if gate.label.is_empty() {
+                gate.label = "Unknown".into();
+            }
+            Ok(gate)
+        })
+        .collect()
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn load_features_tx(tx: &rusqlite::Transaction<'_>, p: &ProjectPartition) -> Result<Vec<Feature>> {
@@ -1767,6 +2038,9 @@ fn load_feature_tx(
     id: &str,
 ) -> Result<Option<Feature>> {
     Ok(tx.query_row("SELECT id,list_id,project_root,display_id,parent_feature_id,title,description,state,priority,tags,brief,acceptance,owner,gates,indexes,depth,created_at,updated_at FROM features WHERE id=?1 AND list_id=?2 AND project_root=?3", params![id,p.list_id,p.project_root], row_feature).optional()?)
+}
+fn load_feature_conn(conn: &Connection, p: &ProjectPartition, id: &str) -> Result<Option<Feature>> {
+    Ok(conn.query_row("SELECT id,list_id,project_root,display_id,parent_feature_id,title,description,state,priority,tags,brief,acceptance,owner,gates,indexes,depth,created_at,updated_at FROM features WHERE id=?1 AND list_id=?2 AND project_root=?3", params![id,p.list_id,p.project_root], row_feature).optional()?)
 }
 fn ensure_list_meta_tx(tx: &rusqlite::Transaction<'_>, p: &ProjectPartition) -> Result<()> {
     let exists: Option<i64> = tx
@@ -2785,5 +3059,211 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PiTaskerError::InvalidReference(_)));
         assert!(store.list_tasks(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn feature_gates_round_trip_typed_resolvers_and_legacy_manual_gates() {
+        let mut store = temp_store();
+        let mut input = feature_input("gated");
+        input.gates = serde_json::json!([
+            {"type":"legacy-review"},
+            {"label":"unit tests","resolver":{"_tag":"command","run":"cargo test","cwd":"crates/x","timeout":123,"env":{"RUST_LOG":"debug"}},"status":"pending"},
+            {"label":"script","resolver":{"_tag":"script","path":"scripts/check.sh","timeout":456},"status":"pending"},
+            {"label":"tool","resolver":{"_tag":"tool","tool":"tasker","args":{"action":"status"}},"status":"passed"},
+            {"label":"agent","resolver":{"_tag":"agent","agent":"reviewer","task":"review","model":"sonnet"},"status":"pending"}
+        ]);
+        let feature = store.create_feature(input).unwrap();
+
+        let gates = store.feature_gates(&feature.id).unwrap();
+        assert_eq!(gates[0].label, "legacy-review");
+        assert_eq!(gates[0].resolver, None);
+        assert_eq!(gates[0].status, "pending");
+        assert!(matches!(
+            gates[1].resolver,
+            Some(GateResolver::Command { .. })
+        ));
+        assert!(matches!(
+            gates[2].resolver,
+            Some(GateResolver::Script { .. })
+        ));
+        assert!(matches!(gates[3].resolver, Some(GateResolver::Tool { .. })));
+        assert!(matches!(
+            gates[4].resolver,
+            Some(GateResolver::Agent { .. })
+        ));
+        assert_eq!(
+            store.pending_executable_gate_indexes(&feature.id).unwrap(),
+            vec![1, 2, 4]
+        );
+    }
+
+    #[test]
+    fn resolve_feature_gate_preserves_resolver_and_updates_json_atomically() {
+        let mut store = temp_store();
+        let mut input = feature_input("manual gates");
+        input.gates = serde_json::json!([
+            {"label":"review","resolver":null,"status":"pending"},
+            {"label":"tests","resolver":{"_tag":"command","run":"true"},"status":"pending"}
+        ]);
+        let feature = store.create_feature(input).unwrap();
+
+        let gates = store
+            .resolve_feature_gate(
+                &feature.id,
+                0,
+                ResolveFeatureGate {
+                    status: "passed".into(),
+                    resolved_by: Some("human".into()),
+                    note: Some("looks good".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(gates[0].status, "passed");
+        assert_eq!(gates[0].resolved_by.as_deref(), Some("human"));
+        assert!(gates[0].resolved_at.is_some());
+        assert_eq!(gates[0].note.as_deref(), Some("looks good"));
+        assert!(matches!(
+            store.feature_gate(&feature.id, 1).unwrap().resolver,
+            Some(GateResolver::Command { .. })
+        ));
+
+        let before = store.feature_gates(&feature.id).unwrap();
+        let err = store
+            .resolve_feature_gate(
+                &feature.id,
+                99,
+                ResolveFeatureGate {
+                    status: "failed".into(),
+                    resolved_by: None,
+                    note: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, PiTaskerError::InvalidReference(_)));
+        assert_eq!(store.feature_gates(&feature.id).unwrap(), before);
+    }
+
+    #[test]
+    fn apply_feature_gate_check_rejects_manual_and_resolved_gates_without_side_effects() {
+        let mut store = temp_store();
+        let mut input = feature_input("check guards");
+        input.gates = serde_json::json!([
+            {"label":"manual","resolver":null,"status":"pending"},
+            {"label":"done","resolver":{"_tag":"command","run":"true"},"status":"passed"}
+        ]);
+        let feature = store.create_feature(input).unwrap();
+        let check = FeatureGateCheckResult {
+            status: "passed".into(),
+            note: "ok".into(),
+            full_log: "log".into(),
+            exit_code: 0,
+            duration_ms: 1,
+        };
+
+        assert!(matches!(
+            store.apply_feature_gate_check(&feature.id, 0, check.clone()),
+            Err(PiTaskerError::InvalidReference(_))
+        ));
+        assert!(matches!(
+            store.apply_feature_gate_check(&feature.id, 1, check),
+            Err(PiTaskerError::InvalidReference(_))
+        ));
+        assert!(store.list_feature_notes().unwrap().is_empty());
+        assert_eq!(
+            store.feature_gates(&feature.id).unwrap()[0].status,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn apply_feature_gate_checks_caps_summary_archives_evidence_and_honors_modes() {
+        let mut store = temp_store();
+        let mut input = feature_input("check all");
+        input.gates = serde_json::json!([
+            {"label":"first","resolver":{"_tag":"command","run":"true"},"status":"pending"},
+            {"label":"second","resolver":{"_tag":"script","path":"safe.sh"},"status":"pending"},
+            {"label":"third","resolver":{"_tag":"agent","agent":"a","task":"t"},"status":"pending"}
+        ]);
+        let feature = store.create_feature(input).unwrap();
+        let long_note = "n".repeat(2_500);
+        let long_log = "l".repeat(12_000);
+
+        let applied = store
+            .apply_feature_gate_checks(
+                &feature.id,
+                vec![
+                    (
+                        0,
+                        FeatureGateCheckResult {
+                            status: "passed".into(),
+                            note: long_note,
+                            full_log: long_log,
+                            exit_code: 0,
+                            duration_ms: 7,
+                        },
+                    ),
+                    (
+                        1,
+                        FeatureGateCheckResult {
+                            status: "failed".into(),
+                            note: "bad".into(),
+                            full_log: "failure".into(),
+                            exit_code: 1,
+                            duration_ms: 8,
+                        },
+                    ),
+                    (
+                        2,
+                        FeatureGateCheckResult {
+                            status: "passed".into(),
+                            note: "would be skipped".into(),
+                            full_log: "skip".into(),
+                            exit_code: 0,
+                            duration_ms: 9,
+                        },
+                    ),
+                ],
+                FeatureGateCheckMode::FailFast,
+            )
+            .unwrap();
+
+        assert_eq!(applied.len(), 2);
+        let gates = store.feature_gates(&feature.id).unwrap();
+        assert_eq!(gates[0].note.as_ref().unwrap().chars().count(), 2_000);
+        assert_eq!(gates[0].resolved_by.as_deref(), Some("resolver:command"));
+        assert_eq!(gates[1].status, "failed");
+        assert_eq!(gates[2].status, "pending");
+        let notes = store.list_feature_notes().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].category.as_deref(), Some("ref"));
+        assert!(
+            notes[0]
+                .content
+                .starts_with("[gate:0] first\n\nExit: 0 | Duration: 7ms")
+        );
+        assert_eq!(notes[0].content.chars().count(), 10_000);
+
+        let applied = store
+            .apply_feature_gate_checks(
+                &feature.id,
+                vec![(
+                    2,
+                    FeatureGateCheckResult {
+                        status: "passed".into(),
+                        note: "ok".into(),
+                        full_log: String::new(),
+                        exit_code: 0,
+                        duration_ms: 3,
+                    },
+                )],
+                FeatureGateCheckMode::CheckAll,
+            )
+            .unwrap();
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0].evidence_note.is_none());
+        assert_eq!(
+            store.feature_gates(&feature.id).unwrap()[2].status,
+            "passed"
+        );
     }
 }
