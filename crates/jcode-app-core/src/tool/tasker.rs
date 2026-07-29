@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::{Tool, ToolContext, ToolOutput};
 
 const BACKEND: &str = "jcode-tasker-pi";
-const TASK_STATES: &[&str] = &["todo", "in_progress", "blocked", "done", "cancelled"];
+const TASK_STATES: &[&str] = &["todo", "in_progress", "blocked", "done"];
 const FEATURE_STATES: &[&str] = &["open", "active", "closed", "archived"];
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
@@ -627,6 +627,7 @@ mod tests {
     use super::*;
     use jcode_tool_core::ToolExecutionMode;
     use rusqlite::Connection;
+    use std::path::Path;
 
     fn context(root: &Path) -> ToolContext {
         ToolContext {
@@ -676,6 +677,9 @@ mod tests {
         let schema = &definition.input_schema;
         assert_eq!(schema["additionalProperties"], false);
         assert!(!schema.to_string().contains("expected_revision"));
+        assert!(!schema.to_string().contains("cancelled"));
+        assert!(validate_enum("done", TASK_STATES, "state").is_ok());
+        assert!(validate_enum("cancelled", TASK_STATES, "state").is_err());
         for (_name, property) in schema["properties"].as_object().expect("properties") {
             assert!(
                 property.get("type").is_some(),
