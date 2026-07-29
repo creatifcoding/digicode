@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use jcode_tasker_pi::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use wait_timeout::ChildExt;
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -40,6 +42,9 @@ const VISUAL_ARTIFACT_KINDS: &[&str] = &[
     "data-table",
     "custom",
 ];
+const DEFAULT_COMMAND_TIMEOUT_MS: i64 = 120_000;
+const DEFAULT_SCRIPT_TIMEOUT_MS: i64 = 120_000;
+const DEFAULT_AGENT_TIMEOUT_MS: i64 = 300_000;
 
 pub struct TaskerTool {
     database_path: Option<PathBuf>,
@@ -243,69 +248,174 @@ fn last_lines(text: &str, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
-fn execute_gate_resolver(
-    resolver: &GateResolver,
-    project_root: &std::path::Path,
-) -> Result<FeatureGateCheckResult> {
+struct ResolverCommandSpec {
+    program: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+    timeout_ms: i64,
+    env: Option<std::collections::BTreeMap<String, String>>,
+    fail_on_tool_error_json: bool,
+}
+
+fn jcode_resolver_bin() -> String {
+    std::env::var("JCODE_BIN").unwrap_or_else(|_| "jcode".to_string())
+}
+
+fn execute_command_with_timeout(spec: ResolverCommandSpec) -> Result<FeatureGateCheckResult> {
     let start = Instant::now();
-    let (program, args, cwd, timeout_ms): (String, Vec<String>, PathBuf, Option<i64>) =
-        match resolver {
-            GateResolver::Command {
-                run, cwd, timeout, ..
-            } => (
-                "bash".into(),
-                vec!["-lc".into(), run.clone()],
-                cwd.as_ref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| project_root.to_path_buf()),
-                *timeout,
-            ),
-            GateResolver::Script { path, timeout } => {
-                let script = if std::path::Path::new(path).is_absolute() {
-                    PathBuf::from(path)
-                } else {
-                    project_root.join(path)
-                };
-                (
-                    "bash".into(),
-                    vec![script.to_string_lossy().into_owned()],
-                    project_root.to_path_buf(),
-                    *timeout,
-                )
-            }
-            GateResolver::Tool { .. } | GateResolver::Agent { .. } => {
-                return Err(anyhow!(
-                    "feature_gate automated resolver {:?} is not wired in jcode-tasker-pi yet; command/script resolvers are supported at the app boundary and the SQL store only applies typed results",
-                    resolver.kind()
-                ));
-            }
-        };
-    if timeout_ms.is_some() {
-        return Err(anyhow!(
-            "feature_gate command/script resolver timeout enforcement is not wired in this sync app boundary yet"
+    let timeout = Duration::from_millis(spec.timeout_ms.max(1) as u64);
+    let stdout_file = tempfile::NamedTempFile::new().context("create resolver stdout capture")?;
+    let stderr_file = tempfile::NamedTempFile::new().context("create resolver stderr capture")?;
+    let stdout_path = stdout_file.path().to_path_buf();
+    let stderr_path = stderr_file.path().to_path_buf();
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdout(Stdio::from(
+            stdout_file
+                .reopen()
+                .context("reopen resolver stdout capture")?,
+        ))
+        .stderr(Stdio::from(
+            stderr_file
+                .reopen()
+                .context("reopen resolver stderr capture")?,
         ));
+    if let Some(env) = &spec.env {
+        command.envs(env);
     }
-    let mut command = std::process::Command::new(program);
-    command.args(args).current_dir(cwd);
-    let output = command.output().context("execute gate resolver")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let full_log = [stdout.trim(), stderr.trim()]
+
+    let mut child = command.with_context(|| {
+        format!(
+            "spawn gate resolver command {} in {}",
+            spec.program,
+            spec.cwd.display()
+        )
+    })?;
+
+    let timed_out = match child
+        .wait_timeout(timeout)
+        .context("wait for gate resolver command")?
+    {
+        Some(_) => false,
+        None => {
+            let _ = child.kill();
+            true
+        }
+    };
+    let status = child.wait().context("reap gate resolver command")?;
+    let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let mut full_log = [stdout.trim(), stderr.trim()]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n---stderr---\n");
+    if timed_out {
+        if !full_log.is_empty() {
+            full_log.push('\n');
+        }
+        full_log.push_str(&format!("timed out after {} ms", spec.timeout_ms));
+    }
+    let exit_code = if timed_out {
+        124
+    } else {
+        status.code().unwrap_or(1)
+    };
+    let tool_error = spec.fail_on_tool_error_json && full_log.contains("\"isError\":true");
     Ok(FeatureGateCheckResult {
-        status: if output.status.success() {
+        status: if !timed_out && !tool_error && status.success() {
             "passed".into()
         } else {
             "failed".into()
         },
         note: last_lines(&full_log, 50),
         full_log,
-        exit_code: output.status.code().unwrap_or(1).into(),
+        exit_code: exit_code.into(),
         duration_ms: start.elapsed().as_millis() as i64,
     })
+}
+
+fn execute_gate_resolver(
+    resolver: &GateResolver,
+    project_root: &std::path::Path,
+) -> Result<FeatureGateCheckResult> {
+    let spec = match resolver {
+        GateResolver::Command {
+            run,
+            cwd,
+            timeout,
+            env,
+        } => ResolverCommandSpec {
+            program: "bash".into(),
+            args: vec!["-lc".into(), run.clone()],
+            cwd: cwd
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| project_root.to_path_buf()),
+            timeout_ms: timeout.unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS),
+            env: env.clone(),
+            fail_on_tool_error_json: false,
+        },
+        GateResolver::Script { path, timeout } => {
+            let script = if std::path::Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                project_root.join(path)
+            };
+            ResolverCommandSpec {
+                program: "bash".into(),
+                args: vec![script.to_string_lossy().into_owned()],
+                cwd: project_root.to_path_buf(),
+                timeout_ms: timeout.unwrap_or(DEFAULT_SCRIPT_TIMEOUT_MS),
+                env: None,
+                fail_on_tool_error_json: false,
+            }
+        }
+        GateResolver::Tool { tool, args } => {
+            let prompt = match args {
+                Some(args) => format!(
+                    "Call exactly one tool named {tool:?} with these JSON arguments: {}. Do not call any other tool. Return only whether that single tool call succeeded.",
+                    serde_json::to_string(args)?
+                ),
+                None => format!(
+                    "Call exactly one tool named {tool:?} with empty JSON arguments. Do not call any other tool. Return only whether that single tool call succeeded."
+                ),
+            };
+            ResolverCommandSpec {
+                program: jcode_resolver_bin(),
+                args: vec![
+                    "--disable-base-tools".into(),
+                    "--tools".into(),
+                    tool.clone(),
+                    "run".into(),
+                    "--json".into(),
+                    prompt,
+                ],
+                cwd: project_root.to_path_buf(),
+                timeout_ms: DEFAULT_COMMAND_TIMEOUT_MS,
+                env: None,
+                fail_on_tool_error_json: true,
+            }
+        }
+        GateResolver::Agent { task, model, .. } => {
+            let mut args = vec!["run".into(), "--json".into()];
+            if let Some(model) = model {
+                args.splice(0..0, ["--model".into(), model.clone()]);
+            }
+            args.push(task.clone());
+            ResolverCommandSpec {
+                program: jcode_resolver_bin(),
+                args,
+                cwd: project_root.to_path_buf(),
+                timeout_ms: DEFAULT_AGENT_TIMEOUT_MS,
+                env: None,
+                fail_on_tool_error_json: false,
+            }
+        }
+    };
+    execute_command_with_timeout(spec)
 }
 
 fn resolve_task(store: &PiTaskerStore, reference: String, action: &str) -> Result<String> {
@@ -1502,6 +1612,7 @@ mod tests {
     use jcode_tool_core::ToolExecutionMode;
     use rusqlite::Connection;
     use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
 
     fn context(root: &Path) -> ToolContext {
         ToolContext {
@@ -1540,6 +1651,187 @@ mod tests {
         let path = database_dir.path().join("tasks.db");
         install_pi_schema(&path);
         (database_dir, TaskerTool::with_database_path(path))
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(old) = &self.old {
+                    std::env::set_var(self.key, old);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn write_executable(path: &Path, content: &str) {
+        std::fs::write(path, content).expect("write fake executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod fake executable");
+        }
+    }
+
+    #[test]
+    fn command_resolver_honors_env_cwd_and_records_output() {
+        let root = tempfile::tempdir().expect("workspace tempdir");
+        let cwd = root.path().join("subdir");
+        std::fs::create_dir(&cwd).expect("create cwd");
+        let result = execute_gate_resolver(
+            &GateResolver::Command {
+                run: "printf 'out:%s:%s\\n' \"$SPECIAL_VALUE\" \"$PWD\"; printf 'errline\\n' >&2"
+                    .into(),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                timeout: Some(5_000),
+                env: Some(std::collections::BTreeMap::from([(
+                    "SPECIAL_VALUE".into(),
+                    "present".into(),
+                )])),
+            },
+            root.path(),
+        )
+        .expect("command resolver");
+
+        assert_eq!(result.status, "passed");
+        assert_eq!(result.exit_code, 0);
+        assert!(result.full_log.contains("out:present:"));
+        assert!(result.full_log.contains(cwd.to_string_lossy().as_ref()));
+        assert!(result.full_log.contains("---stderr---\nerrline"));
+        assert_eq!(result.note, result.full_log);
+    }
+
+    #[test]
+    fn command_resolver_times_out_kills_and_reaps() {
+        let root = tempfile::tempdir().expect("workspace tempdir");
+        let result = execute_gate_resolver(
+            &GateResolver::Command {
+                run: "echo before-timeout; sleep 5; echo after-timeout".into(),
+                cwd: None,
+                timeout: Some(50),
+                env: None,
+            },
+            root.path(),
+        )
+        .expect("timeout resolver");
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.exit_code, 124);
+        assert!(result.full_log.contains("timed out after 50 ms"));
+        assert!(result.duration_ms < 5_000);
+    }
+
+    #[test]
+    fn tool_resolver_invokes_fake_jcode_with_allow_list_and_prompt() {
+        let _lock = env_lock();
+        let root = tempfile::tempdir().expect("workspace tempdir");
+        let fake = root.path().join("fake-jcode");
+        let args_file = root.path().join("args.txt");
+        write_executable(
+            &fake,
+            &format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$PWD\" > {}\nprintf '%s\\n' \"$@\" >> {}\necho tool-ok\n",
+                args_file.display(),
+                args_file.display()
+            ),
+        );
+        let _guard = EnvGuard::set("JCODE_BIN", &fake);
+
+        let result = execute_gate_resolver(
+            &GateResolver::Tool {
+                tool: "tasker".into(),
+                args: Some(json!({"action": "status"})),
+            },
+            root.path(),
+        )
+        .expect("tool resolver");
+
+        assert_eq!(result.status, "passed");
+        assert!(result.full_log.contains("tool-ok"));
+        let captured = std::fs::read_to_string(args_file).expect("captured args");
+        assert!(captured.starts_with(&format!("{}\n", root.path().display())));
+        assert!(captured.contains("--disable-base-tools\n--tools\ntasker\nrun\n--json\n"));
+        assert!(captured.contains("Call exactly one tool named \"tasker\""));
+        assert!(captured.contains("{\"action\":\"status\"}"));
+    }
+
+    #[test]
+    fn tool_resolver_fails_when_fake_jcode_fails() {
+        let _lock = env_lock();
+        let root = tempfile::tempdir().expect("workspace tempdir");
+        let fake = root.path().join("fake-jcode-fail");
+        write_executable(&fake, "#!/usr/bin/env bash\necho nope >&2\nexit 7\n");
+        let _guard = EnvGuard::set("JCODE_BIN", &fake);
+
+        let result = execute_gate_resolver(
+            &GateResolver::Tool {
+                tool: "tasker".into(),
+                args: None,
+            },
+            root.path(),
+        )
+        .expect("tool resolver failure result");
+
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.exit_code, 7);
+        assert!(result.full_log.contains("nope"));
+    }
+
+    #[test]
+    fn agent_resolver_invokes_fake_jcode_with_model_and_task() {
+        let _lock = env_lock();
+        let root = tempfile::tempdir().expect("workspace tempdir");
+        let fake = root.path().join("fake-jcode-agent");
+        let args_file = root.path().join("agent-args.txt");
+        write_executable(
+            &fake,
+            &format!(
+                "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > {}\necho agent-ok\n",
+                args_file.display()
+            ),
+        );
+        let _guard = EnvGuard::set("JCODE_BIN", &fake);
+
+        let result = execute_gate_resolver(
+            &GateResolver::Agent {
+                agent: "reviewer".into(),
+                task: "Check the feature".into(),
+                model: Some("test-model".into()),
+            },
+            root.path(),
+        )
+        .expect("agent resolver");
+
+        assert_eq!(result.status, "passed");
+        assert!(result.full_log.contains("agent-ok"));
+        let captured = std::fs::read_to_string(args_file).expect("captured args");
+        assert_eq!(
+            captured,
+            "--model\ntest-model\nrun\n--json\nCheck the feature\n"
+        );
     }
 
     #[test]
