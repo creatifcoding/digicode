@@ -1,8 +1,8 @@
 # Proposal: Jcode-Native MetaTool
 
-> **Status:** Approved for semantic-core implementation
+> **Status:** Semantic core implemented; native capability migration in progress
 > **Date:** 2026-07-28
-> **Initiative:** `native-metatool`
+> **Initiative:** `pi-extension-migration`
 > **Related:** [`ENTITY_MENTIONS_SCOPE.md`](./ENTITY_MENTIONS_SCOPE.md)
 
 ## 1. Decision
@@ -160,6 +160,42 @@ Minimum API:
 - `store.query`, `store.search`, `store.keys`
 - `store.describe`, `store.collections`
 - Atomic batch/transaction support
+
+#### Store ownership boundary
+
+Jcode's native store is the target canonical backend. The current AgentOS
+codemode runtime still mounts a workspace-scoped `/data` directory and runs the
+forked Pi-compatible TypeScript engine inside the guest. That path is an
+**observed compatibility runtime**, not the final ownership boundary. It exists
+so the programmable `mt.*` surface and existing object semantics can be tested
+without granting the guest host authority.
+
+`jcode-metatool-store` owns the future canonical object model, migrations,
+revision rules, search semantics, and mutation history. The AgentOS guest owns
+program execution only. Guest store operations must eventually cross a
+versioned Jcode capability broker rather than opening the canonical database
+directly. This preserves one writer policy and prevents a runtime adapter from
+defining product persistence semantics.
+
+The compatibility runtime may become the default only for execution, never for
+canonical state ownership. Migration from guest-local Pi-compatible storage to
+`jcode-metatool-store` begins when all of the following are measured:
+
+1. Native CRUD, query, search, collections, and transactional batch behavior
+   cover the active Pi store corpus without lossy conversion.
+2. A capability-broker transport exposes those operations to guest `mt.*`
+   without host filesystem or database mounts.
+3. Import verification compares object counts, keys, JSON payloads, tags,
+   search results, and content hashes before cutover.
+4. Durable codemode, procedure, overlay, and history tests pass against the
+   brokered store on the supported platform matrix.
+5. Rollback to the pre-migration database is proven before the first live
+   workspace is promoted.
+
+Until those gates pass, describe results precisely: the AgentOS guest store is
+live and durable for the compatibility runtime; the Rust store is implemented
+replacement infrastructure; brokered canonical ownership is proposed, not yet
+wired.
 
 ### 6.3 Procedures
 
