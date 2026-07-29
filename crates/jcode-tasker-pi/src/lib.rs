@@ -95,6 +95,15 @@ pub fn make_task_note_id() -> String {
 pub fn make_feature_note_id() -> String {
     prefixed_uuid("fnote_")
 }
+pub fn make_session_instance_id() -> String {
+    prefixed_uuid("sessinst_")
+}
+pub fn make_task_claim_id() -> String {
+    prefixed_uuid("claim_")
+}
+pub fn make_work_unit_id() -> String {
+    prefixed_uuid("wu_")
+}
 pub fn make_task_dependency_id(task_id: &str, depends_on_id: &str) -> String {
     format!("dep_{task_id}_{depends_on_id}")
 }
@@ -212,6 +221,165 @@ pub struct FeatureNote {
     pub category: Option<String>,
     pub content: String,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInstance {
+    pub id: String,
+    pub list_id: String,
+    pub project_root: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub session_file: Option<String>,
+    pub pid: i64,
+    pub model: Option<String>,
+    pub leaf_id_at_start: Option<String>,
+    pub current_leaf_id: Option<String>,
+    pub started_at: i64,
+    pub last_seen_at: i64,
+    pub ended_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskClaim {
+    pub id: String,
+    pub task_id: String,
+    pub scope_feature_id: Option<String>,
+    pub list_id: String,
+    pub project_root: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub session_file: Option<String>,
+    pub session_instance_id: String,
+    pub pid: i64,
+    pub claim_kind: String,
+    pub reason: Option<String>,
+    pub claimed_at: i64,
+    pub expires_at: Option<i64>,
+    pub released_at: Option<i64>,
+    pub release_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkUnit {
+    pub id: String,
+    pub task_id: String,
+    pub claim_id: Option<String>,
+    pub scope_feature_id: Option<String>,
+    pub list_id: String,
+    pub project_root: String,
+    pub agent_id: String,
+    pub session_id: String,
+    pub session_file: Option<String>,
+    pub session_instance_id: String,
+    pub status: String,
+    pub priority: i64,
+    pub note: Option<String>,
+    pub created_at: i64,
+    pub dispatched_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub cancelled_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkContextInput {
+    pub agent_id: String,
+    pub session_id: String,
+    pub session_instance_id: String,
+    pub session_file: Option<String>,
+    pub pid: i64,
+    pub model: Option<String>,
+    pub leaf_id_at_start: Option<String>,
+    pub current_leaf_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimTaskInput {
+    pub task_id: String,
+    pub context: WorkContextInput,
+    pub claim_kind: Option<String>,
+    pub reason: Option<String>,
+    pub lease_ms: Option<i64>,
+    pub scope_feature_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimResult {
+    pub ok: bool,
+    pub task: Option<Task>,
+    pub claim: Option<TaskClaim>,
+    pub scope_feature_id: Option<String>,
+    pub already_held: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseClaimInput {
+    pub context: WorkContextInput,
+    pub task_id: Option<String>,
+    pub claim_id: Option<String>,
+    pub release_all: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseResult {
+    pub released: Vec<TaskClaim>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimedTask {
+    #[serde(flatten)]
+    pub claim: TaskClaim,
+    pub task: Option<Task>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkUnitWithTask {
+    #[serde(flatten)]
+    pub work_unit: WorkUnit,
+    pub task: Option<Task>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkingSetResult {
+    pub claims: Vec<ClaimedTask>,
+    pub work_units: Vec<WorkUnitWithTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NextWorkUnitInput {
+    pub context: WorkContextInput,
+    pub claim_kind: Option<String>,
+    pub reason: Option<String>,
+    pub lease_ms: Option<i64>,
+    pub feature_id: Option<String>,
+    pub priority: Option<i64>,
+    pub set_active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NextWorkUnitResult {
+    pub ok: bool,
+    pub task: Option<Task>,
+    pub claim: Option<TaskClaim>,
+    pub work_unit: Option<WorkUnit>,
+    pub scope_feature_id: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -538,6 +706,272 @@ impl PiTaskerStore {
                         .contains(&needle)
             })
             .collect())
+    }
+
+    pub fn claim_task(&mut self, input: ClaimTaskInput) -> Result<ClaimResult> {
+        let tx = self.conn.transaction()?;
+        cleanup_stale_claims_tx(&tx, &self.partition)?;
+        touch_session_instance_tx(&tx, &self.partition, &input.context)?;
+        let task = match load_task_tx(&tx, &self.partition, &input.task_id)? {
+            Some(task) => task,
+            None => {
+                tx.commit()?;
+                return Ok(ClaimResult {
+                    ok: false,
+                    task: None,
+                    claim: None,
+                    scope_feature_id: None,
+                    already_held: false,
+                    error: Some("task_not_found".into()),
+                });
+            }
+        };
+        let features = load_features_tx(&tx, &self.partition)?;
+        let scope_feature_id = resolve_task_scope_feature_id(&task, &features);
+        let Some(scope_feature_id) = scope_feature_id else {
+            tx.commit()?;
+            return Ok(ClaimResult {
+                ok: false,
+                task: Some(task),
+                claim: None,
+                scope_feature_id: None,
+                already_held: false,
+                error: Some("missing_feature_scope".into()),
+            });
+        };
+        if let Some(requested) = &input.scope_feature_id
+            && find_root_feature_id(&features, requested).as_deref()
+                != Some(scope_feature_id.as_str())
+        {
+            tx.commit()?;
+            return Ok(ClaimResult {
+                ok: false,
+                task: Some(task),
+                claim: None,
+                scope_feature_id: Some(scope_feature_id),
+                already_held: false,
+                error: Some("scope_mismatch".into()),
+            });
+        }
+        if let Some(existing) =
+            active_claim_for_task_tx(&tx, &self.partition, &input.task_id, &scope_feature_id)?
+        {
+            if same_owner(&existing, &input.context) {
+                tx.execute("UPDATE task_claims SET session_instance_id=?1, scope_feature_id=?2, agent_id=?3, session_file=?4, pid=?5 WHERE id=?6 AND list_id=?7 AND project_root=?8", params![input.context.session_instance_id, scope_feature_id, input.context.agent_id, input.context.session_file, input.context.pid, existing.id, self.partition.list_id, self.partition.project_root])?;
+                let mut refreshed = existing;
+                refreshed.session_instance_id = input.context.session_instance_id;
+                refreshed.scope_feature_id = Some(scope_feature_id.clone());
+                refreshed.agent_id = input.context.agent_id;
+                refreshed.session_file = input.context.session_file;
+                refreshed.pid = input.context.pid;
+                tx.commit()?;
+                return Ok(ClaimResult {
+                    ok: true,
+                    task: Some(task),
+                    claim: Some(refreshed),
+                    scope_feature_id: Some(scope_feature_id),
+                    already_held: true,
+                    error: None,
+                });
+            }
+            tx.commit()?;
+            return Ok(ClaimResult {
+                ok: false,
+                task: Some(task),
+                claim: Some(existing),
+                scope_feature_id: Some(scope_feature_id),
+                already_held: false,
+                error: Some("already_claimed".into()),
+            });
+        }
+        let claim = insert_claim_tx(
+            &tx,
+            &self.partition,
+            InsertClaim {
+                task_id: &input.task_id,
+                scope_feature_id: &scope_feature_id,
+                context: &input.context,
+                claim_kind: input.claim_kind.as_deref().unwrap_or("claim"),
+                reason: input.reason.as_deref(),
+                lease_ms: input.lease_ms,
+            },
+        )?;
+        tx.commit()?;
+        Ok(ClaimResult {
+            ok: true,
+            task: Some(task),
+            claim: Some(claim),
+            scope_feature_id: Some(scope_feature_id),
+            already_held: false,
+            error: None,
+        })
+    }
+
+    pub fn release_claim(&mut self, input: ReleaseClaimInput) -> Result<ReleaseResult> {
+        let tx = self.conn.transaction()?;
+        cleanup_stale_claims_tx(&tx, &self.partition)?;
+        touch_session_instance_tx(&tx, &self.partition, &input.context)?;
+        let active = load_active_claims_tx(&tx, &self.partition)?;
+        let has_target = input.release_all || input.task_id.is_some() || input.claim_id.is_some();
+        let owned: Vec<_> = if has_target {
+            active
+                .into_iter()
+                .filter(|claim| {
+                    same_owner(claim, &input.context)
+                        && (input.release_all
+                            || input.task_id.as_ref().is_none_or(|id| claim.task_id == *id))
+                        && input.claim_id.as_ref().is_none_or(|id| claim.id == *id)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let now = now_ms();
+        for claim in &owned {
+            tx.execute("UPDATE task_claims SET released_at=?1, release_reason=?2 WHERE id=?3 AND list_id=?4 AND project_root=?5 AND released_at IS NULL", params![now, input.reason.as_deref().unwrap_or("released"), claim.id, self.partition.list_id, self.partition.project_root])?;
+            tx.execute("UPDATE work_units SET status='cancelled', cancelled_at=?1 WHERE claim_id=?2 AND list_id=?3 AND project_root=?4 AND status IN ('queued','active')", params![now, claim.id, self.partition.list_id, self.partition.project_root])?;
+        }
+        let count = owned.len();
+        tx.commit()?;
+        Ok(ReleaseResult {
+            released: owned,
+            count,
+        })
+    }
+
+    pub fn get_working_set(&mut self, context: WorkContextInput) -> Result<WorkingSetResult> {
+        let tx = self.conn.transaction()?;
+        cleanup_stale_claims_tx(&tx, &self.partition)?;
+        touch_session_instance_tx(&tx, &self.partition, &context)?;
+        let tasks = load_tasks_tx(&tx, &self.partition)?;
+        let by_id: BTreeMap<_, _> = tasks
+            .into_iter()
+            .map(|task| (task.id.clone(), task))
+            .collect();
+        let claims = load_active_claims_tx(&tx, &self.partition)?
+            .into_iter()
+            .filter(|claim| same_owner(claim, &context))
+            .map(|claim| ClaimedTask {
+                task: by_id.get(&claim.task_id).cloned(),
+                claim,
+            })
+            .collect();
+        let work_units = load_open_work_units_tx(&tx, &self.partition)?
+            .into_iter()
+            .filter(|unit| same_work_owner(unit, &context))
+            .map(|work_unit| WorkUnitWithTask {
+                task: by_id.get(&work_unit.task_id).cloned(),
+                work_unit,
+            })
+            .collect();
+        tx.commit()?;
+        Ok(WorkingSetResult { claims, work_units })
+    }
+
+    pub fn enqueue_next_work_unit(
+        &mut self,
+        input: NextWorkUnitInput,
+    ) -> Result<NextWorkUnitResult> {
+        let tx = self.conn.transaction()?;
+        cleanup_stale_claims_tx(&tx, &self.partition)?;
+        touch_session_instance_tx(&tx, &self.partition, &input.context)?;
+        let Some(feature_id) = input.feature_id.as_deref() else {
+            tx.commit()?;
+            return Ok(NextWorkUnitResult {
+                ok: false,
+                task: None,
+                claim: None,
+                work_unit: None,
+                scope_feature_id: None,
+                error: Some("feature_scope_required".into()),
+            });
+        };
+        let tasks = load_tasks_tx(&tx, &self.partition)?;
+        let deps = load_dependencies_tx(&tx, &self.partition)?;
+        let features = load_features_tx(&tx, &self.partition)?;
+        let Some(scope_feature_id) = find_root_feature_id(&features, feature_id) else {
+            tx.commit()?;
+            return Ok(NextWorkUnitResult {
+                ok: false,
+                task: None,
+                claim: None,
+                work_unit: None,
+                scope_feature_id: None,
+                error: Some("feature_scope_not_found".into()),
+            });
+        };
+        let scoped = collect_feature_subtree_ids(&features, &scope_feature_id);
+        let active_tasks: BTreeSet<_> = load_active_claims_tx(&tx, &self.partition)?
+            .into_iter()
+            .map(|claim| claim.task_id)
+            .collect();
+        let open_work_tasks: BTreeSet<_> = load_open_work_units_tx(&tx, &self.partition)?
+            .into_iter()
+            .map(|unit| unit.task_id)
+            .collect();
+        let task = compute_ready_tasks(tasks, deps)
+            .into_iter()
+            .filter(|task| {
+                task.feature_id
+                    .as_ref()
+                    .is_some_and(|id| scoped.contains(id))
+            })
+            .filter(|task| !active_tasks.contains(&task.id) && !open_work_tasks.contains(&task.id))
+            .min_by(|a, b| {
+                a.display_id
+                    .cmp(&b.display_id)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        let Some(mut task) = task else {
+            tx.commit()?;
+            return Ok(NextWorkUnitResult {
+                ok: false,
+                task: None,
+                claim: None,
+                work_unit: None,
+                scope_feature_id: Some(scope_feature_id),
+                error: Some("none_ready".into()),
+            });
+        };
+        let reason = input.reason.as_deref().unwrap_or("next working unit");
+        let claim = insert_claim_tx(
+            &tx,
+            &self.partition,
+            InsertClaim {
+                task_id: &task.id,
+                scope_feature_id: &scope_feature_id,
+                context: &input.context,
+                claim_kind: input.claim_kind.as_deref().unwrap_or("lock"),
+                reason: Some(reason),
+                lease_ms: input.lease_ms,
+            },
+        )?;
+        let work_unit = insert_work_unit_tx(
+            &tx,
+            &self.partition,
+            InsertWorkUnit {
+                task_id: &task.id,
+                claim_id: &claim.id,
+                scope_feature_id: &scope_feature_id,
+                context: &input.context,
+                priority: input.priority.unwrap_or(0),
+                note: Some(reason),
+            },
+        )?;
+        if task.state == "todo" {
+            task.state = "in_progress".into();
+            task.updated_at = now_ms();
+            tx.execute("UPDATE tasks SET state=?1, updated_at=?2 WHERE id=?3 AND list_id=?4 AND project_root=?5", params![task.state, task.updated_at, task.id, self.partition.list_id, self.partition.project_root])?;
+        }
+        tx.commit()?;
+        Ok(NextWorkUnitResult {
+            ok: true,
+            task: Some(task),
+            claim: Some(claim),
+            work_unit: Some(work_unit),
+            scope_feature_id: Some(scope_feature_id),
+            error: None,
+        })
     }
 
     pub fn create_task(&mut self, input: CreateTask) -> Result<Task> {
@@ -1006,9 +1440,210 @@ fn row_feature(r: &rusqlite::Row<'_>) -> rusqlite::Result<Feature> {
         updated_at: r.get(17)?,
     })
 }
+fn row_task_claim(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskClaim> {
+    Ok(TaskClaim {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        scope_feature_id: r.get(2)?,
+        list_id: r.get(3)?,
+        project_root: r.get(4)?,
+        agent_id: r.get(5)?,
+        session_id: r.get(6)?,
+        session_file: r.get(7)?,
+        session_instance_id: r.get(8)?,
+        pid: r.get(9)?,
+        claim_kind: r.get(10)?,
+        reason: r.get(11)?,
+        claimed_at: r.get(12)?,
+        expires_at: r.get(13)?,
+        released_at: r.get(14)?,
+        release_reason: r.get(15)?,
+    })
+}
+fn row_work_unit(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorkUnit> {
+    Ok(WorkUnit {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        claim_id: r.get(2)?,
+        scope_feature_id: r.get(3)?,
+        list_id: r.get(4)?,
+        project_root: r.get(5)?,
+        agent_id: r.get(6)?,
+        session_id: r.get(7)?,
+        session_file: r.get(8)?,
+        session_instance_id: r.get(9)?,
+        status: r.get(10)?,
+        priority: r.get(11)?,
+        note: r.get(12)?,
+        created_at: r.get(13)?,
+        dispatched_at: r.get(14)?,
+        completed_at: r.get(15)?,
+        cancelled_at: r.get(16)?,
+    })
+}
 fn json_or_empty_array(raw: Option<String>) -> Value {
     raw.and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| Value::Array(vec![]))
+}
+
+fn load_features_tx(tx: &rusqlite::Transaction<'_>, p: &ProjectPartition) -> Result<Vec<Feature>> {
+    let mut stmt = tx.prepare("SELECT id,list_id,project_root,display_id,parent_feature_id,title,description,state,priority,tags,brief,acceptance,owner,gates,indexes,depth,created_at,updated_at FROM features WHERE list_id=?1 AND project_root=?2 ORDER BY display_id ASC")?;
+    Ok(stmt
+        .query_map(params![p.list_id, p.project_root], row_feature)?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn load_dependencies_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+) -> Result<Vec<TaskDependency>> {
+    let mut stmt = tx.prepare("SELECT id,task_id,depends_on,list_id,project_root,created_at FROM task_dependencies WHERE list_id=?1 AND project_root=?2 ORDER BY created_at ASC")?;
+    Ok(stmt
+        .query_map(params![p.list_id, p.project_root], |r| {
+            Ok(TaskDependency {
+                id: r.get(0)?,
+                task_id: r.get(1)?,
+                depends_on_id: r.get(2)?,
+                list_id: r.get(3)?,
+                project_root: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn load_active_claims_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+) -> Result<Vec<TaskClaim>> {
+    let now = now_ms();
+    let mut stmt = tx.prepare("SELECT id,task_id,scope_feature_id,list_id,project_root,agent_id,session_id,session_file,session_instance_id,pid,claim_kind,reason,claimed_at,expires_at,released_at,release_reason FROM task_claims WHERE list_id=?1 AND project_root=?2 AND released_at IS NULL AND (expires_at IS NULL OR expires_at>?3) ORDER BY claimed_at ASC")?;
+    Ok(stmt
+        .query_map(params![p.list_id, p.project_root, now], row_task_claim)?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn load_open_work_units_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+) -> Result<Vec<WorkUnit>> {
+    let mut stmt = tx.prepare("SELECT id,task_id,claim_id,scope_feature_id,list_id,project_root,agent_id,session_id,session_file,session_instance_id,status,priority,note,created_at,dispatched_at,completed_at,cancelled_at FROM work_units WHERE list_id=?1 AND project_root=?2 AND status IN ('queued','active') ORDER BY priority DESC, created_at ASC")?;
+    Ok(stmt
+        .query_map(params![p.list_id, p.project_root], row_work_unit)?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn cleanup_stale_claims_tx(tx: &rusqlite::Transaction<'_>, p: &ProjectPartition) -> Result<()> {
+    let now = now_ms();
+    tx.execute("UPDATE task_claims SET released_at=?1, release_reason='expired' WHERE list_id=?2 AND project_root=?3 AND released_at IS NULL AND expires_at IS NOT NULL AND expires_at<=?1", params![now, p.list_id, p.project_root])?;
+    tx.execute("UPDATE work_units SET status='cancelled', cancelled_at=?1 WHERE list_id=?2 AND project_root=?3 AND status IN ('queued','active') AND claim_id IN (SELECT id FROM task_claims WHERE list_id=?2 AND project_root=?3 AND release_reason='expired' AND released_at=?1)", params![now, p.list_id, p.project_root])?;
+    Ok(())
+}
+
+fn touch_session_instance_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    context: &WorkContextInput,
+) -> Result<()> {
+    let now = now_ms();
+    tx.execute("INSERT INTO tasker_session_instances (id,list_id,project_root,agent_id,session_id,session_file,pid,model,leaf_id_at_start,current_leaf_id,started_at,last_seen_at,ended_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11,NULL) ON CONFLICT(id) DO UPDATE SET agent_id=excluded.agent_id, session_id=excluded.session_id, session_file=excluded.session_file, pid=excluded.pid, model=excluded.model, current_leaf_id=excluded.current_leaf_id, last_seen_at=excluded.last_seen_at", params![context.session_instance_id, p.list_id, p.project_root, context.agent_id, context.session_id, context.session_file, context.pid, context.model, context.leaf_id_at_start, context.current_leaf_id, now])?;
+    Ok(())
+}
+
+fn active_claim_for_task_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    task_id: &str,
+    scope_feature_id: &str,
+) -> Result<Option<TaskClaim>> {
+    Ok(load_active_claims_tx(tx, p)?.into_iter().find(|claim| {
+        claim.task_id == task_id
+            && (claim.scope_feature_id.as_deref() == Some(scope_feature_id)
+                || claim.scope_feature_id.is_none())
+    }))
+}
+
+struct InsertClaim<'a> {
+    task_id: &'a str,
+    scope_feature_id: &'a str,
+    context: &'a WorkContextInput,
+    claim_kind: &'a str,
+    reason: Option<&'a str>,
+    lease_ms: Option<i64>,
+}
+
+fn insert_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    input: InsertClaim<'_>,
+) -> Result<TaskClaim> {
+    let now = now_ms();
+    let claim = TaskClaim {
+        id: make_task_claim_id(),
+        task_id: input.task_id.into(),
+        scope_feature_id: Some(input.scope_feature_id.into()),
+        list_id: p.list_id.clone(),
+        project_root: p.project_root.clone(),
+        agent_id: input.context.agent_id.clone(),
+        session_id: input.context.session_id.clone(),
+        session_file: input.context.session_file.clone(),
+        session_instance_id: input.context.session_instance_id.clone(),
+        pid: input.context.pid,
+        claim_kind: input.claim_kind.into(),
+        reason: input.reason.map(str::to_owned),
+        claimed_at: now,
+        expires_at: input.lease_ms.filter(|ms| *ms > 0).map(|ms| now + ms),
+        released_at: None,
+        release_reason: None,
+    };
+    tx.execute("INSERT INTO task_claims (id,task_id,scope_feature_id,list_id,project_root,agent_id,session_id,session_file,session_instance_id,pid,claim_kind,reason,claimed_at,expires_at,released_at,release_reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)", params![claim.id, claim.task_id, claim.scope_feature_id, claim.list_id, claim.project_root, claim.agent_id, claim.session_id, claim.session_file, claim.session_instance_id, claim.pid, claim.claim_kind, claim.reason, claim.claimed_at, claim.expires_at, claim.released_at, claim.release_reason])?;
+    Ok(claim)
+}
+
+struct InsertWorkUnit<'a> {
+    task_id: &'a str,
+    claim_id: &'a str,
+    scope_feature_id: &'a str,
+    context: &'a WorkContextInput,
+    priority: i64,
+    note: Option<&'a str>,
+}
+
+fn insert_work_unit_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    input: InsertWorkUnit<'_>,
+) -> Result<WorkUnit> {
+    let now = now_ms();
+    let unit = WorkUnit {
+        id: make_work_unit_id(),
+        task_id: input.task_id.into(),
+        claim_id: Some(input.claim_id.into()),
+        scope_feature_id: Some(input.scope_feature_id.into()),
+        list_id: p.list_id.clone(),
+        project_root: p.project_root.clone(),
+        agent_id: input.context.agent_id.clone(),
+        session_id: input.context.session_id.clone(),
+        session_file: input.context.session_file.clone(),
+        session_instance_id: input.context.session_instance_id.clone(),
+        status: "active".into(),
+        priority: input.priority,
+        note: input.note.map(str::to_owned),
+        created_at: now,
+        dispatched_at: Some(now),
+        completed_at: None,
+        cancelled_at: None,
+    };
+    tx.execute("INSERT INTO work_units (id,task_id,claim_id,scope_feature_id,list_id,project_root,agent_id,session_id,session_file,session_instance_id,status,priority,note,created_at,dispatched_at,completed_at,cancelled_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)", params![unit.id, unit.task_id, unit.claim_id, unit.scope_feature_id, unit.list_id, unit.project_root, unit.agent_id, unit.session_id, unit.session_file, unit.session_instance_id, unit.status, unit.priority, unit.note, unit.created_at, unit.dispatched_at, unit.completed_at, unit.cancelled_at])?;
+    Ok(unit)
+}
+
+fn same_owner(claim: &TaskClaim, context: &WorkContextInput) -> bool {
+    claim.agent_id == context.agent_id || claim.session_id == context.session_id
+}
+
+fn same_work_owner(unit: &WorkUnit, context: &WorkContextInput) -> bool {
+    unit.agent_id == context.agent_id || unit.session_id == context.session_id
 }
 
 fn load_task_tx(
@@ -1233,6 +1868,51 @@ pub fn compute_ready_tasks(tasks: Vec<Task>, deps: Vec<TaskDependency>) -> Vec<T
                     .is_none_or(|ds| ds.iter().all(|d| done.contains(d)))
         })
         .collect()
+}
+
+pub fn find_root_feature_id(features: &[Feature], feature_id: &str) -> Option<String> {
+    let by_id: BTreeMap<_, _> = features
+        .iter()
+        .map(|feature| (feature.id.as_str(), feature))
+        .collect();
+    let mut current = by_id.get(feature_id)?;
+    let mut seen = BTreeSet::new();
+    while let Some(parent_id) = current.parent_feature_id.as_deref() {
+        if !seen.insert(current.id.as_str()) {
+            return None;
+        }
+        current = by_id.get(parent_id)?;
+    }
+    Some(current.id.clone())
+}
+
+pub fn collect_feature_subtree_ids(
+    features: &[Feature],
+    root_feature_id: &str,
+) -> BTreeSet<String> {
+    let mut children: BTreeMap<&str, Vec<&Feature>> = BTreeMap::new();
+    for feature in features {
+        if let Some(parent_id) = feature.parent_feature_id.as_deref() {
+            children.entry(parent_id).or_default().push(feature);
+        }
+    }
+    let mut out = BTreeSet::new();
+    let mut queue = vec![root_feature_id.to_owned()];
+    while let Some(id) = queue.pop() {
+        if !out.insert(id.clone()) {
+            continue;
+        }
+        if let Some(kids) = children.get(id.as_str()) {
+            queue.extend(kids.iter().map(|feature| feature.id.clone()));
+        }
+    }
+    out
+}
+
+pub fn resolve_task_scope_feature_id(task: &Task, features: &[Feature]) -> Option<String> {
+    task.feature_id
+        .as_deref()
+        .and_then(|feature_id| find_root_feature_id(features, feature_id))
 }
 
 const REQUIRED: &[(&str, &[&str])] = &[
@@ -1496,6 +2176,216 @@ mod tests {
             gates: Value::Array(vec![]),
             indexes: Value::Array(vec![]),
         }
+    }
+
+    fn work_context(agent: &str, session: &str) -> WorkContextInput {
+        WorkContextInput {
+            agent_id: agent.into(),
+            session_id: session.into(),
+            session_instance_id: format!("sessinst_{agent}_{session}"),
+            session_file: Some(format!("{session}.jsonl")),
+            pid: 42,
+            model: Some("test-model".into()),
+            leaf_id_at_start: Some("leaf-start".into()),
+            current_leaf_id: Some("leaf-current".into()),
+        }
+    }
+
+    #[test]
+    fn claim_task_rejects_orphan_global_and_conflicting_claims() {
+        let mut store = temp_store();
+        let orphan = store
+            .create_task(CreateTask {
+                title: "Global".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let rejected = store
+            .claim_task(ClaimTaskInput {
+                task_id: orphan.id,
+                context: work_context("a", "s1"),
+                claim_kind: None,
+                reason: None,
+                lease_ms: None,
+                scope_feature_id: None,
+            })
+            .unwrap();
+        assert!(!rejected.ok);
+        assert_eq!(rejected.error.as_deref(), Some("missing_feature_scope"));
+        assert!(rejected.claim.is_none());
+
+        let feature = store.create_feature(feature_input("Root")).unwrap();
+        let task = store
+            .create_task(CreateTask {
+                title: "Scoped".into(),
+                feature_id: Some(feature.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let first = store
+            .claim_task(ClaimTaskInput {
+                task_id: task.id.clone(),
+                context: work_context("a", "s1"),
+                claim_kind: None,
+                reason: Some("mine".into()),
+                lease_ms: Some(30_000),
+                scope_feature_id: Some(feature.id.clone()),
+            })
+            .unwrap();
+        assert!(first.ok);
+        assert_eq!(first.scope_feature_id.as_deref(), Some(feature.id.as_str()));
+        let again = store
+            .claim_task(ClaimTaskInput {
+                task_id: task.id.clone(),
+                context: work_context("a", "s2"),
+                claim_kind: None,
+                reason: None,
+                lease_ms: None,
+                scope_feature_id: None,
+            })
+            .unwrap();
+        assert!(again.ok);
+        assert!(again.already_held);
+        let conflict = store
+            .claim_task(ClaimTaskInput {
+                task_id: task.id,
+                context: work_context("b", "other"),
+                claim_kind: None,
+                reason: None,
+                lease_ms: None,
+                scope_feature_id: None,
+            })
+            .unwrap();
+        assert!(!conflict.ok);
+        assert_eq!(conflict.error.as_deref(), Some("already_claimed"));
+    }
+
+    #[test]
+    fn working_sets_are_private_and_release_cancels_owned_units() {
+        let mut store = temp_store();
+        let feature = store.create_feature(feature_input("Root")).unwrap();
+        let task = store
+            .create_task(CreateTask {
+                title: "Work".into(),
+                feature_id: Some(feature.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let owner = work_context("agent", "session");
+        let outsider = work_context("other", "else");
+        let next = store
+            .enqueue_next_work_unit(NextWorkUnitInput {
+                context: owner.clone(),
+                claim_kind: None,
+                reason: None,
+                lease_ms: None,
+                feature_id: Some(feature.id),
+                priority: Some(7),
+                set_active: None,
+            })
+            .unwrap();
+        assert!(next.ok);
+        assert_eq!(next.task.as_ref().unwrap().id, task.id);
+        assert_eq!(next.task.as_ref().unwrap().state, "in_progress");
+        assert_eq!(
+            store.get_working_set(owner.clone()).unwrap().claims.len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_working_set(owner.clone())
+                .unwrap()
+                .work_units
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .get_working_set(outsider.clone())
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        assert!(
+            store
+                .get_working_set(outsider)
+                .unwrap()
+                .work_units
+                .is_empty()
+        );
+        let release = store
+            .release_claim(ReleaseClaimInput {
+                context: owner.clone(),
+                task_id: None,
+                claim_id: next.claim.as_ref().map(|claim| claim.id.clone()),
+                release_all: false,
+                reason: None,
+            })
+            .unwrap();
+        assert_eq!(release.count, 1);
+        assert!(store.get_working_set(owner).unwrap().claims.is_empty());
+        let status: String = store
+            .conn
+            .query_row(
+                "SELECT status FROM work_units WHERE id=?1",
+                params![next.work_unit.unwrap().id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn task_done_completes_work_units_and_releases_claims() {
+        let mut store = temp_store();
+        let feature = store.create_feature(feature_input("Root")).unwrap();
+        let task = store
+            .create_task(CreateTask {
+                title: "Finish".into(),
+                feature_id: Some(feature.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let next = store
+            .enqueue_next_work_unit(NextWorkUnitInput {
+                context: work_context("agent", "session"),
+                claim_kind: None,
+                reason: None,
+                lease_ms: None,
+                feature_id: Some(feature.id),
+                priority: None,
+                set_active: None,
+            })
+            .unwrap();
+        store
+            .update_task(
+                &task.id,
+                UpdateTask {
+                    state: Some("done".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (work_status, completed_at): (String, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT status,completed_at FROM work_units WHERE id=?1",
+                params![next.work_unit.unwrap().id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(work_status, "done");
+        assert!(completed_at.is_some());
+        let (released_at, reason): (Option<i64>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT released_at,release_reason FROM task_claims WHERE id=?1",
+                params![next.claim.unwrap().id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(released_at.is_some());
+        assert_eq!(reason.as_deref(), Some("task_done"));
     }
 
     #[test]
