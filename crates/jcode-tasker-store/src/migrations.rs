@@ -17,7 +17,10 @@ pub(crate) fn configure_and_migrate(
 
 fn apply_pending(connection: &mut Connection) -> StoreResult<()> {
     let current: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let latest = u32::try_from(MIGRATIONS.len()).expect("migration count fits in u32");
+    let latest =
+        u32::try_from(MIGRATIONS.len()).map_err(|_| jcode_tasker_types::TaskerError::Conflict {
+            message: "tasker migration count exceeds SQLite user_version range".to_string(),
+        })?;
     if current > latest {
         return Err(jcode_tasker_types::TaskerError::Conflict {
             message: format!(
@@ -28,7 +31,10 @@ fn apply_pending(connection: &mut Connection) -> StoreResult<()> {
     }
 
     for (index, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
-        let version = u32::try_from(index + 1).expect("migration index fits in u32");
+        let version =
+            u32::try_from(index + 1).map_err(|_| jcode_tasker_types::TaskerError::Conflict {
+                message: "tasker migration index exceeds SQLite user_version range".to_string(),
+            })?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(sql)?;
         transaction.pragma_update(None, "user_version", version)?;

@@ -20,7 +20,10 @@ impl TaskerStore {
         self.call(move |connection| {
             let name = required_text("name", command.name, 200)?;
             let canonical_root = optional_text(command.canonical_root);
-            let project_id = command.id.unwrap_or_default();
+            let project_id = match command.id {
+                Some(project_id) => project_id,
+                None => ProjectId::new(),
+            };
             let now = Utc::now();
             let timestamp = now.to_rfc3339();
             let transaction =
@@ -84,7 +87,10 @@ impl TaskerStore {
     ) -> StoreResult<MutationResult<Feature>> {
         self.call(move |connection| {
             let title = required_text("title", command.title, 500)?;
-            let feature_id = command.id.unwrap_or_default();
+            let feature_id = match command.id {
+                Some(feature_id) => feature_id,
+                None => FeatureId::new(),
+            };
             let now = Utc::now();
             let timestamp = now.to_rfc3339();
             let transaction =
@@ -140,7 +146,10 @@ impl TaskerStore {
     pub async fn create_task(&self, command: CreateTask) -> StoreResult<MutationResult<Task>> {
         self.call(move |connection| {
             let title = required_text("title", command.title, 500)?;
-            let task_id = command.id.unwrap_or_default();
+            let task_id = match command.id {
+                Some(task_id) => task_id,
+                None => TaskId::new(),
+            };
             let now = Utc::now();
             let timestamp = now.to_rfc3339();
             let transaction =
