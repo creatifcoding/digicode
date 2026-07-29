@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use jcode_tasker_pi::{
-    CreateFeature, CreateTask, PiTaskerStore, ProjectPartition, Task, UpdateFeature, UpdateTask,
+    BatchOperation, CreateFeature, CreateTask, PiTaskerStore, PlanTask, ProjectPartition, Task,
+    UpdateFeature, UpdateTask,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -83,6 +84,10 @@ struct TaskerInput {
     indexes: Option<Value>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    operations: Option<Vec<BatchOperation>>,
+    #[serde(default)]
+    tasks: Option<Vec<PlanTask>>,
 }
 
 fn required<T>(value: Option<T>, field: &'static str, action: &str) -> Result<T> {
@@ -203,7 +208,7 @@ impl Tool for TaskerTool {
                     "enum": [
                         "status", "ready", "show", "create_feature", "create", "add_dependency", "set_state",
                         "list", "search", "update", "add_note", "feature_list", "feature_update", "feature_status",
-                        "link", "unlink"
+                        "link", "unlink", "batch", "plan"
                     ]
                 },
                 "title": {"type": "string"},
@@ -224,6 +229,46 @@ impl Tool for TaskerTool {
                 "owner": {"type": "string"},
                 "gates": {"type": ["array", "object"]},
                 "indexes": {"type": ["array", "object"]},
+                "operations": {
+                    "type": "array",
+                    "description": "Atomic Pi-compatible create/update operations. Create keys may be referenced by later dependencies and updates.",
+                    "items": {
+                        "type": "object",
+                        "required": ["op"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "op": {"type": "string", "enum": ["create", "update"]},
+                            "key": {"type": "string"},
+                            "taskId": {"type": "string"},
+                            "title": {"type": "string"},
+                            "description": {"type": ["string", "null"]},
+                            "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done"]},
+                            "dependsOn": {"type": "array", "items": {"type": "string"}},
+                            "notes": {"type": "array", "items": {"type": "object", "required": ["content"], "additionalProperties": false, "properties": {"content": {"type": "string"}, "category": {"type": "string"}}}},
+                            "indexes": {"type": ["array", "object"]},
+                            "clearDependencies": {"type": "boolean"},
+                            "active": {"type": "boolean"}
+                        }
+                    }
+                },
+                "tasks": {
+                    "type": "array",
+                    "description": "Atomic pure-creation task plan. Each after entry references another task key in this plan.",
+                    "items": {
+                        "type": "object",
+                        "required": ["key", "title"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "key": {"type": "string"},
+                            "title": {"type": "string"},
+                            "description": {"type": "string"},
+                            "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done"]},
+                            "after": {"type": "array", "items": {"type": "string"}},
+                            "notes": {"type": "array", "items": {"type": "object", "required": ["content"], "additionalProperties": false, "properties": {"content": {"type": "string"}, "category": {"type": "string"}}}},
+                            "indexes": {"type": ["array", "object"]}
+                        }
+                    }
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum records returned by bounded list, search, and status projections."}
             }
         })
@@ -402,6 +447,48 @@ impl Tool for TaskerTool {
                     output(
                         format!("Created #{}", task.display_id),
                         with_base(json!({"task": task})),
+                    )
+                }
+                "batch" => {
+                    let operations = required(params.operations, "operations", "batch")?;
+                    if operations.is_empty() {
+                        return Err(anyhow!("operations must not be empty for batch"));
+                    }
+                    for operation in &operations {
+                        let state = match operation {
+                            BatchOperation::Create { state, .. }
+                            | BatchOperation::Update { state, .. } => state.as_deref(),
+                        };
+                        if let Some(state) = state {
+                            validate_enum(state, TASK_STATES, "state")?;
+                        }
+                    }
+                    let result = store.batch_execute(operations)?;
+                    output(
+                        format!(
+                            "Batch: {} created, {} updated",
+                            result.created, result.updated
+                        ),
+                        with_base(json!({"batch": result})),
+                    )
+                }
+                "plan" => {
+                    let tasks = required(params.tasks, "tasks", "plan")?;
+                    if tasks.is_empty() {
+                        return Err(anyhow!("tasks must not be empty for plan"));
+                    }
+                    for task in &tasks {
+                        if let Some(state) = task.state.as_deref() {
+                            validate_enum(state, TASK_STATES, "state")?;
+                        }
+                    }
+                    let result = store.plan_import(tasks)?;
+                    output(
+                        format!(
+                            "Plan: {} tasks, {} dependencies",
+                            result.task_count, result.dependency_count
+                        ),
+                        with_base(json!({"plan": result})),
                     )
                 }
                 "update" | "set_state" => {
@@ -710,6 +797,8 @@ mod tests {
             "feature_status",
             "link",
             "unlink",
+            "batch",
+            "plan",
         ] {
             assert!(actions.contains(&json!(action)), "missing {action}");
         }
@@ -848,5 +937,81 @@ mod tests {
             .metadata
             .expect("unlink metadata");
         assert_eq!(unlinked["task"]["featureId"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn imports_atomic_plans_and_batches_through_the_public_tool() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (_database_dir, tool) = temp_tool();
+        let ctx = context(workspace.path());
+
+        let plan = tool
+            .execute(
+                json!({
+                    "action": "plan",
+                    "tasks": [
+                        {"key": "ground", "title": "Ground source", "state": "done"},
+                        {"key": "build", "title": "Build bridge", "after": ["ground"], "notes": [{"category": "context", "content": "atomic plan"}]}
+                    ]
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("import plan")
+            .metadata
+            .expect("plan metadata");
+        assert_eq!(plan["plan"]["taskCount"], 2);
+        assert_eq!(plan["plan"]["dependencyCount"], 1);
+
+        let batch = tool
+            .execute(
+                json!({
+                    "action": "batch",
+                    "operations": [
+                        {"op": "create", "key": "verify", "title": "Verify bridge", "dependsOn": ["#2"]},
+                        {"op": "update", "taskId": "verify", "state": "done"}
+                    ]
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("execute batch")
+            .metadata
+            .expect("batch metadata");
+        assert_eq!(batch["batch"]["created"], 1);
+        assert_eq!(batch["batch"]["updated"], 1);
+        assert_eq!(batch["batch"]["operations"][1]["task"]["state"], "done");
+
+        let before = tool
+            .execute(json!({"action": "status"}), ctx.clone())
+            .await
+            .expect("status before invalid plan")
+            .metadata
+            .expect("status metadata");
+        let invalid = tool
+            .execute(
+                json!({"action": "plan", "tasks": [{"key": "bad", "title": "Must roll back", "after": ["missing"]}]}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(invalid.is_err());
+        let invalid_state = tool
+            .execute(
+                json!({"action": "batch", "operations": [{"op": "create", "title": "Nope", "state": "cancelled"}]}),
+                ctx.clone(),
+            )
+            .await;
+        assert!(invalid_state.is_err());
+        let after = tool
+            .execute(json!({"action": "status"}), ctx)
+            .await
+            .expect("status after invalid plan")
+            .metadata
+            .expect("status metadata");
+        assert_eq!(before["counts"]["tasks"], after["counts"]["tasks"]);
+        assert_eq!(
+            before["counts"]["dependencies"],
+            after["counts"]["dependencies"]
+        );
     }
 }
