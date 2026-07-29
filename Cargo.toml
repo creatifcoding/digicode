@@ -76,6 +76,7 @@ members = [
     "crates/jcode-task-types",
     "crates/jcode-tasker-types",
     "crates/jcode-tasker-store",
+    "crates/jcode-tasker-pi",
     "crates/jcode-tool-core",
     "crates/jcode-tool-types",
     "crates/jcode-tui-account-picker",

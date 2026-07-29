@@ -4769,6 +4769,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcode-tasker-pi"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "jcode-tasker-store"
 version = "0.1.0"
 dependencies = [
