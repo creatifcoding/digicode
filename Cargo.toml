@@ -33,6 +33,7 @@ members = [
     "crates/jcode-desktop2",
     "crates/jcode-memory-types",
     "crates/jcode-metatool-store",
+    "crates/jcode-metatool-runtime",
     "crates/jcode-metatool-types",
     "crates/jcode-message-types",
     "crates/jcode-overnight-core",

@@ -106,7 +106,7 @@ impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             cpu_time_ms: 250,
-            wall_time_ms: 1_000,
+            wall_time_ms: 5_000,
             heap_mb: 32,
             max_output_bytes: 64 * 1024,
         }

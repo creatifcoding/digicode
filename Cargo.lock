@@ -3986,6 +3986,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcode-metatool-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jcode-metatool-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "jcode-metatool-store"
 version = "0.1.0"
 dependencies = [

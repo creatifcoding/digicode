@@ -1,0 +1,258 @@
+use std::{path::PathBuf, process::Stdio, time::Instant};
+
+use async_trait::async_trait;
+use jcode_metatool_types::{ExecutionOutcome, ExecutionRequest, ExecutionResult, MetaToolError};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+
+pub const AGENTOS_PACKAGE: &str = "@rivet-dev/agentos-core";
+pub const AGENTOS_VERSION: &str = "0.2.15";
+pub const SIDECAR_PROTOCOL_VERSION: u32 = 1;
+pub const SIDECAR_SOURCE: &str = include_str!("../assets/agentos-sidecar.mjs");
+
+#[async_trait]
+pub trait JavaScriptExecutor: Send + Sync {
+    async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResult, MetaToolError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentOsRuntimeConfig {
+    pub node_binary: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub expected_sidecar_sha256: String,
+}
+
+impl AgentOsRuntimeConfig {
+    pub fn expected_sidecar_sha256() -> String {
+        format!("{:x}", Sha256::digest(SIDECAR_SOURCE.as_bytes()))
+    }
+
+    pub fn validate(&self) -> Result<(), MetaToolError> {
+        for (name, path) in [
+            ("node binary", &self.node_binary),
+            ("runtime directory", &self.runtime_dir),
+            ("AgentOS sidecar", &self.sidecar_path),
+        ] {
+            if !path.exists() {
+                return Err(MetaToolError::RuntimeUnavailable {
+                    message: format!("{name} is missing at {}", path.display()),
+                });
+            }
+        }
+        let source = std::fs::read(&self.sidecar_path).map_err(|error| {
+            MetaToolError::RuntimeUnavailable {
+                message: format!("failed to read AgentOS sidecar: {error}"),
+            }
+        })?;
+        let actual = format!("{:x}", Sha256::digest(source));
+        if actual != self.expected_sidecar_sha256 {
+            return Err(MetaToolError::RuntimeUnavailable {
+                message: "AgentOS sidecar integrity check failed".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentOsExecutor {
+    config: AgentOsRuntimeConfig,
+}
+
+impl AgentOsExecutor {
+    pub fn new(config: AgentOsRuntimeConfig) -> Result<Self, MetaToolError> {
+        config.validate()?;
+        Ok(Self { config })
+    }
+}
+
+#[async_trait]
+impl JavaScriptExecutor for AgentOsExecutor {
+    async fn execute(&self, request: ExecutionRequest) -> Result<ExecutionResult, MetaToolError> {
+        let started = Instant::now();
+        let payload = serde_json::to_vec(&request).map_err(|error| MetaToolError::Execution {
+            message: format!("failed to serialize execution request: {error}"),
+        })?;
+        let mut child = Command::new(&self.config.node_binary)
+            .arg(&self.config.sidecar_path)
+            .current_dir(&self.config.runtime_dir)
+            .env_clear()
+            .env("HOME", "/home/agentos")
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| MetaToolError::RuntimeUnavailable {
+                message: format!("failed to start AgentOS sidecar: {error}"),
+            })?;
+
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| MetaToolError::Execution {
+                message: "AgentOS sidecar stdin was unavailable".to_owned(),
+            })?
+            .write_all(&payload)
+            .await
+            .map_err(|error| MetaToolError::Execution {
+                message: format!("failed to send request to AgentOS sidecar: {error}"),
+            })?;
+
+        let wall_budget =
+            std::time::Duration::from_millis(request.limits.wall_time_ms.saturating_add(1_000));
+        let output = timeout(wall_budget, child.wait_with_output())
+            .await
+            .map_err(|_| MetaToolError::Execution {
+                message: "AgentOS sidecar exceeded its outer wall-clock budget".to_owned(),
+            })?
+            .map_err(|error| MetaToolError::Execution {
+                message: format!("failed while waiting for AgentOS sidecar: {error}"),
+            })?;
+
+        if output.stdout.len() > request.limits.max_output_bytes {
+            return Err(MetaToolError::Execution {
+                message: format!(
+                    "AgentOS result exceeded {} bytes",
+                    request.limits.max_output_bytes
+                ),
+            });
+        }
+        if !output.status.success() {
+            return Err(MetaToolError::Execution {
+                message: bounded_stderr(&output.stderr),
+            });
+        }
+
+        let response: SidecarResponse =
+            serde_json::from_slice(&output.stdout).map_err(|error| MetaToolError::Execution {
+                message: format!("AgentOS sidecar returned invalid JSON: {error}"),
+            })?;
+        if response.protocol_version != SIDECAR_PROTOCOL_VERSION
+            || response.id != request.id.as_str()
+        {
+            return Err(MetaToolError::Execution {
+                message: "AgentOS sidecar protocol identity mismatch".to_owned(),
+            });
+        }
+        if let Some(error) = response.error {
+            return Ok(ExecutionResult {
+                id: request.id,
+                outcome: ExecutionOutcome::Failed,
+                value: None,
+                output: String::new(),
+                duration_ms: response
+                    .duration_ms
+                    .unwrap_or(started.elapsed().as_millis() as u64),
+                termination_reason: Some(format_error(error)),
+            });
+        }
+
+        let result = response.result.unwrap_or_default();
+        let outcome = match result.outcome.as_deref() {
+            Some("succeeded") => ExecutionOutcome::Succeeded,
+            Some("cancelled") => ExecutionOutcome::Cancelled,
+            Some("timed_out") => ExecutionOutcome::TimedOut,
+            _ if matches!(
+                result
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.code.as_deref()),
+                Some("timeout" | "execution_timed_out")
+            ) =>
+            {
+                ExecutionOutcome::TimedOut
+            }
+            _ => ExecutionOutcome::Failed,
+        };
+        Ok(ExecutionResult {
+            id: request.id,
+            outcome,
+            value: result.value.or(result.evaluation_value),
+            output: result.output.unwrap_or_default(),
+            duration_ms: response
+                .duration_ms
+                .unwrap_or(started.elapsed().as_millis() as u64),
+            termination_reason: result.error.map(format_error),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SidecarResponse {
+    protocol_version: u32,
+    id: String,
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    result: Option<AgentOsResult>,
+    #[serde(default)]
+    error: Option<RuntimeError>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentOsResult {
+    outcome: Option<String>,
+    value: Option<serde_json::Value>,
+    evaluation_value: Option<serde_json::Value>,
+    output: Option<String>,
+    error: Option<RuntimeError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeError {
+    name: Option<String>,
+    message: Option<String>,
+    code: Option<String>,
+}
+
+fn format_error(error: RuntimeError) -> String {
+    let label = error
+        .code
+        .or(error.name)
+        .unwrap_or_else(|| "execution_error".to_owned());
+    match error.message {
+        Some(message) => format!("{label}: {message}"),
+        None => label,
+    }
+}
+
+fn bounded_stderr(stderr: &[u8]) -> String {
+    const LIMIT: usize = 4 * 1024;
+    let truncated = &stderr[..stderr.len().min(LIMIT)];
+    let message = String::from_utf8_lossy(truncated).trim().to_owned();
+    if message.is_empty() {
+        "AgentOS sidecar exited unsuccessfully".to_owned()
+    } else {
+        message
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_digest_is_stable_and_nonempty() {
+        let digest = AgentOsRuntimeConfig::expected_sidecar_sha256();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn missing_runtime_is_a_typed_unavailable_error() {
+        let config = AgentOsRuntimeConfig {
+            node_binary: PathBuf::from("/missing/node"),
+            runtime_dir: PathBuf::from("/missing/runtime"),
+            sidecar_path: PathBuf::from("/missing/sidecar.mjs"),
+            expected_sidecar_sha256: AgentOsRuntimeConfig::expected_sidecar_sha256(),
+        };
+        assert!(matches!(
+            AgentOsExecutor::new(config),
+            Err(MetaToolError::RuntimeUnavailable { .. })
+        ));
+    }
+}

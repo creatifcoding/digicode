@@ -84,6 +84,8 @@ The sidecar is not an ambient user dependency. Jcode installs a pinned runtime b
 
 AgentOS requires limited **guest** filesystem, process, environment, and child-process facilities to bootstrap its virtual machine. Those facilities are ephemeral kernel resources and are not host authority. The security invariant is therefore precise: no host filesystem mounts, inherited host environment, unrestricted host process execution, network access, or undeclared bindings. A policy that disables the guest bootstrap itself proves only that nothing ran, which is a rather expensive form of silence.
 
+**Measured runtime probe (2026-07-29):** the exact sidecar committed with the native adapter executed pure JavaScript successfully while a host environment sentinel was absent, a host SSH path resolved as absent, outbound `fetch` failed, and an attempted `sh` child process failed. An infinite loop was terminated within the bounded execution window. AgentOS `0.2.15` reported that CPU-limit termination as generic `execution_failed`, however, rather than a typed timeout. Jcode therefore preserves the failure evidence but does not claim deterministic timeout classification yet. A 1-second wall budget also produced false startup timeouts on this machine; the experimental default is 5 seconds pending platform-matrix measurement.
+
 ### 4.2 Execution profiles
 
 Start with three named profiles:
@@ -317,7 +319,7 @@ This slice should follow the FFF-backed `@file` entity foundation so it can cons
 ## 12. Acceptance criteria
 
 1. Untrusted guest code cannot access host files, environment, network, processes, or Jcode tools without an explicit grant.
-2. Runtime limits terminate infinite loops, excessive allocation, oversized output, and excessive capability calls deterministically.
+2. Runtime limits terminate infinite loops, excessive allocation, oversized output, and excessive capability calls deterministically, and classify each termination precisely. Infinite-loop termination is measured; precise AgentOS CPU-limit classification remains blocked by upstream `execution_failed` reporting.
 3. All host calls are schema-validated, scoped, budgeted, and journaled.
 4. `workspace-read` cannot mutate files, store state, tasks, sessions, or initiatives.
 5. Procedures are revisioned and historical calls remain reproducible against their pinned definition and capability manifest.
