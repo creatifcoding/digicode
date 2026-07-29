@@ -1,0 +1,182 @@
+{
+  "generated_from": "src/api-surface.ts intersected with the measured live guest surface (41 methods, 2026-07-29)",
+  "notes": [
+    "inputs is the JSON object passed to the call; history(n) returns recent call history entries.",
+    "read/write/sh/exec operate on the GUEST filesystem (cwd /data, the durable workspace store mount), not the host repo.",
+    "Store data should include _meta: { summary } for catalog discipline."
+  ],
+  "undeclared": [
+    "exec",
+    "inputs"
+  ],
+  "sections": {
+    "stored-procedures": [
+      {
+        "name": "call",
+        "signature": "async (name, args?) → any"
+      },
+      {
+        "name": "define",
+        "signature": "async (name, fn, opts) → ProcedureRecord"
+      },
+      {
+        "name": "defineCode",
+        "signature": "async (name, code, opts) → ProcedureRecord"
+      },
+      {
+        "name": "describeProcedure",
+        "signature": "async (name) → ProcedureRecord | null"
+      },
+      {
+        "name": "fn",
+        "signature": "→ Proxy (calls are awaitable)"
+      },
+      {
+        "name": "procedures",
+        "signature": "async () → ProcedureSummary[]"
+      },
+      {
+        "name": "removeProcedure",
+        "signature": "async (name) → boolean"
+      },
+      {
+        "name": "source",
+        "signature": "async (name) → string | null"
+      }
+    ],
+    "store-api": [
+      {
+        "name": "catalog",
+        "signature": "async (nsGlob?) → CatalogEntry[]"
+      },
+      {
+        "name": "clear",
+        "signature": "async (ns) → number"
+      },
+      {
+        "name": "collections",
+        "signature": "async () → [{name, count}]"
+      },
+      {
+        "name": "delete",
+        "signature": "async (ns, key) → boolean"
+      },
+      {
+        "name": "describe",
+        "signature": "async (ns, key) → _meta | null"
+      },
+      {
+        "name": "domain",
+        "signature": "async (name, config) → void"
+      },
+      {
+        "name": "domains",
+        "signature": "async () → DomainConfig[]"
+      },
+      {
+        "name": "exportStore",
+        "signature": "async (opts) → ExportManifest"
+      },
+      {
+        "name": "get",
+        "signature": "async (ns, key) → data | null"
+      },
+      {
+        "name": "getRaw",
+        "signature": "async (ns, key) → envelope | null"
+      },
+      {
+        "name": "importStore",
+        "signature": "async (opts) → ImportResult"
+      },
+      {
+        "name": "keys",
+        "signature": "async (ns) → string[]"
+      },
+      {
+        "name": "profiles",
+        "signature": "async () → ProfileSummary[]"
+      },
+      {
+        "name": "put",
+        "signature": "async (ns, key, data, tags?) → void"
+      },
+      {
+        "name": "putNow",
+        "signature": "async (ns, prefix, data) → {ns,key}"
+      },
+      {
+        "name": "query",
+        "signature": "async (ns, filter?) → results[]"
+      },
+      {
+        "name": "removeProfile",
+        "signature": "async (name) → { removed, collections }"
+      },
+      {
+        "name": "search",
+        "signature": "async (text, nsGlob?) → SearchHit[]"
+      },
+      {
+        "name": "store",
+        "signature": "async (ns, key, data, tags?) → void"
+      },
+      {
+        "name": "vars",
+        "signature": "async () → VarInfo[]"
+      }
+    ],
+    "fluent-builders": [
+      {
+        "name": "from",
+        "signature": "(ns) → QueryBuilder"
+      },
+      {
+        "name": "into",
+        "signature": "(ns) → PutBuilder"
+      }
+    ],
+    "overlay-management": [
+      {
+        "name": "hasOverlay",
+        "signature": "(id) → boolean"
+      },
+      {
+        "name": "loadOverlay",
+        "signature": "async (overlay) → void"
+      },
+      {
+        "name": "overlays",
+        "signature": "() → [{id, name, version?}]"
+      },
+      {
+        "name": "switchOverlay",
+        "signature": "async (overlay) → void"
+      },
+      {
+        "name": "unloadOverlay",
+        "signature": "async (id) → void"
+      }
+    ],
+    "context-history": [
+      {
+        "name": "history",
+        "signature": "(n?) → HistoryEntry[]"
+      }
+    ],
+    "eval-discipline": [
+      {
+        "name": "read",
+        "signature": "async (path) → string"
+      },
+      {
+        "name": "sh",
+        "signature": "async (cmd) → string"
+      },
+      {
+        "name": "write",
+        "signature": "async (path, content) → void"
+      }
+    ]
+  }
+}

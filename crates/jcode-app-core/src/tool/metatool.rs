@@ -21,6 +21,10 @@ const GUEST_ENGINE_SOURCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../jcode-metatool-runtime/assets/guest-engine.mjs"
 ));
+const GUIDE_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../jcode-metatool-runtime/assets/guide.json"
+));
 const MAX_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
@@ -227,6 +231,7 @@ enum MetaToolAction {
     Status,
     #[default]
     Evaluate,
+    Guide,
 }
 
 fn default_action() -> MetaToolAction {
@@ -261,8 +266,8 @@ impl Tool for MetaTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["status", "evaluate"],
-                    "description": "status inspects runtime availability; evaluate runs code. Defaults to evaluate when omitted."
+                    "enum": ["status", "evaluate", "guide"],
+                    "description": "status inspects runtime availability; evaluate runs code; guide returns the mt.* API reference grouped by section."
                 },
                 "code": {"type": "string", "description": "JavaScript body evaluated as an async function with the live `mt` engine object in scope. Use `return` for the final value, e.g. `await mt.put('notes', 'k', { _meta: { summary: 's' }, v: 1 }); return await mt.get('notes', 'k')`. Required for evaluate."},
                 "inputs": {
@@ -282,6 +287,11 @@ impl Tool for MetaTool {
         let params: MetaToolInput = serde_json::from_value(input)?;
         match params.action {
             MetaToolAction::Status => output("MetaTool runtime status", Self::status()?),
+            MetaToolAction::Guide => {
+                let guide: Value = serde_json::from_str(GUIDE_SOURCE)
+                    .context("parse embedded MetaTool guide manifest")?;
+                output("MetaTool mt.* API guide", guide)
+            }
             MetaToolAction::Evaluate => {
                 if params.profile != ExecutionProfile::Pure {
                     return Err(anyhow!(MetaToolError::RuntimeUnavailable {
@@ -345,7 +355,7 @@ mod tests {
         assert!(definition.description.contains("codemode"));
         assert_eq!(
             definition.input_schema["properties"]["action"]["enum"],
-            json!(["status", "evaluate"])
+            json!(["status", "evaluate", "guide"])
         );
     }
 
@@ -369,6 +379,22 @@ mod tests {
             definition.input_schema["required"],
             json!(["action", "intent"])
         );
+    }
+
+    #[test]
+    fn guide_manifest_parses_and_covers_the_measured_surface() {
+        let guide: Value = serde_json::from_str(GUIDE_SOURCE).expect("embedded guide JSON");
+        let sections = guide["sections"].as_object().expect("guide sections");
+        let method_count: usize = sections
+            .values()
+            .filter_map(|section| section.as_array())
+            .map(|methods| methods.len())
+            .sum();
+        assert!(
+            method_count >= 39,
+            "guide should document the measured live surface, found {method_count}"
+        );
+        assert!(guide["notes"].is_array());
     }
 
     #[test]
