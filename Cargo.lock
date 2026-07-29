@@ -3675,6 +3675,8 @@ dependencies = [
  "jcode-setup-hints",
  "jcode-swarm-core",
  "jcode-task-types",
+ "jcode-tasker-store",
+ "jcode-tasker-types",
  "jcode-terminal-image",
  "jcode-tool-core",
  "jcode-tool-types",

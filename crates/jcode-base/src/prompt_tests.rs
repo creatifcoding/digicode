@@ -24,7 +24,10 @@ fn mermaid_prompt_module_follows_capability() {
         false,
         None,
         None,
-        PromptCapabilities { mermaid: true },
+        PromptCapabilities {
+            mermaid: true,
+            tasker: false,
+        },
     );
     assert!(enabled.static_part.contains(MERMAID_PROMPT));
 
@@ -34,10 +37,43 @@ fn mermaid_prompt_module_follows_capability() {
         false,
         None,
         None,
-        PromptCapabilities { mermaid: false },
+        PromptCapabilities {
+            mermaid: false,
+            tasker: false,
+        },
     );
     assert!(!disabled.static_part.contains("Mermaid diagrams"));
     assert!(!disabled.static_part.contains("fenced `mermaid` code block"));
+}
+
+#[test]
+fn tasker_prompt_module_follows_capability() {
+    let (enabled, _) = build_system_prompt_split_with_capabilities(
+        None,
+        &[],
+        false,
+        None,
+        None,
+        PromptCapabilities {
+            mermaid: false,
+            tasker: true,
+        },
+    );
+    assert!(enabled.static_part.contains(TASKER_PROMPT));
+
+    let (disabled, _) = build_system_prompt_split_with_capabilities(
+        None,
+        &[],
+        false,
+        None,
+        None,
+        PromptCapabilities {
+            mermaid: false,
+            tasker: false,
+        },
+    );
+    assert!(!disabled.static_part.contains("# Durable Tasker"));
+    assert!(!disabled.static_part.contains("`tasker` tool"));
 }
 
 /// Verify skill prompts don't accidentally introduce "Claude Code" identity

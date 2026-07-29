@@ -12,6 +12,36 @@ use super::{TaskerStore, rows};
 use crate::{StoreResult, error::StoreError};
 
 impl TaskerStore {
+    pub async fn project_by_root(&self, root: impl Into<String>) -> StoreResult<Option<Project>> {
+        let root = root.into();
+        self.call(move |connection| {
+            let row = connection
+                .query_row(
+                    "SELECT p.id, p.name, p.canonical_root, r.revision, p.created_at, p.updated_at
+                     FROM project_roots roots
+                     JOIN projects p ON p.id = roots.project_id
+                     JOIN project_revisions r ON r.project_id = p.id
+                     WHERE roots.root = ?1
+                     ORDER BY roots.is_canonical DESC, p.created_at ASC
+                     LIMIT 1",
+                    [root],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(rows::project_from_row).transpose()
+        })
+        .await
+    }
+
     pub async fn get_project(&self, project_id: ProjectId) -> StoreResult<Project> {
         self.call(move |connection| project_by_id(connection, project_id))
             .await
