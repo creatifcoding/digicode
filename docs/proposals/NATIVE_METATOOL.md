@@ -1,6 +1,6 @@
 # Proposal: Jcode-Native MetaTool
 
-> **Status:** Tentative architecture directive
+> **Status:** Approved for semantic-core implementation
 > **Date:** 2026-07-28
 > **Initiative:** `native-metatool`
 > **Related:** [`ENTITY_MENTIONS_SCOPE.md`](./ENTITY_MENTIONS_SCOPE.md)
@@ -78,13 +78,19 @@ Use AgentOS's JavaScript runtime as the primary executor:
 
 Do not describe the runtime as safe merely because JavaScript runs in an isolate. Security depends on the permissions, mounts, host callbacks, system bridge, and capability broker configured for each execution.
 
+**Observed integration boundary (2026-07-29):** the supported AgentOS integration is the pinned `@rivet-dev/agentos-core` Node package. The published Rust crates are internal, lock-step implementation components rather than a supported embedding API. Jcode therefore owns an executor trait and initially implements it with a managed JSON-lines Node sidecar. AgentOS-specific request and error shapes terminate at that adapter boundary.
+
+The sidecar is not an ambient user dependency. Jcode installs a pinned runtime bundle into a versioned Jcode runtime directory, verifies its integrity before launch, starts it with a clean environment, and reports an actionable unavailable-runtime error. Releases may later bundle the same verified assets without changing the executor contract.
+
+AgentOS requires limited **guest** filesystem, process, environment, and child-process facilities to bootstrap its virtual machine. Those facilities are ephemeral kernel resources and are not host authority. The security invariant is therefore precise: no host filesystem mounts, inherited host environment, unrestricted host process execution, network access, or undeclared bindings. A policy that disables the guest bootstrap itself proves only that nothing ran, which is a rather expensive form of silence.
+
 ### 4.2 Execution profiles
 
 Start with three named profiles:
 
 | Profile | Intended use | Default authority |
 |---|---|---|
-| `pure` | Transform supplied values and call deterministic procedures | No filesystem, network, process, environment, or arbitrary tool callbacks |
+| `pure` | Transform supplied values and call deterministic procedures | Ephemeral guest bootstrap resources only; no host mounts, inherited host environment, network, arbitrary host process, or tool callbacks |
 | `workspace-read` | Search and inspect authorized entities and native store state | Read-only entity/store capabilities scoped to the active workspace |
 | `workspace-mutate` | Explicitly approved state or file mutation | Narrow declared mutation capabilities; no network or process unless separately granted |
 
@@ -254,7 +260,7 @@ The smallest useful end-to-end implementation is:
 4. Return a bounded clone-safe value plus captured output and termination metadata.
 5. Persist an execution-journal entry.
 6. Add one-turn bounded guidance describing available methods and failed capability requests.
-7. Demonstrate that filesystem, network, process, environment, arbitrary host tools, and undeclared modules are unavailable.
+7. Demonstrate that host filesystem mounts, inherited host environment, network, arbitrary host processes, arbitrary host tools, and undeclared modules are unavailable. Guest virtual resources required by AgentOS bootstrap remain bounded and ephemeral.
 
 This slice should follow the FFF-backed `@file` entity foundation so it can consume the same typed entity references and authorization logic.
 
@@ -323,15 +329,28 @@ This slice should follow the FFF-backed `@file` entity foundation so it can cons
 
 ## 13. Open decisions
 
-1. Whether AgentOS runs in-process, through a managed local service, or behind a Jcode runtime adapter supporting both.
-2. Default CPU, wall-time, memory, output, and capability-call budgets.
-3. The exact Jcode SQLite ownership boundary and whether stores are per workspace, per project identity, or support explicit global collections.
-4. Whether procedure source is JavaScript-only initially or supports declarative pipelines.
-5. Which Node builtins are available in `pure` and whether all are disabled unless needed by the AgentOS runtime itself.
-6. How user approvals compose with existing Jcode tool policy for mutating, process, and network capabilities.
-7. Whether execution journals retain bounded values directly or content-addressed encrypted evidence.
-8. How read-only npm module mounts are reviewed, pinned, and updated.
+1. Default CPU, wall-time, memory, output, and capability-call budgets after platform-matrix measurement.
+2. Whether explicit global collections are warranted beyond the canonical workspace-scoped SQLite store.
+3. Whether procedure source is JavaScript-only initially or supports declarative pipelines.
+4. Which additional Node builtins are available beyond those required for AgentOS bootstrap.
+5. How user approvals compose with existing Jcode tool policy for mutating, process, and network capabilities.
+6. Whether execution journals retain bounded values directly or content-addressed encrypted evidence.
+7. How read-only npm module mounts are reviewed, pinned, and updated.
 
-## 14. Definition of done
+## 14. Dependency security gate
+
+The pinned `@rivet-dev/agentos-core@0.2.15` dependency graph currently reports seven advisories: three high and four moderate. The high advisory chain includes Pi packages that AgentOS depends on but the MetaTool executor does not intentionally invoke; the moderate chain includes Google API and UUID dependencies. This is measured dependency exposure, not yet measured exploitability.
+
+Before production enablement Jcode must:
+
+1. Produce the runtime-reachable dependency subset for the JavaScript evaluator path.
+2. Verify that no Pi extension installation, auth-file writing, HTML export, Google API, or affected UUID buffer API is reachable from the sidecar protocol.
+3. Run the sidecar from an immutable, owner-only runtime directory with no package installation at execution time.
+4. Pin the complete dependency tree and integrity digest rather than accepting semver drift.
+5. Fail the release security gate if a reachable high-severity advisory remains.
+
+The semantic core may be developed behind an explicit experimental availability state while this gate remains open. “Transitive” is not a synonym for “harmless”; it is merely a direction in a graph.
+
+## 15. Definition of done
 
 The initiative is ready for implementation when Milestone 0 fixes the runtime adapter boundary, capability descriptor schema, default profiles and limits, native store ownership, journal retention, and threat model. The first production milestone is complete when a bounded `mt({code})` execution can safely compose read-only entity and store operations inside AgentOS while proving that undeclared host authority is unavailable.
