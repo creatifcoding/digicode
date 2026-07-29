@@ -3675,6 +3675,8 @@ dependencies = [
  "jcode-setup-hints",
  "jcode-swarm-core",
  "jcode-task-types",
+ "jcode-tasker-store",
+ "jcode-tasker-types",
  "jcode-terminal-image",
  "jcode-tool-core",
  "jcode-tool-types",
@@ -4492,6 +4494,28 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+]
+
+[[package]]
+name = "jcode-tasker-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "jcode-tasker-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rusqlite",
+]
+
+[[package]]
+name = "jcode-tasker-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

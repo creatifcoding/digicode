@@ -28,6 +28,7 @@ mod session_search;
 pub(crate) mod session_search_index;
 mod side_panel;
 mod skill;
+mod tasker;
 mod todo;
 mod webfetch;
 mod websearch;
@@ -209,6 +210,7 @@ impl Registry {
             );
             Self::insert_tool_timed(&mut m, &mut timings, "invalid", invalid::InvalidTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
+            Self::insert_tool_timed(&mut m, &mut timings, "tasker", tasker::TaskerTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
             Self::insert_tool_timed(
                 &mut m,
