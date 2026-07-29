@@ -4,8 +4,8 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use jcode_tasker_pi::{
     BatchOperation, ClaimTaskInput, CreateFeature, CreateTask, NextWorkUnitInput, PiTaskerStore,
-    PlanTask, ProjectPartition, ReleaseClaimInput, Task, UpdateFeature, UpdateTask,
-    WorkContextInput,
+    PlanTask, ProjectPartition, ReleaseClaimInput, ResolveFeatureGate, Task, UpdateFeature,
+    UpdateTask, WorkContextInput,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -103,6 +103,14 @@ struct TaskerInput {
     work_priority: Option<i64>,
     #[serde(default)]
     set_active: Option<bool>,
+    #[serde(default)]
+    gate_index: Option<usize>,
+    #[serde(default)]
+    gate_status: Option<String>,
+    #[serde(default)]
+    resolved_by: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 fn required<T>(value: Option<T>, field: &'static str, action: &str) -> Result<T> {
@@ -238,7 +246,7 @@ impl Tool for TaskerTool {
                     "enum": [
                         "status", "ready", "show", "create_feature", "create", "add_dependency", "set_state",
                         "list", "search", "update", "add_note", "feature_list", "feature_update", "feature_status",
-                        "link", "unlink", "batch", "plan", "claim", "release", "working_set", "next_work_unit"
+                        "link", "unlink", "batch", "plan", "claim", "release", "working_set", "next_work_unit", "feature_gate"
                     ]
                 },
                 "title": {"type": "string"},
@@ -306,6 +314,10 @@ impl Tool for TaskerTool {
                 "release_all": {"type": "boolean"},
                 "work_priority": {"type": "integer", "description": "Queue priority for next_work_unit."},
                 "set_active": {"type": "boolean", "description": "Whether next_work_unit should activate a todo task. Defaults to true in Pi-compatible behavior."},
+                "gate_index": {"type": "integer", "minimum": 0, "description": "Zero-based feature gate index."},
+                "gate_status": {"type": "string", "enum": ["pending", "passed", "failed"]},
+                "resolved_by": {"type": "string"},
+                "note": {"type": "string", "description": "Gate resolution note. Automated resolver evidence is retained separately by the store adapter."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum records returned by bounded list, search, and status projections."}
             }
         })
@@ -609,6 +621,34 @@ impl Tool for TaskerTool {
                     output(
                         "Next work unit",
                         with_base(json!({"next_work_unit": result})),
+                    )
+                }
+                "feature_gate" => {
+                    let feature_id = resolve_feature(
+                        store,
+                        required(params.feature_id, "feature_id", "feature_gate")?,
+                        "feature_gate",
+                    )?;
+                    let gate_index = required(params.gate_index, "gate_index", "feature_gate")?;
+                    let status = required(params.gate_status, "gate_status", "feature_gate")?;
+                    validate_enum(&status, &["pending", "passed", "failed"], "gate_status")?;
+                    let gates = store.resolve_feature_gate(
+                        &feature_id,
+                        gate_index,
+                        ResolveFeatureGate {
+                            status,
+                            resolved_by: params.resolved_by,
+                            note: params.note,
+                        },
+                    )?;
+                    output(
+                        format!("Resolved feature gate {gate_index}"),
+                        with_base(json!({
+                            "feature_id": feature_id,
+                            "gate_index": gate_index,
+                            "gate": gates.get(gate_index),
+                            "gates": gates,
+                        })),
                     )
                 }
                 "update" | "set_state" => {
@@ -923,6 +963,7 @@ mod tests {
             "release",
             "working_set",
             "next_work_unit",
+            "feature_gate",
         ] {
             assert!(actions.contains(&json!(action)), "missing {action}");
         }
@@ -1261,5 +1302,67 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn resolves_manual_feature_gates_through_the_public_tool() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (_database_dir, tool) = temp_tool();
+        let ctx = context(workspace.path());
+
+        tool.execute(
+            json!({
+                "action": "create_feature",
+                "title": "Gated feature",
+                "gates": [{"label": "Operator approval", "status": "pending"}]
+            }),
+            ctx.clone(),
+        )
+        .await
+        .expect("create gated feature");
+
+        let resolved = tool
+            .execute(
+                json!({
+                    "action": "feature_gate",
+                    "feature_id": "#F1",
+                    "gate_index": 0,
+                    "gate_status": "passed",
+                    "resolved_by": "test",
+                    "note": "approved"
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("resolve gate")
+            .metadata
+            .expect("gate metadata");
+        assert_eq!(resolved["gate"]["status"], "passed");
+        assert_eq!(resolved["gate"]["resolvedBy"], "test");
+        assert_eq!(resolved["gate"]["note"], "approved");
+
+        let status = tool
+            .execute(
+                json!({"action": "feature_status", "feature_id": "#F1"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("feature status")
+            .metadata
+            .expect("status metadata");
+        assert_eq!(status["feature"]["gates"][0]["status"], "passed");
+
+        let invalid = tool
+            .execute(
+                json!({
+                    "action": "feature_gate",
+                    "feature_id": "#F1",
+                    "gate_index": 0,
+                    "gate_status": "waived"
+                }),
+                ctx,
+            )
+            .await;
+        assert!(invalid.is_err());
     }
 }
