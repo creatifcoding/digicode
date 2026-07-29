@@ -15,6 +15,8 @@ mod edit;
 mod gmail;
 mod goal;
 mod invalid;
+#[cfg(target_os = "linux")]
+mod linux_computer;
 mod ls;
 pub mod mcp;
 mod memory;
@@ -196,6 +198,13 @@ impl Registry {
                 &mut timings,
                 "macos_computer_use",
                 computer::ComputerTool::new,
+            );
+            #[cfg(target_os = "linux")]
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "linux_computer_use",
+                linux_computer::LinuxComputerTool::new,
             );
             Self::insert_tool_timed(
                 &mut m,

@@ -31,6 +31,17 @@ impl Provider for MockProvider {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_source_owned_linux_computer_use_is_registered() {
+    let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+    let registry = Registry::new(provider).await;
+    let names = registry.tool_names().await;
+
+    assert!(names.iter().any(|name| name == "linux_computer_use"));
+    assert!(!names.iter().any(|name| name == "macos_computer_use"));
+}
+
 #[tokio::test]
 async fn test_tool_definitions_are_sorted() {
     // Create registry with mock provider

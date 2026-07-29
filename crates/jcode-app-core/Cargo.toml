@@ -146,3 +146,6 @@ global-hotkey = "0.7"
 # events, cursor positioning, display bounds). `highsierra` enables the
 # CGEventCreateScrollWheelEvent2 binding used for scroll.
 core-graphics = { version = "0.23", features = ["highsierra"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+jcode-computer-use-linux = { path = "../jcode-computer-use-linux" }

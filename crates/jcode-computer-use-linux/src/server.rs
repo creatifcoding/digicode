@@ -12,8 +12,8 @@ use crate::remote_desktop::{
     ScrollDirection,
 };
 use crate::screenshot::{
-    capture_screenshot_raw, prepare_screenshot_payload, RawScreenshotCapture, ScreenshotCapture,
-    ScreenshotOutputFormat, ScreenshotPayloadOptions,
+    capture_screenshot, capture_screenshot_raw, prepare_screenshot_payload, RawScreenshotCapture,
+    ScreenshotCapture, ScreenshotOutputFormat, ScreenshotPayloadOptions,
 };
 use crate::windowing::registry;
 use crate::windows::{
@@ -22,7 +22,7 @@ use crate::windows::{
     GNOME_SHELL_INTROSPECT_BACKEND,
 };
 use crate::ydotool;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
     model::{CallToolResult, Content},
@@ -77,6 +77,80 @@ pub struct ComputerUseLinux {
 
 #[tool_router]
 impl ComputerUseLinux {
+    /// Execute one computer-use action in-process without starting the MCP
+    /// transport. Jcode's built-in tool adapter uses this path so the shipped
+    /// product does not depend on a sibling process or external checkout.
+    pub async fn execute_json(
+        &self,
+        action: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        macro_rules! json_result {
+            ($expr:expr) => {
+                serde_json::to_value($expr.0).map_err(Into::into)
+            };
+        }
+
+        match action {
+            "doctor" | "check_readiness" => json_result!(self.doctor()),
+            "setup_accessibility" => json_result!(self.setup_accessibility()),
+            "setup_window_targeting" => json_result!(self.setup_window_targeting().await),
+            "list_apps" => json_result!(self.list_apps().await),
+            "list_windows" => json_result!(self.list_windows().await),
+            "focused_window" => json_result!(self.focused_window().await),
+            "activate_window" => json_result!(
+                self.activate_window(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "get_app_state" | "ui" => json_result!(
+                self.get_app_state(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "click" => json_result!(
+                self.click(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "perform_action" => json_result!(
+                self.perform_action(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "set_value" => json_result!(
+                self.set_value(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "scroll" => json_result!(
+                self.scroll(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "drag" => json_result!(self.drag(Parameters(serde_json::from_value(params)?)).await),
+            "press_key" | "key" => json_result!(
+                self.press_key(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "type_text" | "type" => json_result!(
+                self.type_text(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "move_window" => json_result!(
+                self.move_window(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            "resize_window" => json_result!(
+                self.resize_window(Parameters(serde_json::from_value(params)?))
+                    .await
+            ),
+            other => bail!("unknown Linux computer-use action: {other}"),
+        }
+    }
+
+    /// Capture a full-screen image for Jcode's native image-bearing tool
+    /// result. Window-targeted capture remains available through the MCP-shaped
+    /// API while the built-in adapter intentionally starts with the safe full
+    /// desktop observation path.
+    pub async fn screenshot_capture(&self) -> Result<ScreenshotCapture> {
+        capture_screenshot().await
+    }
+
     #[tool(
         name = "doctor",
         description = "Report Linux Computer Use desktop integration readiness.",
