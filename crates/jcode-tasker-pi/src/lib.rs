@@ -565,6 +565,88 @@ pub struct PlanResult {
     pub task_count: usize,
     pub dependency_count: usize,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturePlanInput {
+    pub feature: FeaturePlanFeature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturePlanFeature {
+    pub key: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub brief: Option<String>,
+    #[serde(default)]
+    pub acceptance: Vec<FeaturePlanAcceptance>,
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub gates: Vec<Value>,
+    #[serde(default)]
+    pub indexes: Vec<Value>,
+    #[serde(default)]
+    pub notes: Vec<NoteInput>,
+    #[serde(default)]
+    pub children: Vec<FeaturePlanChild>,
+    #[serde(default)]
+    pub tasks: Vec<FeaturePlanTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturePlanChild {
+    pub key: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub gates: Vec<Value>,
+    #[serde(default)]
+    pub children: Vec<FeaturePlanChild>,
+    #[serde(default)]
+    pub tasks: Vec<FeaturePlanTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturePlanTask {
+    pub key: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub state: Option<String>,
+    #[serde(default)]
+    pub after: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<NoteInput>,
+    pub indexes: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturePlanAcceptance {
+    pub criterion: String,
+    #[serde(default)]
+    pub met: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeaturePlanResult {
+    pub feature: Feature,
+    pub child_features: Vec<Feature>,
+    pub tasks: Vec<Task>,
+    pub key_map: BTreeMap<String, String>,
+    pub feature_count: usize,
+    pub task_count: usize,
+    pub dependency_count: usize,
+}
 #[derive(Debug, Clone)]
 pub struct CreateFeature {
     pub title: String,
@@ -815,19 +897,21 @@ impl PiTaskerStore {
                 error: Some("missing_feature_scope".into()),
             });
         };
-        if let Some(requested) = &input.scope_feature_id
-            && find_root_feature_id(&features, requested).as_deref()
+        #[allow(clippy::collapsible_if)]
+        if let Some(requested) = &input.scope_feature_id {
+            if find_root_feature_id(&features, requested).as_deref()
                 != Some(scope_feature_id.as_str())
-        {
-            tx.commit()?;
-            return Ok(ClaimResult {
-                ok: false,
-                task: Some(task),
-                claim: None,
-                scope_feature_id: Some(scope_feature_id),
-                already_held: false,
-                error: Some("scope_mismatch".into()),
-            });
+            {
+                tx.commit()?;
+                return Ok(ClaimResult {
+                    ok: false,
+                    task: Some(task),
+                    claim: None,
+                    scope_feature_id: Some(scope_feature_id),
+                    already_held: false,
+                    error: Some("scope_mismatch".into()),
+                });
+            }
         }
         if let Some(existing) =
             active_claim_for_task_tx(&tx, &self.partition, &input.task_id, &scope_feature_id)?
@@ -1294,6 +1378,49 @@ impl PiTaskerStore {
             tasks: created_tasks,
             key_map,
             dependencies,
+            task_count,
+            dependency_count,
+        })
+    }
+
+    pub fn feature_plan_import(&mut self, input: FeaturePlanInput) -> Result<FeaturePlanResult> {
+        validate_feature_plan_keys(&input.feature)?;
+
+        let tx = self.conn.transaction()?;
+        ensure_list_meta_tx(&tx, &self.partition)?;
+
+        let mut key_map = BTreeMap::new();
+        let mut features = Vec::new();
+        let mut tasks = Vec::new();
+        let mut dependency_count = 0;
+
+        create_feature_plan_node_tx(
+            &tx,
+            &self.partition,
+            FeaturePlanNode::Root(&input.feature),
+            None,
+            0,
+            &mut key_map,
+            &mut features,
+            &mut tasks,
+            &mut dependency_count,
+        )?;
+
+        let feature_count = features.len();
+        let task_count = tasks.len();
+        let feature = features
+            .first()
+            .cloned()
+            .ok_or_else(|| PiTaskerError::InvalidReference("feature plan root".into()))?;
+        let child_features = features.iter().skip(1).cloned().collect();
+        tx.commit()?;
+
+        Ok(FeaturePlanResult {
+            feature,
+            child_features,
+            tasks,
+            key_map,
+            feature_count,
             task_count,
             dependency_count,
         })
@@ -1976,6 +2103,318 @@ fn append_task_notes_tx(
     Ok(())
 }
 
+fn append_feature_notes_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    feature_id: &str,
+    notes: &[NoteInput],
+) -> Result<()> {
+    for note in notes {
+        tx.execute("INSERT INTO feature_notes (id,feature_id,list_id,project_root,category,content,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![make_feature_note_id(), feature_id, p.list_id, p.project_root, note.category, note.content, now_ms()])?;
+    }
+    Ok(())
+}
+
+enum FeaturePlanNode<'a> {
+    Root(&'a FeaturePlanFeature),
+    Child(&'a FeaturePlanChild),
+}
+
+impl FeaturePlanNode<'_> {
+    fn key(&self) -> &str {
+        match self {
+            Self::Root(feature) => &feature.key,
+            Self::Child(feature) => &feature.key,
+        }
+    }
+
+    fn title(&self) -> &str {
+        match self {
+            Self::Root(feature) => &feature.title,
+            Self::Child(feature) => &feature.title,
+        }
+    }
+
+    fn description(&self) -> Option<String> {
+        match self {
+            Self::Root(feature) => feature.description.clone(),
+            Self::Child(feature) => feature.description.clone(),
+        }
+    }
+
+    fn priority(&self) -> Option<String> {
+        match self {
+            Self::Root(feature) => feature.priority.clone(),
+            Self::Child(feature) => feature.priority.clone(),
+        }
+    }
+
+    fn tags(&self) -> Value {
+        match self {
+            Self::Root(feature) => serde_json::json!(feature.tags),
+            Self::Child(feature) => serde_json::json!(feature.tags),
+        }
+    }
+
+    fn gates(&self) -> Value {
+        let gates = match self {
+            Self::Root(feature) => &feature.gates,
+            Self::Child(feature) => &feature.gates,
+        };
+        normalize_feature_plan_gates(gates)
+    }
+
+    fn children(&self) -> &[FeaturePlanChild] {
+        match self {
+            Self::Root(feature) => &feature.children,
+            Self::Child(feature) => &feature.children,
+        }
+    }
+
+    fn tasks(&self) -> &[FeaturePlanTask] {
+        match self {
+            Self::Root(feature) => &feature.tasks,
+            Self::Child(feature) => &feature.tasks,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_feature_plan_node_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    node: FeaturePlanNode<'_>,
+    parent_feature_id: Option<String>,
+    depth: i64,
+    key_map: &mut BTreeMap<String, String>,
+    features: &mut Vec<Feature>,
+    tasks: &mut Vec<Task>,
+    dependency_count: &mut usize,
+) -> Result<()> {
+    let feature = create_feature_tx(
+        tx,
+        p,
+        CreateFeature {
+            title: node.title().to_owned(),
+            description: node.description(),
+            parent_feature_id,
+            state: Some("open".into()),
+            priority: node.priority(),
+            tags: node.tags(),
+            brief: match &node {
+                FeaturePlanNode::Root(feature) => feature.brief.clone(),
+                FeaturePlanNode::Child(_) => None,
+            },
+            acceptance: match &node {
+                FeaturePlanNode::Root(feature) => {
+                    normalize_feature_plan_acceptance(&feature.acceptance)
+                }
+                FeaturePlanNode::Child(_) => Value::Array(vec![]),
+            },
+            owner: match &node {
+                FeaturePlanNode::Root(feature) => feature.owner.clone(),
+                FeaturePlanNode::Child(_) => None,
+            },
+            gates: node.gates(),
+            indexes: match &node {
+                FeaturePlanNode::Root(feature) => serde_json::json!(feature.indexes),
+                FeaturePlanNode::Child(_) => Value::Array(vec![]),
+            },
+        },
+        depth,
+    )?;
+    key_map.insert(node.key().to_owned(), feature.id.clone());
+    features.push(feature.clone());
+
+    if let FeaturePlanNode::Root(root) = &node {
+        append_feature_notes_tx(tx, p, &feature.id, &root.notes)?;
+    }
+
+    for child in node.children() {
+        create_feature_plan_node_tx(
+            tx,
+            p,
+            FeaturePlanNode::Child(child),
+            Some(feature.id.clone()),
+            depth + 1,
+            key_map,
+            features,
+            tasks,
+            dependency_count,
+        )?;
+    }
+
+    for plan_task in node.tasks() {
+        let task = create_task_tx(
+            tx,
+            p,
+            plan_task.title.clone(),
+            plan_task.description.clone(),
+            plan_task.state.clone(),
+            Some(feature.id.clone()),
+            plan_task.indexes.clone(),
+        )?;
+        append_task_notes_tx(tx, p, &task.id, &plan_task.notes)?;
+        key_map.insert(plan_task.key.clone(), task.id.clone());
+        tasks.push(task);
+    }
+
+    for plan_task in node.tasks() {
+        if plan_task.after.is_empty() {
+            continue;
+        }
+        let task_id = key_map
+            .get(&plan_task.key)
+            .cloned()
+            .ok_or_else(|| PiTaskerError::InvalidReference(plan_task.key.clone()))?;
+        let dep_ids = plan_task
+            .after
+            .iter()
+            .map(|key| match key_map.get(key) {
+                Some(id) if id.starts_with("task_") => Ok(id.clone()),
+                Some(_) => Err(PiTaskerError::InvalidReference(format!(
+                    "feature key cannot be a task dependency: {key}"
+                ))),
+                None => Err(PiTaskerError::InvalidReference(key.clone())),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        set_dependencies_tx(tx, p, &task_id, &dep_ids)?;
+        *dependency_count += dep_ids.len();
+    }
+
+    Ok(())
+}
+
+fn create_feature_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    input: CreateFeature,
+    depth: i64,
+) -> Result<Feature> {
+    let now = now_ms();
+    let display_id: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(display_id),0)+1 FROM features WHERE list_id=?1 AND project_root=?2",
+        params![p.list_id, p.project_root],
+        |r| r.get(0),
+    )?;
+    let feature = Feature {
+        id: make_feature_id(),
+        list_id: p.list_id.clone(),
+        project_root: p.project_root.clone(),
+        display_id,
+        parent_feature_id: input.parent_feature_id,
+        title: input.title,
+        description: input.description,
+        state: input.state.unwrap_or_else(|| "open".into()),
+        priority: input.priority.unwrap_or_else(|| "medium".into()),
+        tags: input.tags,
+        brief: input.brief,
+        acceptance: input.acceptance,
+        owner: input.owner,
+        gates: input.gates,
+        indexes: input.indexes,
+        depth,
+        created_at: now,
+        updated_at: now,
+    };
+    tx.execute("INSERT INTO features (id,list_id,project_root,display_id,parent_feature_id,title,description,state,priority,tags,brief,acceptance,owner,gates,indexes,depth,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)", params![feature.id, feature.list_id, feature.project_root, feature.display_id, feature.parent_feature_id, feature.title, feature.description, feature.state, feature.priority, serde_json::to_string(&feature.tags)?, feature.brief, serde_json::to_string(&feature.acceptance)?, feature.owner, serde_json::to_string(&feature.gates)?, serde_json::to_string(&feature.indexes)?, feature.depth, feature.created_at, feature.updated_at])?;
+    Ok(feature)
+}
+
+fn normalize_feature_plan_acceptance(input: &[FeaturePlanAcceptance]) -> Value {
+    Value::Array(
+        input
+            .iter()
+            .map(|acceptance| {
+                serde_json::json!({
+                    "criterion": acceptance.criterion,
+                    "met": false,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn normalize_feature_plan_gates(input: &[Value]) -> Value {
+    Value::Array(
+        input
+            .iter()
+            .map(|gate| {
+                let mut gate = gate.clone();
+                if let Value::Object(object) = &mut gate {
+                    object.insert("status".into(), Value::String("pending".into()));
+                }
+                gate
+            })
+            .collect(),
+    )
+}
+
+fn validate_feature_plan_keys(root: &FeaturePlanFeature) -> Result<()> {
+    let mut keys = BTreeSet::new();
+    let mut visited_task_keys = BTreeSet::new();
+    validate_feature_plan_root_keys(root, &mut keys, &mut visited_task_keys)
+}
+
+fn insert_plan_key(keys: &mut BTreeSet<String>, key: &str) -> Result<()> {
+    if !keys.insert(key.to_owned()) {
+        return Err(PiTaskerError::InvalidReference(format!(
+            "duplicate plan key: {key}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_feature_plan_root_keys(
+    feature: &FeaturePlanFeature,
+    keys: &mut BTreeSet<String>,
+    visited_task_keys: &mut BTreeSet<String>,
+) -> Result<()> {
+    insert_plan_key(keys, &feature.key)?;
+    for child in &feature.children {
+        validate_feature_plan_child_keys(child, keys, visited_task_keys)?;
+    }
+    validate_feature_plan_tasks(&feature.tasks, keys, visited_task_keys)
+}
+
+fn validate_feature_plan_child_keys(
+    feature: &FeaturePlanChild,
+    keys: &mut BTreeSet<String>,
+    visited_task_keys: &mut BTreeSet<String>,
+) -> Result<()> {
+    insert_plan_key(keys, &feature.key)?;
+    for child in &feature.children {
+        validate_feature_plan_child_keys(child, keys, visited_task_keys)?;
+    }
+    validate_feature_plan_tasks(&feature.tasks, keys, visited_task_keys)
+}
+
+fn validate_feature_plan_tasks(
+    tasks: &[FeaturePlanTask],
+    keys: &mut BTreeSet<String>,
+    visited_task_keys: &mut BTreeSet<String>,
+) -> Result<()> {
+    for task in tasks {
+        insert_plan_key(keys, &task.key)?;
+    }
+    for task in tasks {
+        for dependency in &task.after {
+            if keys.contains(dependency) && !visited_task_keys.contains(dependency) {
+                return Err(PiTaskerError::InvalidReference(format!(
+                    "feature key cannot be a task dependency: {dependency}"
+                )));
+            }
+            if !visited_task_keys.contains(dependency) {
+                return Err(PiTaskerError::InvalidReference(dependency.clone()));
+            }
+        }
+    }
+    for task in tasks {
+        visited_task_keys.insert(task.key.clone());
+    }
+    Ok(())
+}
+
 fn load_task_dependencies_tx(
     tx: &rusqlite::Transaction<'_>,
     p: &ProjectPartition,
@@ -2108,13 +2547,14 @@ pub fn resolve_feature_id_from(features: &[Feature], input: &str) -> Result<Opti
         .unwrap_or(trimmed)
         .strip_prefix(['F', 'f'])
         .unwrap_or("");
-    if !n.is_empty()
-        && let Ok(n) = n.parse::<i64>()
-    {
-        return Ok(features
-            .iter()
-            .find(|f| f.display_id == n)
-            .map(|f| f.id.clone()));
+    #[allow(clippy::collapsible_if)]
+    if !n.is_empty() {
+        if let Ok(n) = n.parse::<i64>() {
+            return Ok(features
+                .iter()
+                .find(|f| f.display_id == n)
+                .map(|f| f.id.clone()));
+        }
     }
     Ok(None)
 }
@@ -3059,6 +3499,194 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PiTaskerError::InvalidReference(_)));
         assert!(store.list_tasks(None).unwrap().is_empty());
+    }
+
+    fn feature_plan_fixture() -> FeaturePlanInput {
+        FeaturePlanInput {
+            feature: FeaturePlanFeature {
+                key: "root".into(),
+                title: "Root feature".into(),
+                description: Some("Root description".into()),
+                priority: Some("high".into()),
+                tags: vec!["root-tag".into()],
+                brief: Some("Brief".into()),
+                acceptance: vec![FeaturePlanAcceptance {
+                    criterion: "Ship it".into(),
+                    met: true,
+                }],
+                owner: Some("agent".into()),
+                gates: vec![serde_json::json!({"label":"Review","status":"done"})],
+                indexes: vec![serde_json::json!({"type":"file","path":"README.md"})],
+                notes: vec![NoteInput {
+                    content: "Root note".into(),
+                    category: Some("context".into()),
+                }],
+                children: vec![FeaturePlanChild {
+                    key: "child".into(),
+                    title: "Child feature".into(),
+                    description: None,
+                    priority: None,
+                    tags: vec!["child-tag".into()],
+                    gates: vec![serde_json::json!({"label":"Child gate"})],
+                    children: vec![FeaturePlanChild {
+                        key: "grandchild".into(),
+                        title: "Grandchild feature".into(),
+                        description: None,
+                        priority: None,
+                        tags: vec![],
+                        gates: vec![],
+                        children: vec![],
+                        tasks: vec![FeaturePlanTask {
+                            key: "setup".into(),
+                            title: "Setup".into(),
+                            description: None,
+                            state: Some("done".into()),
+                            after: vec![],
+                            notes: vec![NoteInput {
+                                content: "Task note".into(),
+                                category: None,
+                            }],
+                            indexes: None,
+                        }],
+                    }],
+                    tasks: vec![FeaturePlanTask {
+                        key: "build".into(),
+                        title: "Build".into(),
+                        description: None,
+                        state: None,
+                        after: vec!["setup".into()],
+                        notes: vec![],
+                        indexes: Some(serde_json::json!([{"type":"file","path":"src/lib.rs"}])),
+                    }],
+                }],
+                tasks: vec![FeaturePlanTask {
+                    key: "finish".into(),
+                    title: "Finish".into(),
+                    description: None,
+                    state: None,
+                    after: vec!["setup".into(), "build".into()],
+                    notes: vec![],
+                    indexes: None,
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn feature_plan_import_creates_depth_first_tree_tasks_notes_and_dependencies() {
+        let mut store = temp_store();
+        let result = store.feature_plan_import(feature_plan_fixture()).unwrap();
+
+        assert_eq!(result.feature_count, 3);
+        assert_eq!(result.task_count, 3);
+        assert_eq!(result.dependency_count, 3);
+        assert_eq!(result.feature.title, "Root feature");
+        assert_eq!(result.child_features[0].title, "Child feature");
+        assert_eq!(result.child_features[1].title, "Grandchild feature");
+        assert_eq!(
+            result
+                .tasks
+                .iter()
+                .map(|task| task.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Setup", "Build", "Finish"]
+        );
+        assert!(result.key_map["root"].starts_with("feat_"));
+        assert!(result.key_map["setup"].starts_with("task_"));
+
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.features.len(), 3);
+        assert_eq!(snapshot.tasks.len(), 3);
+        assert_eq!(snapshot.dependencies.len(), 3);
+        assert_eq!(snapshot.task_notes.len(), 1);
+        assert_eq!(snapshot.feature_notes.len(), 1);
+        assert_eq!(
+            snapshot.features[0].acceptance,
+            serde_json::json!([{"criterion":"Ship it","met":false}])
+        );
+        assert_eq!(
+            snapshot.features[0].gates,
+            serde_json::json!([{"label":"Review","status":"pending"}])
+        );
+        assert_eq!(
+            snapshot.features[1].gates,
+            serde_json::json!([{"label":"Child gate","status":"pending"}])
+        );
+        assert_eq!(snapshot.features[2].depth, 2);
+        assert_eq!(
+            snapshot.tasks[1].feature_id,
+            Some(snapshot.features[1].id.clone())
+        );
+    }
+
+    #[test]
+    fn feature_plan_import_rejects_duplicate_global_keys() {
+        let mut store = temp_store();
+        let mut plan = feature_plan_fixture();
+        plan.feature.children[0].tasks[0].key = "setup".into();
+        let err = store.feature_plan_import(plan).unwrap_err();
+        assert!(
+            matches!(err, PiTaskerError::InvalidReference(message) if message.contains("duplicate plan key: setup"))
+        );
+        assert!(store.snapshot().unwrap().features.is_empty());
+    }
+
+    #[test]
+    fn feature_plan_import_rejects_invalid_dependency_reference() {
+        let mut store = temp_store();
+        let mut plan = feature_plan_fixture();
+        plan.feature.tasks[0].after.push("missing".into());
+        let err = store.feature_plan_import(plan).unwrap_err();
+        assert!(matches!(err, PiTaskerError::InvalidReference(key) if key == "missing"));
+        assert!(store.snapshot().unwrap().tasks.is_empty());
+    }
+
+    #[test]
+    fn feature_plan_import_rejects_feature_dependency_targets() {
+        let mut store = temp_store();
+        let mut plan = feature_plan_fixture();
+        plan.feature.tasks[0].after.push("root".into());
+        let err = store.feature_plan_import(plan).unwrap_err();
+        assert!(
+            matches!(err, PiTaskerError::InvalidReference(message) if message.contains("feature key cannot be a task dependency: root"))
+        );
+        assert!(store.snapshot().unwrap().features.is_empty());
+    }
+
+    #[test]
+    fn feature_plan_import_rolls_back_when_late_dependency_wiring_fails() {
+        let mut store = temp_store();
+        let mut plan = feature_plan_fixture();
+        plan.feature.children[0].tasks[0].after = vec!["root".into()];
+        assert!(validate_feature_plan_keys(&plan.feature).is_err());
+
+        let tx = store.conn.transaction().unwrap();
+        ensure_list_meta_tx(&tx, &store.partition).unwrap();
+        let mut key_map = BTreeMap::new();
+        let mut features = Vec::new();
+        let mut tasks = Vec::new();
+        let mut dependency_count = 0;
+        let err = create_feature_plan_node_tx(
+            &tx,
+            &store.partition,
+            FeaturePlanNode::Root(&plan.feature),
+            None,
+            0,
+            &mut key_map,
+            &mut features,
+            &mut tasks,
+            &mut dependency_count,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PiTaskerError::InvalidReference(message) if message.contains("feature key cannot be a task dependency: root"))
+        );
+        drop(tx);
+
+        let snapshot = store.snapshot().unwrap();
+        assert!(snapshot.features.is_empty());
+        assert!(snapshot.tasks.is_empty());
+        assert!(snapshot.dependencies.is_empty());
     }
 
     #[test]
