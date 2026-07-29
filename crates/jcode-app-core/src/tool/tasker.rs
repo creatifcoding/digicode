@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use jcode_tasker_pi::{
-    BatchOperation, CreateFeature, CreateTask, PiTaskerStore, PlanTask, ProjectPartition, Task,
-    UpdateFeature, UpdateTask,
+    BatchOperation, ClaimTaskInput, CreateFeature, CreateTask, NextWorkUnitInput, PiTaskerStore,
+    PlanTask, ProjectPartition, ReleaseClaimInput, Task, UpdateFeature, UpdateTask,
+    WorkContextInput,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -88,6 +89,20 @@ struct TaskerInput {
     operations: Option<Vec<BatchOperation>>,
     #[serde(default)]
     tasks: Option<Vec<PlanTask>>,
+    #[serde(default)]
+    claim_id: Option<String>,
+    #[serde(default)]
+    claim_kind: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    lease_ms: Option<i64>,
+    #[serde(default)]
+    release_all: Option<bool>,
+    #[serde(default)]
+    work_priority: Option<i64>,
+    #[serde(default)]
+    set_active: Option<bool>,
 }
 
 fn required<T>(value: Option<T>, field: &'static str, action: &str) -> Result<T> {
@@ -186,6 +201,21 @@ where
     })
 }
 
+fn work_context(ctx: &ToolContext) -> WorkContextInput {
+    let agent_id = format!("session:{}", ctx.session_id);
+    let session_instance_id = format!("jcode:{}", ctx.session_id);
+    WorkContextInput {
+        agent_id,
+        session_id: ctx.session_id.clone(),
+        session_instance_id,
+        session_file: None,
+        pid: i64::from(std::process::id()),
+        model: None,
+        leaf_id_at_start: None,
+        current_leaf_id: Some(ctx.message_id.clone()),
+    }
+}
+
 #[async_trait]
 impl Tool for TaskerTool {
     fn name(&self) -> &str {
@@ -208,7 +238,7 @@ impl Tool for TaskerTool {
                     "enum": [
                         "status", "ready", "show", "create_feature", "create", "add_dependency", "set_state",
                         "list", "search", "update", "add_note", "feature_list", "feature_update", "feature_status",
-                        "link", "unlink", "batch", "plan"
+                        "link", "unlink", "batch", "plan", "claim", "release", "working_set", "next_work_unit"
                     ]
                 },
                 "title": {"type": "string"},
@@ -269,6 +299,13 @@ impl Tool for TaskerTool {
                         }
                     }
                 },
+                "claim_id": {"type": "string", "description": "Claim identifier returned by claim or next_work_unit."},
+                "claim_kind": {"type": "string", "enum": ["claim", "hold", "lock"]},
+                "reason": {"type": "string"},
+                "lease_ms": {"type": "integer", "minimum": 1},
+                "release_all": {"type": "boolean"},
+                "work_priority": {"type": "integer", "description": "Queue priority for next_work_unit."},
+                "set_active": {"type": "boolean", "description": "Whether next_work_unit should activate a todo task. Defaults to true in Pi-compatible behavior."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Maximum records returned by bounded list, search, and status projections."}
             }
         })
@@ -280,6 +317,7 @@ impl Tool for TaskerTool {
         let root = canonical_root(&ctx)?;
         let db_path = self.database_path();
         let action = params.action.clone();
+        let work_context = work_context(&ctx);
         run_pi(db_path, root, move |store| {
             let base = provider_metadata(store)?;
             let limit = bounded_limit(params.limit);
@@ -489,6 +527,88 @@ impl Tool for TaskerTool {
                             result.task_count, result.dependency_count
                         ),
                         with_base(json!({"plan": result})),
+                    )
+                }
+                "claim" => {
+                    if let Some(kind) = params.claim_kind.as_deref() {
+                        validate_enum(kind, &["claim", "hold", "lock"], "claim_kind")?;
+                    }
+                    let task_id = resolve_task(
+                        store,
+                        required(params.task_id, "task_id", "claim")?,
+                        "claim",
+                    )?;
+                    let scope_feature_id = match params.feature_id {
+                        Some(reference) => Some(resolve_feature(store, reference, "claim")?),
+                        None => None,
+                    };
+                    let result = store.claim_task(ClaimTaskInput {
+                        task_id,
+                        context: work_context,
+                        claim_kind: params.claim_kind,
+                        reason: params.reason,
+                        lease_ms: params.lease_ms,
+                        scope_feature_id,
+                    })?;
+                    output("Task claim", with_base(json!({"claim": result})))
+                }
+                "release" => {
+                    let task_id = match params.task_id {
+                        Some(reference) => Some(resolve_task(store, reference, "release")?),
+                        None => None,
+                    };
+                    if task_id.is_none()
+                        && params.claim_id.is_none()
+                        && !params.release_all.unwrap_or(false)
+                    {
+                        return Err(anyhow!(
+                            "task_id, claim_id, or release_all=true is required for release"
+                        ));
+                    }
+                    let result = store.release_claim(ReleaseClaimInput {
+                        context: work_context,
+                        task_id,
+                        claim_id: params.claim_id,
+                        release_all: params.release_all.unwrap_or(false),
+                        reason: params.reason,
+                    })?;
+                    output(
+                        format!("Released {} claims", result.count),
+                        with_base(json!({"release": result})),
+                    )
+                }
+                "working_set" => {
+                    let result = store.get_working_set(work_context)?;
+                    output(
+                        format!(
+                            "Working set: {} claims, {} work units",
+                            result.claims.len(),
+                            result.work_units.len()
+                        ),
+                        with_base(json!({"working_set": result})),
+                    )
+                }
+                "next_work_unit" => {
+                    if let Some(kind) = params.claim_kind.as_deref() {
+                        validate_enum(kind, &["claim", "hold", "lock"], "claim_kind")?;
+                    }
+                    let feature_id = resolve_feature(
+                        store,
+                        required(params.feature_id, "feature_id", "next_work_unit")?,
+                        "next_work_unit",
+                    )?;
+                    let result = store.enqueue_next_work_unit(NextWorkUnitInput {
+                        context: work_context,
+                        claim_kind: params.claim_kind,
+                        reason: params.reason,
+                        lease_ms: params.lease_ms,
+                        feature_id: Some(feature_id),
+                        priority: params.work_priority,
+                        set_active: params.set_active,
+                    })?;
+                    output(
+                        "Next work unit",
+                        with_base(json!({"next_work_unit": result})),
                     )
                 }
                 "update" | "set_state" => {
@@ -799,6 +919,10 @@ mod tests {
             "unlink",
             "batch",
             "plan",
+            "claim",
+            "release",
+            "working_set",
+            "next_work_unit",
         ] {
             assert!(actions.contains(&json!(action)), "missing {action}");
         }
@@ -1012,6 +1136,130 @@ mod tests {
         assert_eq!(
             before["counts"]["dependencies"],
             after["counts"]["dependencies"]
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinates_private_claims_and_work_units_through_the_public_tool() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (_database_dir, tool) = temp_tool();
+        let ctx = context(workspace.path());
+
+        tool.execute(
+            json!({"action": "create_feature", "title": "Coordinator scope"}),
+            ctx.clone(),
+        )
+        .await
+        .expect("create feature");
+        tool.execute(
+            json!({"action": "create", "feature_id": "#F1", "title": "First ready"}),
+            ctx.clone(),
+        )
+        .await
+        .expect("create first task");
+        tool.execute(
+            json!({"action": "create", "feature_id": "#F1", "title": "Second ready"}),
+            ctx.clone(),
+        )
+        .await
+        .expect("create second task");
+
+        let next = tool
+            .execute(
+                json!({
+                    "action": "next_work_unit",
+                    "feature_id": "#F1",
+                    "claim_kind": "lock",
+                    "reason": "public integration test"
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("next work unit")
+            .metadata
+            .expect("next metadata");
+        assert_eq!(next["next_work_unit"]["ok"], true);
+        assert_eq!(next["next_work_unit"]["task"]["displayId"], 1);
+        assert_eq!(next["next_work_unit"]["task"]["state"], "in_progress");
+
+        let claimed = tool
+            .execute(
+                json!({"action": "claim", "task_id": "#2", "claim_kind": "claim"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("claim second task")
+            .metadata
+            .expect("claim metadata");
+        assert_eq!(claimed["claim"]["ok"], true);
+
+        let working = tool
+            .execute(json!({"action": "working_set"}), ctx.clone())
+            .await
+            .expect("working set")
+            .metadata
+            .expect("working set metadata");
+        assert_eq!(
+            working["working_set"]["claims"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            working["working_set"]["workUnits"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut other_ctx = ctx.clone();
+        other_ctx.session_id = "session-other".into();
+        let other = tool
+            .execute(json!({"action": "working_set"}), other_ctx)
+            .await
+            .expect("other working set")
+            .metadata
+            .expect("other metadata");
+        assert!(
+            other["working_set"]["claims"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            other["working_set"]["workUnits"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let released = tool
+            .execute(
+                json!({"action": "release", "release_all": true, "reason": "test complete"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("release claims")
+            .metadata
+            .expect("release metadata");
+        assert_eq!(released["release"]["count"], 2);
+
+        let empty = tool
+            .execute(json!({"action": "working_set"}), ctx)
+            .await
+            .expect("empty working set")
+            .metadata
+            .expect("empty metadata");
+        assert!(
+            empty["working_set"]["claims"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            empty["working_set"]["workUnits"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
     }
 }
