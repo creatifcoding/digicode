@@ -1,7 +1,8 @@
 use jcode_tasker_store::{StoreError, TaskerStore};
 use jcode_tasker_types::{
-    AddTaskDependency, CreateFeature, CreateProject, CreateTask, ProjectRevision, SetTaskState,
-    TaskPriority, TaskState, TaskerError,
+    AddFeatureDependency, AddTaskDependency, CreateFeature, CreateProject, CreateTask,
+    FeatureState, ProjectRevision, SetFeatureState, SetTaskState, TaskPriority, TaskState,
+    TaskerError,
 };
 
 async fn seeded_store() -> (
@@ -62,6 +63,18 @@ async fn configures_sqlite_and_migrates_once() {
     assert_eq!(state.schema_version, 1);
     assert!(state.busy_timeout_ms >= 5_000);
     assert!(matches!(state.journal_mode.as_str(), "wal" | "memory"));
+}
+
+#[tokio::test]
+async fn file_store_uses_wal_and_foreign_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = TaskerStore::open(directory.path().join("tasker.db"))
+        .await
+        .unwrap();
+    let state = store.connection_state().await.unwrap();
+    assert_eq!(state.journal_mode, "wal");
+    assert!(state.foreign_keys);
+    assert_eq!(state.synchronous, 1);
 }
 
 #[tokio::test]
@@ -296,6 +309,76 @@ async fn dependency_cycles_are_rejected_without_partial_state() {
     assert_eq!(
         store.snapshot(project.id).await.unwrap().revision,
         ProjectRevision(5)
+    );
+}
+
+#[tokio::test]
+async fn feature_cycles_and_closed_ancestors_are_enforced() {
+    let (store, project, parent) = seeded_store().await;
+    let child = store
+        .create_feature(CreateFeature {
+            project_id: project.id,
+            id: None,
+            parent_id: Some(parent.id),
+            title: "Child".into(),
+            description: String::new(),
+            expected_revision: Some(ProjectRevision(2)),
+        })
+        .await
+        .unwrap();
+    store
+        .add_feature_dependency(AddFeatureDependency {
+            project_id: project.id,
+            feature_id: child.value.id,
+            depends_on_feature_id: parent.id,
+            expected_revision: Some(ProjectRevision(3)),
+        })
+        .await
+        .unwrap();
+    let cycle = store
+        .add_feature_dependency(AddFeatureDependency {
+            project_id: project.id,
+            feature_id: parent.id,
+            depends_on_feature_id: child.value.id,
+            expected_revision: Some(ProjectRevision(4)),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        cycle,
+        StoreError::Domain(TaskerError::DependencyCycle { .. })
+    ));
+
+    let task = store
+        .create_task(task_command(
+            project.id,
+            child.value.id,
+            "Nested task",
+            TaskPriority::Normal,
+            0,
+            ProjectRevision(4),
+        ))
+        .await
+        .unwrap();
+    store
+        .set_feature_state(SetFeatureState {
+            project_id: project.id,
+            feature_id: parent.id,
+            state: FeatureState::Closed,
+            expected_revision: Some(ProjectRevision(5)),
+        })
+        .await
+        .unwrap();
+    let readiness = store
+        .task_readiness(project.id, task.value.id)
+        .await
+        .unwrap();
+    assert!(!readiness.ready);
+    assert!(
+        readiness
+            .restrictions
+            .iter()
+            .any(|restriction| restriction.contains(&parent.id.to_string()))
     );
 }
 
