@@ -1464,7 +1464,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let feature_id = feature_output.metadata["feature"]["id"].as_str().unwrap();
+        let feature_metadata = feature_output.metadata.expect("feature metadata");
+        let feature_id = feature_metadata["feature"]["id"].as_str().unwrap();
 
         let task_output = tool
             .execute(
@@ -1473,14 +1474,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let task_id = task_output.metadata["task"]["id"].as_str().unwrap();
+        let task_metadata = task_output.metadata.expect("task metadata");
+        let task_id = task_metadata["task"]["id"].as_str().unwrap();
 
         let graph = tool
             .execute(json!({"action": "task_graph", "limit": 1}), context(root))
             .await
             .unwrap();
-        assert_eq!(graph.metadata["projection"]["limit"], 1);
-        assert_eq!(graph.metadata["projection"]["counts"]["tasks"], 1);
+        let graph_metadata = graph.metadata.expect("graph metadata");
+        assert_eq!(graph_metadata["projection"]["limit"], 1);
+        assert_eq!(graph_metadata["projection"]["counts"]["tasks"], 1);
 
         let neighbors = tool
             .execute(
@@ -1489,7 +1492,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(neighbors.metadata["projection"]["nodeCount"], 1);
+        let neighbor_metadata = neighbors.metadata.expect("neighbor metadata");
+        assert_eq!(neighbor_metadata["projection"]["nodeCount"], 1);
     }
 
     #[tokio::test]
