@@ -1429,6 +1429,53 @@ impl PiTaskerStore {
         Ok(task)
     }
 
+    pub fn set_task_indexes(&mut self, task_id: &str, indexes: Value) -> Result<Task> {
+        self.update_task(
+            task_id,
+            UpdateTask {
+                indexes: Some(indexes),
+                ..UpdateTask::default()
+            },
+        )
+    }
+
+    pub fn add_task_indexes(&mut self, task_id: &str, add: Value) -> Result<Task> {
+        let task = self
+            .list_tasks(None)?
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| PiTaskerError::NotFound(task_id.into()))?;
+        let mut indexes = task.indexes.as_array().cloned().unwrap_or_default();
+        indexes.extend(add.as_array().cloned().unwrap_or_default());
+        self.set_task_indexes(task_id, Value::Array(indexes))
+    }
+
+    pub fn remove_task_indexes(&mut self, task_id: &str, remove_paths: &[String]) -> Result<Task> {
+        let task = self
+            .list_tasks(None)?
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .ok_or_else(|| PiTaskerError::NotFound(task_id.into()))?;
+        let remove = remove_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let indexes = task
+            .indexes
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_none_or(|path| !remove.contains(path))
+            })
+            .collect::<Vec<_>>();
+        self.set_task_indexes(task_id, Value::Array(indexes))
+    }
+
     pub fn batch_execute(&mut self, operations: Vec<BatchOperation>) -> Result<BatchResult> {
         let tx = self.conn.transaction()?;
         ensure_list_meta_tx(&tx, &self.partition)?;

@@ -106,6 +106,12 @@ struct TaskerInput {
     #[serde(default)]
     indexes: Option<Value>,
     #[serde(default)]
+    index_add: Option<Value>,
+    #[serde(default)]
+    index_remove: Option<Vec<String>>,
+    #[serde(default)]
+    index_set: Option<Value>,
+    #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
     operations: Option<Vec<BatchOperation>>,
@@ -303,7 +309,7 @@ impl Tool for TaskerTool {
                     "type": "string",
                     "enum": [
                         "status", "ready", "show", "create_feature", "create", "add_dependency", "set_state",
-                        "list", "search", "update", "add_note", "feature_list", "feature_update", "feature_status",
+                        "list", "search", "update", "add_note", "task_index", "feature_list", "feature_update", "feature_status",
                         "link", "unlink", "batch", "plan", "feature_plan", "claim", "release", "working_set", "next_work_unit", "feature_gate",
                         "task_artifact_create", "task_artifacts", "task_stage_report",
                         "task_graph", "task_structure", "topology_summary", "topology_anomalies", "topology_paths", "topology_frontier",
@@ -329,6 +335,9 @@ impl Tool for TaskerTool {
                 "owner": {"type": "string"},
                 "gates": {"type": ["array", "object"]},
                 "indexes": {"type": ["array", "object"]},
+                "index_add": {"type": ["array", "object"], "description": "task_index add entries. Appended after remove when index_set is omitted."},
+                "index_remove": {"type": "array", "items": {"type": "string"}, "description": "task_index remove paths. Removes entries whose path exactly matches."},
+                "index_set": {"type": ["array", "object"], "description": "task_index replacement entries. When present, add/remove are ignored to match Pi set semantics."},
                 "operations": {
                     "type": "array",
                     "description": "Atomic Pi-compatible create/update operations. Create keys may be referenced by later dependencies and updates.",
@@ -813,17 +822,16 @@ impl Tool for TaskerTool {
                     if let Some(kind) = params.claim_kind.as_deref() {
                         validate_enum(kind, &["claim", "hold", "lock"], "claim_kind")?;
                     }
-                    let feature_id = resolve_feature(
-                        store,
-                        required(params.feature_id, "feature_id", "next_work_unit")?,
-                        "next_work_unit",
-                    )?;
+                    let feature_id = match params.feature_id {
+                        Some(reference) => Some(resolve_feature(store, reference, "next_work_unit")?),
+                        None => None,
+                    };
                     let result = store.enqueue_next_work_unit(NextWorkUnitInput {
                         context: work_context,
                         claim_kind: params.claim_kind,
                         reason: params.reason,
                         lease_ms: params.lease_ms,
-                        feature_id: Some(feature_id),
+                        feature_id,
                         priority: params.work_priority,
                         set_active: params.set_active,
                     })?;
@@ -839,7 +847,18 @@ impl Tool for TaskerTool {
                         "feature_gate",
                     )?;
                     let gate_index = required(params.gate_index, "gate_index", "feature_gate")?;
-                    let status = required(params.gate_status, "gate_status", "feature_gate")?;
+                    let Some(status) = params.gate_status else {
+                        let gate = store.feature_gate(&feature_id, gate_index)?;
+                        return output(
+                            format!("Feature gate {gate_index}"),
+                            with_base(json!({
+                                "feature_id": feature_id,
+                                "gate_index": gate_index,
+                                "gate": gate,
+                                "readOnly": true,
+                            })),
+                        );
+                    };
                     validate_enum(&status, &["pending", "passed", "failed"], "gate_status")?;
                     let gates = store.resolve_feature_gate(
                         &feature_id,
@@ -1090,13 +1109,77 @@ impl Tool for TaskerTool {
                         )),
                     }
                 }
+                "task_index" => {
+                    let task_id = resolve_task(
+                        store,
+                        required(params.task_id, "task_id", "task_index")?,
+                        "task_index",
+                    )?;
+                    let task = if let Some(indexes) = params.index_set {
+                        store.set_task_indexes(&task_id, indexes)?
+                    } else {
+                        if let Some(remove) = params.index_remove.as_ref().filter(|paths| !paths.is_empty()) {
+                            store.remove_task_indexes(&task_id, remove)?;
+                        }
+                        if let Some(add) = params.index_add {
+                            store.add_task_indexes(&task_id, add)?
+                        } else {
+                            store
+                                .list_tasks(None)?
+                                .into_iter()
+                                .find(|task| task.id == task_id)
+                                .ok_or_else(|| anyhow!("task disappeared while updating indexes"))?
+                        }
+                    };
+                    let index_count = task.indexes.as_array().map_or(0, Vec::len);
+                    let indexes = task.indexes.clone();
+                    output(
+                        format!("Indexes updated on #{} ({index_count} entries)", task.display_id),
+                        with_base(json!({"task": task, "indexes": indexes, "indexCount": index_count})),
+                    )
+                }
                 "feature_list" => {
-                    let features = store.list_features()?;
+                    let snapshot_features = store.list_features()?;
+                    let parent_filter = match params.parent_feature_id.as_deref() {
+                        Some("root") => Some(None),
+                        Some(reference) => Some(Some(resolve_feature(store, reference.to_string(), "feature_list")?)),
+                        None => None,
+                    };
+                    let mut features = snapshot_features
+                        .iter()
+                        .filter(|feature| params.state.as_deref().is_none_or(|state| feature.state == state))
+                        .filter(|feature| match parent_filter.as_ref() {
+                            Some(Some(parent)) => feature.parent_feature_id.as_deref() == Some(parent.as_str()),
+                            Some(None) => feature.parent_feature_id.is_none(),
+                            None => true,
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    features.sort_by(|a, b| a.display_id.cmp(&b.display_id).then_with(|| a.id.cmp(&b.id)));
                     let total = features.len();
+                    let progress = features
+                        .iter()
+                        .map(|feature| {
+                            let gates = feature.gates.as_array().cloned().unwrap_or_default();
+                            let passed = gates
+                                .iter()
+                                .filter(|gate| gate.get("status").and_then(Value::as_str) == Some("passed"))
+                                .count();
+                            json!({"featureId": feature.id, "displayId": feature.display_id, "gatePassed": passed, "gateTotal": gates.len()})
+                        })
+                        .collect::<Vec<_>>();
                     output(
                         format!("{total} features"),
                         with_base(json!({
                             "features": features.into_iter().take(limit).collect::<Vec<_>>(),
+                            "progress": progress.into_iter().take(limit).collect::<Vec<_>>(),
+                            "counts": {
+                                "total": snapshot_features.len(),
+                                "open": snapshot_features.iter().filter(|feature| feature.state == "open").count(),
+                                "active": snapshot_features.iter().filter(|feature| feature.state == "active").count(),
+                                "closed": snapshot_features.iter().filter(|feature| feature.state == "closed").count(),
+                                "archived": snapshot_features.iter().filter(|feature| feature.state == "archived").count(),
+                            },
                             "total": total,
                             "truncated": total > limit,
                             "limit": limit,
@@ -1114,11 +1197,56 @@ impl Tool for TaskerTool {
                         .into_iter()
                         .find(|f| f.id == feature_id)
                         .ok_or_else(|| anyhow!("feature disappeared while showing it"))?;
+                    let all_features = store.list_features()?;
+                    let child_features = all_features
+                        .iter()
+                        .filter(|candidate| candidate.parent_feature_id.as_deref() == Some(feature_id.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let subtree_ids = {
+                        let mut ids = std::collections::BTreeSet::new();
+                        let mut queue = vec![feature_id.clone()];
+                        while let Some(id) = queue.pop() {
+                            if ids.insert(id.clone()) {
+                                queue.extend(
+                                    all_features
+                                        .iter()
+                                        .filter(|candidate| candidate.parent_feature_id.as_deref() == Some(id.as_str()))
+                                        .map(|candidate| candidate.id.clone()),
+                                );
+                            }
+                        }
+                        ids
+                    };
                     let tasks = store
                         .list_tasks(None)?
                         .into_iter()
                         .filter(|task| task.feature_id.as_deref() == Some(feature_id.as_str()))
                         .collect::<Vec<_>>();
+                    let subtree_tasks = store
+                        .list_tasks(None)?
+                        .into_iter()
+                        .filter(|task| task.feature_id.as_ref().is_some_and(|id| subtree_ids.contains(id)))
+                        .collect::<Vec<_>>();
+                    let done_tasks = tasks.iter().filter(|task| task.state == "done").count();
+                    let rollup_done_tasks = subtree_tasks.iter().filter(|task| task.state == "done").count();
+                    let total_tasks = tasks.len();
+                    let total_subtree_tasks = subtree_tasks.len();
+                    let progress_ratio = if total_tasks == 0 {
+                        0.0
+                    } else {
+                        done_tasks as f64 / total_tasks as f64
+                    };
+                    let rollup_progress_ratio = if total_subtree_tasks == 0 {
+                        0.0
+                    } else {
+                        rollup_done_tasks as f64 / total_subtree_tasks as f64
+                    };
+                    let gates = feature.gates.as_array().cloned().unwrap_or_default();
+                    let passed_gates = gates
+                        .iter()
+                        .filter(|gate| gate.get("status").and_then(Value::as_str) == Some("passed"))
+                        .count();
                     let dependencies = store
                         .list_feature_dependencies()?
                         .into_iter()
@@ -1134,6 +1262,11 @@ impl Tool for TaskerTool {
                         with_base(json!({
                             "feature": feature,
                             "tasks": tasks,
+                            "childFeatures": child_features,
+                            "subtree": {"featureIds": subtree_ids, "tasks": subtree_tasks},
+                            "progress": {"doneTasks": done_tasks, "totalTasks": total_tasks, "ratio": progress_ratio},
+                            "rollupProgress": {"doneTasks": rollup_done_tasks, "totalTasks": total_subtree_tasks, "ratio": rollup_progress_ratio},
+                            "gateProgress": {"passed": passed_gates, "total": gates.len()},
                             "dependencies": dependencies,
                             "notes": notes,
                         })),
@@ -1302,6 +1435,7 @@ mod tests {
             "search",
             "update",
             "add_note",
+            "task_index",
             "feature_list",
             "feature_update",
             "feature_status",
@@ -1591,6 +1725,132 @@ mod tests {
             .metadata
             .expect("unlink metadata");
         assert_eq!(unlinked["task"]["featureId"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn task_index_and_feature_progress_match_pi_ergonomics() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (_database_dir, tool) = temp_tool();
+        let ctx = context(workspace.path());
+
+        tool.execute(
+            json!({"action": "create_feature", "title": "Root", "gates": [{"label": "Manual gate"}]}),
+            ctx.clone(),
+        )
+        .await
+        .expect("create root feature");
+        tool.execute(
+            json!({"action": "create_feature", "title": "Child", "parent_feature_id": "#F1", "state": "active"}),
+            ctx.clone(),
+        )
+        .await
+        .expect("create child feature");
+        tool.execute(
+            json!({"action": "create", "title": "Root task", "feature_id": "#F1", "state": "done"}),
+            ctx.clone(),
+        )
+        .await
+        .expect("create root task");
+        tool.execute(
+            json!({"action": "create", "title": "Child task", "feature_id": "#F2"}),
+            ctx.clone(),
+        )
+        .await
+        .expect("create child task");
+
+        let set = tool
+            .execute(
+                json!({
+                    "action": "task_index",
+                    "task_id": "#2",
+                    "index_set": [{"type": "file", "path": "src/a.rs"}, {"type": "url", "path": "https://example.test"}]
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("set indexes")
+            .metadata
+            .expect("set metadata");
+        assert_eq!(set["indexCount"], 2);
+
+        let changed = tool
+            .execute(
+                json!({
+                    "action": "task_index",
+                    "task_id": "#2",
+                    "index_remove": ["src/a.rs"],
+                    "index_add": [{"type": "symbol", "path": "TaskerTool"}]
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("add/remove indexes")
+            .metadata
+            .expect("changed metadata");
+        assert_eq!(changed["indexCount"], 2);
+        assert_eq!(changed["indexes"][0]["path"], "https://example.test");
+        assert_eq!(changed["indexes"][1]["path"], "TaskerTool");
+
+        let roots = tool
+            .execute(
+                json!({"action": "feature_list", "parent_feature_id": "root"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("list roots")
+            .metadata
+            .expect("roots metadata");
+        assert_eq!(roots["features"].as_array().unwrap().len(), 1);
+        assert_eq!(roots["counts"]["active"], 1);
+        assert_eq!(roots["progress"][0]["gateTotal"], 1);
+
+        let active = tool
+            .execute(
+                json!({"action": "feature_list", "state": "active"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("list active")
+            .metadata
+            .expect("active metadata");
+        assert_eq!(active["features"][0]["title"], "Child");
+
+        let status = tool
+            .execute(
+                json!({"action": "feature_status", "feature_id": "#F1"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("feature status")
+            .metadata
+            .expect("status metadata");
+        assert_eq!(status["progress"]["doneTasks"], 1);
+        assert_eq!(status["rollupProgress"]["totalTasks"], 2);
+        assert_eq!(status["childFeatures"][0]["title"], "Child");
+
+        let read_gate = tool
+            .execute(
+                json!({"action": "feature_gate", "feature_id": "#F1", "gate_index": 0}),
+                ctx.clone(),
+            )
+            .await
+            .expect("read gate")
+            .metadata
+            .expect("gate metadata");
+        assert_eq!(read_gate["readOnly"], true);
+        assert_eq!(read_gate["gate"]["status"], "pending");
+
+        let no_scope = tool
+            .execute(json!({"action": "next_work_unit"}), ctx)
+            .await
+            .expect("next work unit without feature scope")
+            .metadata
+            .expect("next metadata");
+        assert_eq!(no_scope["next_work_unit"]["ok"], false);
+        assert_eq!(
+            no_scope["next_work_unit"]["error"],
+            "feature_scope_required"
+        );
     }
 
     #[tokio::test]
