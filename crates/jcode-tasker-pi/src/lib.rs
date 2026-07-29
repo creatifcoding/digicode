@@ -104,6 +104,9 @@ pub fn make_task_claim_id() -> String {
 pub fn make_work_unit_id() -> String {
     prefixed_uuid("wu_")
 }
+pub fn make_visual_artifact_id() -> String {
+    prefixed_uuid("artifact_")
+}
 pub fn make_task_dependency_id(task_id: &str, depends_on_id: &str) -> String {
     format!("dep_{task_id}_{depends_on_id}")
 }
@@ -358,6 +361,54 @@ pub struct WorkUnit {
     pub dispatched_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub cancelled_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualArtifact {
+    pub id: String,
+    pub list_id: String,
+    pub project_root: String,
+    pub task_id: Option<String>,
+    pub feature_id: Option<String>,
+    pub work_unit_id: Option<String>,
+    pub stage: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+    pub path: String,
+    pub mime_type: String,
+    pub metadata: Value,
+    pub created_by: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualArtifactCreateInput {
+    pub task_id: Option<String>,
+    pub feature_id: Option<String>,
+    pub work_unit_id: Option<String>,
+    pub stage: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+    pub path: String,
+    pub mime_type: Option<String>,
+    pub metadata: Option<Value>,
+    pub created_by: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualArtifactQueryInput {
+    pub task_id: Option<String>,
+    pub feature_id: Option<String>,
+    pub work_unit_id: Option<String>,
+    pub stage: Option<String>,
+    pub kind: Option<String>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -836,6 +887,94 @@ impl PiTaskerStore {
                 },
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn create_visual_artifact(
+        &mut self,
+        input: VisualArtifactCreateInput,
+    ) -> Result<VisualArtifact> {
+        let tx = self.conn.transaction()?;
+        let now = now_ms();
+        let artifact = VisualArtifact {
+            id: make_visual_artifact_id(),
+            list_id: self.partition.list_id.clone(),
+            project_root: self.partition.project_root.clone(),
+            task_id: input.task_id,
+            feature_id: input.feature_id,
+            work_unit_id: input.work_unit_id,
+            stage: input.stage,
+            kind: input.kind,
+            title: input.title,
+            summary: input.summary,
+            path: input.path,
+            mime_type: input.mime_type.unwrap_or_else(|| "text/html".into()),
+            metadata: input
+                .metadata
+                .unwrap_or_else(|| Value::Object(Default::default())),
+            created_by: input.created_by,
+            created_at: now,
+            updated_at: now,
+        };
+        tx.execute(
+            "INSERT INTO visual_artifacts (id,list_id,project_root,task_id,feature_id,work_unit_id,stage,kind,title,summary,path,mime_type,metadata,created_by,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+            params![
+                artifact.id,
+                artifact.list_id,
+                artifact.project_root,
+                artifact.task_id,
+                artifact.feature_id,
+                artifact.work_unit_id,
+                artifact.stage,
+                artifact.kind,
+                artifact.title,
+                artifact.summary,
+                artifact.path,
+                artifact.mime_type,
+                serde_json::to_string(&artifact.metadata)?,
+                artifact.created_by,
+                artifact.created_at,
+                artifact.updated_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(artifact)
+    }
+
+    pub fn list_visual_artifacts(
+        &self,
+        query: VisualArtifactQueryInput,
+    ) -> Result<Vec<VisualArtifact>> {
+        let mut stmt = self.conn.prepare("SELECT id,list_id,project_root,task_id,feature_id,work_unit_id,stage,kind,title,summary,path,mime_type,metadata,created_by,created_at,updated_at FROM visual_artifacts WHERE list_id=?1 AND project_root=?2 ORDER BY created_at DESC")?;
+        let artifacts = stmt
+            .query_map(
+                params![self.partition.list_id, self.partition.project_root],
+                row_visual_artifact,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let limit = query.limit.unwrap_or(100).max(1);
+        Ok(artifacts
+            .into_iter()
+            .filter(|artifact| {
+                query
+                    .task_id
+                    .as_ref()
+                    .is_none_or(|v| artifact.task_id.as_ref() == Some(v))
+                    && query
+                        .feature_id
+                        .as_ref()
+                        .is_none_or(|v| artifact.feature_id.as_ref() == Some(v))
+                    && query
+                        .work_unit_id
+                        .as_ref()
+                        .is_none_or(|v| artifact.work_unit_id.as_ref() == Some(v))
+                    && query
+                        .stage
+                        .as_ref()
+                        .is_none_or(|v| artifact.stage.as_ref() == Some(v))
+                    && query.kind.as_ref().is_none_or(|v| &artifact.kind == v)
+            })
+            .take(limit)
+            .collect())
     }
 
     pub fn resolve_task_id(&self, input: &str) -> Result<Option<String>> {
@@ -1839,9 +1978,34 @@ fn row_work_unit(r: &rusqlite::Row<'_>) -> rusqlite::Result<WorkUnit> {
         cancelled_at: r.get(16)?,
     })
 }
+fn row_visual_artifact(r: &rusqlite::Row<'_>) -> rusqlite::Result<VisualArtifact> {
+    Ok(VisualArtifact {
+        id: r.get(0)?,
+        list_id: r.get(1)?,
+        project_root: r.get(2)?,
+        task_id: r.get(3)?,
+        feature_id: r.get(4)?,
+        work_unit_id: r.get(5)?,
+        stage: r.get(6)?,
+        kind: r.get(7)?,
+        title: r.get(8)?,
+        summary: r.get(9)?,
+        path: r.get(10)?,
+        mime_type: r.get(11)?,
+        metadata: json_or_empty_object(r.get(12)?),
+        created_by: r.get(13)?,
+        created_at: r.get(14)?,
+        updated_at: r.get(15)?,
+    })
+}
 fn json_or_empty_array(raw: Option<String>) -> Value {
     raw.and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| Value::Array(vec![]))
+}
+
+fn json_or_empty_object(raw: Option<String>) -> Value {
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| Value::Object(Default::default()))
 }
 
 fn feature_gates_from_value(value: Value) -> Result<Vec<FeatureGate>> {
@@ -2903,6 +3067,75 @@ mod tests {
             leaf_id_at_start: Some("leaf-start".into()),
             current_leaf_id: Some("leaf-current".into()),
         }
+    }
+
+    #[test]
+    fn visual_artifacts_create_and_filter_like_pi() {
+        let mut store = temp_store();
+        let feature = store.create_feature(feature_input("Feature")).unwrap();
+        let task = store
+            .create_task(CreateTask {
+                title: "Task".into(),
+                feature_id: Some(feature.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let first = store
+            .create_visual_artifact(VisualArtifactCreateInput {
+                task_id: Some(task.id.clone()),
+                feature_id: Some(feature.id.clone()),
+                work_unit_id: Some("wu_manual".into()),
+                stage: Some("design".into()),
+                kind: "visual-plan".into(),
+                title: "Plan".into(),
+                summary: "Summary".into(),
+                path: "reports/plan.html".into(),
+                mime_type: None,
+                metadata: Some(serde_json::json!({"a": 1})),
+                created_by: "agent:test".into(),
+            })
+            .unwrap();
+        assert!(first.id.starts_with("artifact_"));
+        assert_eq!(first.mime_type, "text/html");
+        assert_eq!(first.metadata, serde_json::json!({"a": 1}));
+
+        let second = store
+            .create_visual_artifact(VisualArtifactCreateInput {
+                task_id: None,
+                feature_id: Some(feature.id.clone()),
+                work_unit_id: None,
+                stage: Some("validate".into()),
+                kind: "evidence-pack".into(),
+                title: "Evidence".into(),
+                summary: "Proof".into(),
+                path: "reports/evidence.html".into(),
+                mime_type: Some("text/markdown".into()),
+                metadata: None,
+                created_by: "agent:test".into(),
+            })
+            .unwrap();
+        assert_eq!(second.metadata, serde_json::json!({}));
+
+        let by_task = store
+            .list_visual_artifacts(VisualArtifactQueryInput {
+                task_id: Some(task.id.clone()),
+                limit: Some(20),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_task, vec![first.clone()]);
+
+        let by_stage = store
+            .list_visual_artifacts(VisualArtifactQueryInput {
+                feature_id: Some(feature.id),
+                stage: Some("validate".into()),
+                kind: Some("evidence-pack".into()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_stage, vec![second]);
     }
 
     #[test]

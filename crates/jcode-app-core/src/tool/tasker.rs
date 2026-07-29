@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use jcode_tasker_pi::{
     BatchOperation, ClaimTaskInput, CreateFeature, CreateTask, FeaturePlanFeature,
     FeaturePlanInput, NextWorkUnitInput, PiTaskerStore, PlanTask, ProjectPartition,
-    ReleaseClaimInput, ResolveFeatureGate, Task, UpdateFeature, UpdateTask, WorkContextInput,
+    ReleaseClaimInput, ResolveFeatureGate, Task, UpdateFeature, UpdateTask,
+    VisualArtifactCreateInput, VisualArtifactQueryInput, WorkContextInput,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -18,6 +19,25 @@ const FEATURE_STATES: &[&str] = &["open", "active", "closed", "archived"];
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
 const FEATURE_PRIORITIES: &[&str] = &["low", "medium", "high", "critical"];
+const EDIN_STAGES: &[&str] = &[
+    "experiment",
+    "design",
+    "implement",
+    "validate",
+    "negotiate",
+    "release",
+];
+const VISUAL_ARTIFACT_KINDS: &[&str] = &[
+    "stage-report",
+    "visual-plan",
+    "diff-review",
+    "evidence-pack",
+    "project-recap",
+    "design-deck",
+    "architecture-diagram",
+    "data-table",
+    "custom",
+];
 
 pub struct TaskerTool {
     database_path: Option<PathBuf>,
@@ -72,6 +92,8 @@ struct TaskerInput {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
     tags: Option<Value>,
     #[serde(default)]
     brief: Option<String>,
@@ -113,6 +135,20 @@ struct TaskerInput {
     note: Option<String>,
     #[serde(default)]
     feature: Option<FeaturePlanFeature>,
+    #[serde(default)]
+    work_unit_id: Option<String>,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    created_by: Option<String>,
 }
 
 fn required<T>(value: Option<T>, field: &'static str, action: &str) -> Result<T> {
@@ -248,7 +284,8 @@ impl Tool for TaskerTool {
                     "enum": [
                         "status", "ready", "show", "create_feature", "create", "add_dependency", "set_state",
                         "list", "search", "update", "add_note", "feature_list", "feature_update", "feature_status",
-                        "link", "unlink", "batch", "plan", "feature_plan", "claim", "release", "working_set", "next_work_unit", "feature_gate"
+                        "link", "unlink", "batch", "plan", "feature_plan", "claim", "release", "working_set", "next_work_unit", "feature_gate",
+                        "task_artifact_create", "task_artifacts", "task_stage_report"
                     ]
                 },
                 "title": {"type": "string"},
@@ -263,6 +300,7 @@ impl Tool for TaskerTool {
                 "query": {"type": "string"},
                 "category": {"type": "string"},
                 "content": {"type": "string"},
+                "summary": {"type": "string"},
                 "tags": {"type": ["array", "object"]},
                 "brief": {"type": "string"},
                 "acceptance": {"type": ["array", "object"]},
@@ -320,6 +358,13 @@ impl Tool for TaskerTool {
                 "gate_status": {"type": "string", "enum": ["pending", "passed", "failed"]},
                 "resolved_by": {"type": "string"},
                 "note": {"type": "string", "description": "Gate resolution note. Automated resolver evidence is retained separately by the store adapter."},
+                "work_unit_id": {"type": "string"},
+                "stage": {"type": "string", "enum": ["experiment", "design", "implement", "validate", "negotiate", "release"]},
+                "kind": {"type": "string", "enum": ["stage-report", "visual-plan", "diff-review", "evidence-pack", "project-recap", "design-deck", "architecture-diagram", "data-table", "custom"]},
+                "path": {"type": "string"},
+                "mime_type": {"type": "string"},
+                "metadata": {"type": "object"},
+                "created_by": {"type": "string"},
                 "feature": {
                     "type": "object",
                     "description": "Root of an atomic Pi-compatible feature plan.",
@@ -712,6 +757,147 @@ impl Tool for TaskerTool {
                         })),
                     )
                 }
+                "task_artifact_create" => {
+                    let task_id = match params.task_id {
+                        Some(reference) => Some(resolve_task(store, reference, "task_artifact_create")?),
+                        None => None,
+                    };
+                    let feature_id = match params.feature_id {
+                        Some(reference) => {
+                            Some(resolve_feature(store, reference, "task_artifact_create")?)
+                        }
+                        None => None,
+                    };
+                    let kind = required(params.kind, "kind", "task_artifact_create")?;
+                    validate_enum(&kind, VISUAL_ARTIFACT_KINDS, "kind")?;
+                    if let Some(stage) = params.stage.as_deref() {
+                        validate_enum(stage, EDIN_STAGES, "stage")?;
+                    }
+                    let artifact = store.create_visual_artifact(VisualArtifactCreateInput {
+                        task_id,
+                        feature_id,
+                        work_unit_id: params.work_unit_id,
+                        stage: params.stage,
+                        kind,
+                        title: required(params.title, "title", "task_artifact_create")?,
+                        summary: required(params.summary.or(params.content), "summary", "task_artifact_create")?,
+                        path: required(params.path, "path", "task_artifact_create")?,
+                        mime_type: params.mime_type,
+                        metadata: params.metadata,
+                        created_by: params.created_by.unwrap_or(work_context.agent_id),
+                    })?;
+                    output(
+                        format!("✓ Artifact {} · {}", artifact.kind, artifact.title),
+                        with_base(json!({"artifact": artifact, "workingSetScope": "self"})),
+                    )
+                }
+                "task_artifacts" => {
+                    let task_id = match params.task_id {
+                        Some(reference) => Some(resolve_task(store, reference, "task_artifacts")?),
+                        None => None,
+                    };
+                    let feature_id = match params.feature_id {
+                        Some(reference) => Some(resolve_feature(store, reference, "task_artifacts")?),
+                        None => None,
+                    };
+                    if let Some(stage) = params.stage.as_deref() {
+                        validate_enum(stage, EDIN_STAGES, "stage")?;
+                    }
+                    if let Some(kind) = params.kind.as_deref() {
+                        validate_enum(kind, VISUAL_ARTIFACT_KINDS, "kind")?;
+                    }
+                    let artifacts = store.list_visual_artifacts(VisualArtifactQueryInput {
+                        task_id,
+                        feature_id,
+                        work_unit_id: params.work_unit_id,
+                        stage: params.stage,
+                        kind: params.kind,
+                        limit: Some(limit),
+                    })?;
+                    let lines = artifacts
+                        .iter()
+                        .map(|artifact| {
+                            format!(
+                                "{} · {} · {} · {}",
+                                artifact.stage.as_deref().unwrap_or("no-stage"),
+                                artifact.kind,
+                                artifact.title,
+                                artifact.path
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let count = artifacts.len();
+                    output(
+                        if lines.is_empty() {
+                            "No visual artifacts found".to_string()
+                        } else {
+                            lines.join("\n")
+                        },
+                        with_base(json!({"artifacts": artifacts, "count": count})),
+                    )
+                }
+                "task_stage_report" => {
+                    let stage = required(params.stage, "stage", "task_stage_report")?;
+                    validate_enum(&stage, EDIN_STAGES, "stage")?;
+                    let task_id = match params.task_id {
+                        Some(reference) => Some(resolve_task(store, reference, "task_stage_report")?),
+                        None => None,
+                    };
+                    let feature_id = match params.feature_id {
+                        Some(reference) => Some(resolve_feature(store, reference, "task_stage_report")?),
+                        None => None,
+                    };
+                    let work_unit_id = params.work_unit_id.clone();
+                    let report_input = json!({
+                        "stage": stage.clone(),
+                        "generatedAt": chrono::Utc::now().timestamp_millis(),
+                        "task": task_id.as_ref().and_then(|id| store.list_tasks(None).ok()?.into_iter().find(|task| &task.id == id)),
+                        "feature": feature_id.as_ref().and_then(|id| store.list_features().ok()?.into_iter().find(|feature| &feature.id == id)),
+                        "workUnit": Value::Null,
+                        "dependencies": task_id.as_ref().map(|id| store.list_dependencies().unwrap_or_default().into_iter().filter(|dep| &dep.task_id == id).collect::<Vec<_>>()).unwrap_or_default(),
+                        "dependents": task_id.as_ref().map(|id| store.list_dependencies().unwrap_or_default().into_iter().filter(|dep| &dep.depends_on_id == id).collect::<Vec<_>>()).unwrap_or_default(),
+                        "taskNotes": task_id.as_ref().map(|id| store.list_task_notes().unwrap_or_default().into_iter().filter(|note| &note.task_id == id).collect::<Vec<_>>()).unwrap_or_default(),
+                        "featureNotes": feature_id.as_ref().map(|id| store.list_feature_notes().unwrap_or_default().into_iter().filter(|note| &note.feature_id == id).collect::<Vec<_>>()).unwrap_or_default(),
+                        "artifacts": store.list_visual_artifacts(VisualArtifactQueryInput { task_id: task_id.clone(), feature_id: feature_id.clone(), work_unit_id: work_unit_id.clone(), stage: Some(stage.clone()), kind: None, limit: Some(50) })?,
+                        "workingSet": store.get_working_set(work_context.clone())?,
+                    });
+                    let report_task_id = task_id.clone();
+                    let report_feature_id = feature_id.clone();
+                    let report_work_unit_id = work_unit_id.clone();
+                    let mut metadata = params.metadata.unwrap_or_else(|| Value::Object(Default::default()));
+                    if let Value::Object(object) = &mut metadata {
+                        object.insert("taskerReportInput".into(), json!({
+                            "generatedAt": report_input.get("generatedAt").cloned().unwrap_or(Value::Null),
+                            "taskId": report_task_id,
+                            "featureId": report_feature_id,
+                            "workUnitId": report_work_unit_id,
+                            "dependencyCount": report_input["dependencies"].as_array().map_or(0, Vec::len),
+                            "dependentCount": report_input["dependents"].as_array().map_or(0, Vec::len),
+                            "taskNoteCount": report_input["taskNotes"].as_array().map_or(0, Vec::len),
+                            "featureNoteCount": report_input["featureNotes"].as_array().map_or(0, Vec::len),
+                            "priorArtifactCount": report_input["artifacts"].as_array().map_or(0, Vec::len),
+                            "workingClaimCount": report_input["workingSet"]["claims"].as_array().map_or(0, Vec::len),
+                            "workingWorkUnitCount": report_input["workingSet"]["workUnits"].as_array().map_or(0, Vec::len),
+                        }));
+                    }
+                    let artifact = store.create_visual_artifact(VisualArtifactCreateInput {
+                        task_id,
+                        feature_id,
+                        work_unit_id,
+                        stage: Some(stage),
+                        kind: "stage-report".into(),
+                        title: params.title.unwrap_or_else(|| format!("{} Stage Report", report_input["stage"].as_str().unwrap_or("stage").to_uppercase())),
+                        summary: required(params.summary.or(params.content), "summary", "task_stage_report")?,
+                        path: required(params.path, "path", "task_stage_report")?,
+                        mime_type: Some("text/html".into()),
+                        metadata: Some(metadata),
+                        created_by: params.created_by.unwrap_or(work_context.agent_id),
+                    })?;
+                    output(
+                        format!("✓ Stage report attached · {} · {}", artifact.stage.as_deref().unwrap_or("no-stage"), artifact.title),
+                        with_base(json!({"artifact": artifact, "reportInput": report_input, "workingSetScope": "self"})),
+                    )
+                }
                 "update" | "set_state" => {
                     let task_id = resolve_task(
                         store,
@@ -1026,6 +1212,9 @@ mod tests {
             "working_set",
             "next_work_unit",
             "feature_gate",
+            "task_artifact_create",
+            "task_artifacts",
+            "task_stage_report",
         ] {
             assert!(actions.contains(&json!(action)), "missing {action}");
         }
@@ -1067,6 +1256,87 @@ mod tests {
                 .to_string()
         );
         assert_eq!(status["schema_fingerprint"].as_str().unwrap().len(), 40);
+    }
+
+    #[tokio::test]
+    async fn artifact_actions_round_trip_through_public_tool() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (_database_dir, tool) = temp_tool();
+        let ctx = context(workspace.path());
+
+        let task = tool
+            .execute(
+                json!({"action": "create", "title": "Artifact task"}),
+                ctx.clone(),
+            )
+            .await
+            .expect("create task")
+            .metadata
+            .expect("task metadata")["task"]
+            .clone();
+        let task_id = task["id"].as_str().expect("task id");
+
+        let artifact_meta = tool
+            .execute(
+                json!({
+                    "action": "task_artifact_create",
+                    "task_id": task_id,
+                    "stage": "design",
+                    "kind": "visual-plan",
+                    "title": "Design plan",
+                    "summary": "A visual plan",
+                    "path": "reports/design.html",
+                    "metadata": {"source": "test"}
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("create artifact")
+            .metadata
+            .expect("artifact metadata");
+        assert_eq!(artifact_meta["artifact"]["taskId"], task_id);
+        assert_eq!(artifact_meta["artifact"]["mimeType"], "text/html");
+        assert_eq!(artifact_meta["artifact"]["metadata"]["source"], "test");
+
+        let listed = tool
+            .execute(
+                json!({
+                    "action": "task_artifacts",
+                    "task_id": task_id,
+                    "stage": "design",
+                    "kind": "visual-plan"
+                }),
+                ctx.clone(),
+            )
+            .await
+            .expect("list artifacts")
+            .metadata
+            .expect("listed metadata");
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["artifacts"][0]["title"], "Design plan");
+
+        let report = tool
+            .execute(
+                json!({
+                    "action": "task_stage_report",
+                    "task_id": task_id,
+                    "stage": "validate",
+                    "summary": "Validation complete",
+                    "path": "reports/validate.html"
+                }),
+                ctx,
+            )
+            .await
+            .expect("stage report")
+            .metadata
+            .expect("report metadata");
+        assert_eq!(report["artifact"]["kind"], "stage-report");
+        assert_eq!(report["artifact"]["stage"], "validate");
+        assert_eq!(
+            report["artifact"]["metadata"]["taskerReportInput"]["taskId"],
+            task_id
+        );
+        assert_eq!(report["reportInput"]["stage"], "validate");
     }
 
     #[tokio::test]
