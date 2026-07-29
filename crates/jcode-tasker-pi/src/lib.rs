@@ -528,6 +528,7 @@ pub struct CreateTask {
     pub feature_id: Option<String>,
     pub indexes: Option<Value>,
     pub depends_on: Vec<String>,
+    pub notes: Vec<NoteInput>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct UpdateTask {
@@ -536,6 +537,14 @@ pub struct UpdateTask {
     pub state: Option<String>,
     pub feature_id: Option<Option<String>>,
     pub indexes: Option<Value>,
+    pub depends_on: Option<Vec<String>>,
+    pub clear_dependencies: bool,
+    /// Pi keeps `activeTaskId` only in its in-process SubscriptionRef snapshot,
+    /// not in SQL. The compatibility store cannot persist a process-local UI
+    /// selection without inventing new Pi schema, so this field is accepted and
+    /// intentionally non-durable. Callers should use claims/work units for
+    /// durable active ownership.
+    pub active: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1390,6 +1399,7 @@ impl PiTaskerStore {
         };
         tx.execute("INSERT INTO tasks (id,list_id,project_root,display_id,feature_id,title,description,state,indexes,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)", params![task.id, task.list_id, task.project_root, task.display_id, task.feature_id, task.title, task.description, task.state, serde_json::to_string(&task.indexes)?, task.created_at, task.updated_at])?;
         set_dependencies_tx(&tx, &self.partition, &task.id, &input.depends_on)?;
+        append_task_notes_tx(&tx, &self.partition, &task.id, &input.notes)?;
         tx.commit()?;
         Ok(task)
     }
@@ -1413,6 +1423,9 @@ impl PiTaskerStore {
         if let Some(v) = input.indexes {
             task.indexes = v;
         }
+        // Pi's `active` flag mutates only the service snapshot's activeTaskId;
+        // it is deliberately not represented in SQL. See UpdateTask::active.
+        let _active_selection = input.active;
         task.updated_at = now_ms();
         tx.execute("UPDATE tasks SET title=?1,description=?2,state=?3,feature_id=?4,indexes=?5,updated_at=?6 WHERE id=?7 AND list_id=?8 AND project_root=?9", params![task.title, task.description, task.state, task.feature_id, serde_json::to_string(&task.indexes)?, task.updated_at, task.id, self.partition.list_id, self.partition.project_root])?;
         if task.state == "done" {
@@ -1424,6 +1437,11 @@ impl PiTaskerStore {
                 "UPDATE task_claims SET released_at=?1, release_reason='task_done' WHERE task_id=?2 AND list_id=?3 AND project_root=?4 AND released_at IS NULL",
                 params![task.updated_at, task.id, self.partition.list_id, self.partition.project_root],
             )?;
+        }
+        if input.clear_dependencies {
+            set_dependencies_tx(&tx, &self.partition, &task.id, &[])?;
+        } else if let Some(depends_on) = input.depends_on {
+            set_dependencies_tx(&tx, &self.partition, &task.id, &depends_on)?;
         }
         tx.commit()?;
         Ok(task)
@@ -4676,5 +4694,88 @@ mod tests {
             store.feature_gates(&feature.id).unwrap()[2].status,
             "passed"
         );
+    }
+
+    #[test]
+    fn create_task_accepts_dependencies_and_notes_in_one_transaction() {
+        let mut store = temp_store();
+        let prerequisite = store
+            .create_task(CreateTask {
+                title: "Prerequisite".into(),
+                ..CreateTask::default()
+            })
+            .unwrap();
+
+        let task = store
+            .create_task(CreateTask {
+                title: "Dependent".into(),
+                depends_on: vec![prerequisite.id.clone()],
+                notes: vec![NoteInput {
+                    content: "Inline note".into(),
+                    category: Some("context".into()),
+                }],
+                ..CreateTask::default()
+            })
+            .unwrap();
+
+        let deps = store.list_dependencies().unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].task_id, task.id);
+        assert_eq!(deps[0].depends_on_id, prerequisite.id);
+        let notes = store.list_task_notes().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].task_id, task.id);
+        assert_eq!(notes[0].content, "Inline note");
+    }
+
+    #[test]
+    fn update_task_replaces_and_clears_dependencies_without_persisting_active_selection() {
+        let mut store = temp_store();
+        let dep_a = store
+            .create_task(CreateTask {
+                title: "A".into(),
+                ..CreateTask::default()
+            })
+            .unwrap();
+        let dep_b = store
+            .create_task(CreateTask {
+                title: "B".into(),
+                ..CreateTask::default()
+            })
+            .unwrap();
+        let task = store
+            .create_task(CreateTask {
+                title: "Task".into(),
+                depends_on: vec![dep_a.id.clone()],
+                ..CreateTask::default()
+            })
+            .unwrap();
+
+        store
+            .update_task(
+                &task.id,
+                UpdateTask {
+                    depends_on: Some(vec![dep_b.id.clone()]),
+                    active: Some(true),
+                    ..UpdateTask::default()
+                },
+            )
+            .unwrap();
+        let deps = store.list_dependencies().unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on_id, dep_b.id);
+        assert_eq!(store.snapshot().unwrap().tasks.len(), 3);
+
+        store
+            .update_task(
+                &task.id,
+                UpdateTask {
+                    clear_dependencies: true,
+                    active: Some(false),
+                    ..UpdateTask::default()
+                },
+            )
+            .unwrap();
+        assert!(store.list_dependencies().unwrap().is_empty());
     }
 }

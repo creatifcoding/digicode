@@ -1,12 +1,14 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use jcode_tasker_pi::{
-    BatchOperation, ClaimTaskInput, CreateFeature, CreateTask, FeaturePlanFeature,
-    FeaturePlanInput, NextWorkUnitInput, PiTaskerStore, PlanTask, ProjectPartition,
-    ReleaseClaimInput, ResolveFeatureGate, Task, UpdateFeature, UpdateTask,
-    VisualArtifactCreateInput, VisualArtifactQueryInput, WorkContextInput,
+    BatchOperation, ClaimTaskInput, CreateFeature, CreateTask, FeatureGateCheckMode,
+    FeatureGateCheckResult, FeaturePlanFeature, FeaturePlanInput, GateResolver, NextWorkUnitInput,
+    NoteInput, PiTaskerStore, PlanTask, ProjectPartition, ReleaseClaimInput, ResolveFeatureGate,
+    Task, UpdateFeature, UpdateTask, VisualArtifactCreateInput, VisualArtifactQueryInput,
+    WorkContextInput,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -80,6 +82,8 @@ struct TaskerInput {
     #[serde(default)]
     depends_on_task_id: Option<String>,
     #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
     state: Option<String>,
     #[serde(default)]
     priority: Option<String>,
@@ -116,6 +120,8 @@ struct TaskerInput {
     #[serde(default)]
     operations: Option<Vec<BatchOperation>>,
     #[serde(default)]
+    notes: Vec<NoteInput>,
+    #[serde(default)]
     tasks: Option<Vec<PlanTask>>,
     #[serde(default)]
     claim_id: Option<String>,
@@ -132,9 +138,15 @@ struct TaskerInput {
     #[serde(default)]
     set_active: Option<bool>,
     #[serde(default)]
+    active: Option<bool>,
+    #[serde(default)]
+    clear_dependencies: bool,
+    #[serde(default)]
     gate_index: Option<usize>,
     #[serde(default)]
     gate_status: Option<String>,
+    #[serde(default)]
+    gate_action: Option<String>,
     #[serde(default)]
     resolved_by: Option<String>,
     #[serde(default)]
@@ -224,6 +236,76 @@ fn provider_metadata(store: &PiTaskerStore) -> Result<Value> {
         "project_root": partition.project_root,
         "schema_fingerprint": store.schema_fingerprint()?,
     }))
+}
+
+fn last_lines(text: &str, n: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+fn execute_gate_resolver(
+    resolver: &GateResolver,
+    project_root: &std::path::Path,
+) -> Result<FeatureGateCheckResult> {
+    let start = Instant::now();
+    let (program, args, cwd, timeout_ms): (String, Vec<String>, PathBuf, Option<i64>) =
+        match resolver {
+            GateResolver::Command {
+                run, cwd, timeout, ..
+            } => (
+                "bash".into(),
+                vec!["-lc".into(), run.clone()],
+                cwd.as_ref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| project_root.to_path_buf()),
+                *timeout,
+            ),
+            GateResolver::Script { path, timeout } => {
+                let script = if std::path::Path::new(path).is_absolute() {
+                    PathBuf::from(path)
+                } else {
+                    project_root.join(path)
+                };
+                (
+                    "bash".into(),
+                    vec![script.to_string_lossy().into_owned()],
+                    project_root.to_path_buf(),
+                    *timeout,
+                )
+            }
+            GateResolver::Tool { .. } | GateResolver::Agent { .. } => {
+                return Err(anyhow!(
+                    "feature_gate automated resolver {:?} is not wired in jcode-tasker-pi yet; command/script resolvers are supported at the app boundary and the SQL store only applies typed results",
+                    resolver.kind()
+                ));
+            }
+        };
+    if timeout_ms.is_some() {
+        return Err(anyhow!(
+            "feature_gate command/script resolver timeout enforcement is not wired in this sync app boundary yet"
+        ));
+    }
+    let mut command = std::process::Command::new(program);
+    command.args(args).current_dir(cwd);
+    let output = command.output().context("execute gate resolver")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let full_log = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n---stderr---\n");
+    Ok(FeatureGateCheckResult {
+        status: if output.status.success() {
+            "passed".into()
+        } else {
+            "failed".into()
+        },
+        note: last_lines(&full_log, 50),
+        full_log,
+        exit_code: output.status.code().unwrap_or(1).into(),
+        duration_ms: start.elapsed().as_millis() as i64,
+    })
 }
 
 fn resolve_task(store: &PiTaskerStore, reference: String, action: &str) -> Result<String> {
@@ -322,6 +404,7 @@ impl Tool for TaskerTool {
                 "parent_feature_id": {"type": "string", "description": "Optional parent feature reference."},
                 "task_id": {"type": "string", "description": "Task reference: task_<id>, <number>, or #<number>."},
                 "depends_on_task_id": {"type": "string", "description": "Prerequisite task reference."},
+                "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Prerequisite task references. Pi-compatible plural form for create/update."},
                 "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done", "open", "active", "closed", "archived"]},
                 "priority": {"type": "string", "enum": ["low", "normal", "medium", "high", "critical"]},
                 "rank": {"type": "integer", "description": "Accepted for compatibility; Pi stores order as display_id."},
@@ -379,13 +462,17 @@ impl Tool for TaskerTool {
                     }
                 },
                 "claim_id": {"type": "string", "description": "Claim identifier returned by claim or next_work_unit."},
+                "notes": {"type": "array", "items": {"type": "object", "required": ["content"], "additionalProperties": false, "properties": {"content": {"type": "string"}, "category": {"type": "string"}}}},
                 "claim_kind": {"type": "string", "enum": ["claim", "hold", "lock"]},
                 "reason": {"type": "string"},
                 "lease_ms": {"type": "integer", "minimum": 1},
                 "release_all": {"type": "boolean"},
                 "work_priority": {"type": "integer", "description": "Queue priority for next_work_unit."},
                 "set_active": {"type": "boolean", "description": "Whether next_work_unit should activate a todo task. Defaults to true in Pi-compatible behavior."},
+                "active": {"type": "boolean", "description": "Accepted for Pi update compatibility. Pi activeTaskId is process-local snapshot state and is not persisted in SQL."},
+                "clear_dependencies": {"type": "boolean", "description": "Clear all dependencies on update before applying replacement dependencies."},
                 "gate_index": {"type": "integer", "minimum": 0, "description": "Zero-based feature gate index."},
+                "gate_action": {"type": "string", "enum": ["resolve", "check", "check-all"], "description": "Feature gate operation. Defaults to resolve."},
                 "gate_status": {"type": "string", "enum": ["pending", "passed", "failed"]},
                 "resolved_by": {"type": "string"},
                 "note": {"type": "string", "description": "Gate resolution note. Automated resolver evidence is retained separately by the store adapter."},
@@ -689,10 +776,13 @@ impl Tool for TaskerTool {
                         Some(reference) => Some(resolve_feature(store, reference, "create")?),
                         None => None,
                     };
-                    let depends_on = match params.depends_on_task_id {
+                    let mut depends_on = match params.depends_on_task_id {
                         Some(reference) => vec![resolve_task(store, reference, "create")?],
                         None => Vec::new(),
                     };
+                    for reference in params.depends_on {
+                        depends_on.push(resolve_task(store, reference, "create")?);
+                    }
                     let task = store.create_task(CreateTask {
                         title: required(params.title, "title", "create")?,
                         description: params.description,
@@ -700,6 +790,7 @@ impl Tool for TaskerTool {
                         feature_id,
                         indexes: params.indexes,
                         depends_on,
+                        notes: params.notes,
                     })?;
                     output(
                         format!("Created #{}", task.display_id),
@@ -846,7 +937,47 @@ impl Tool for TaskerTool {
                         required(params.feature_id, "feature_id", "feature_gate")?,
                         "feature_gate",
                     )?;
+                    let gate_action = params.gate_action.as_deref().unwrap_or("resolve");
+                    validate_enum(gate_action, &["resolve", "check", "check-all"], "gate_action")?;
+                    if gate_action == "check-all" {
+                        let project_root = PathBuf::from(store.partition().project_root.clone());
+                        let indexes = store.pending_executable_gate_indexes(&feature_id)?;
+                        let mut results = Vec::new();
+                        for index in indexes {
+                            let gate = store.feature_gate(&feature_id, index)?;
+                            let resolver = gate.resolver.as_ref().ok_or_else(|| anyhow!("gate {index} has no resolver"))?;
+                            let result = execute_gate_resolver(resolver, &project_root)?;
+                            let failed = result.status == "failed";
+                            results.push((index, result));
+                            if failed {
+                                break;
+                            }
+                        }
+                        let applied = store.apply_feature_gate_checks(
+                            &feature_id,
+                            results,
+                            FeatureGateCheckMode::FailFast,
+                        )?;
+                        return output(
+                            format!("Checked {} feature gates", applied.len()),
+                            with_base(json!({"feature_id": feature_id, "applied": applied})),
+                        );
+                    }
                     let gate_index = required(params.gate_index, "gate_index", "feature_gate")?;
+                    if gate_action == "check" {
+                        let project_root = PathBuf::from(store.partition().project_root.clone());
+                        let gate = store.feature_gate(&feature_id, gate_index)?;
+                        let resolver = gate.resolver.as_ref().ok_or_else(|| anyhow!("gate {gate_index} is manual and cannot be checked automatically"))?;
+                        if gate.status != "pending" {
+                            return Err(anyhow!("gate {gate_index} already {}", gate.status));
+                        }
+                        let result = execute_gate_resolver(resolver, &project_root)?;
+                        let applied = store.apply_feature_gate_check(&feature_id, gate_index, result)?;
+                        return output(
+                            format!("Checked feature gate {gate_index}"),
+                            with_base(json!({"feature_id": feature_id, "gate_index": gate_index, "applied": applied})),
+                        );
+                    }
                     let Some(status) = params.gate_status else {
                         let gate = store.feature_gate(&feature_id, gate_index)?;
                         return output(
@@ -1046,6 +1177,19 @@ impl Tool for TaskerTool {
                             state: params.state,
                             feature_id,
                             indexes: params.indexes,
+                            depends_on: if params.depends_on.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    params
+                                        .depends_on
+                                        .into_iter()
+                                        .map(|reference| resolve_task(store, reference, action.as_str()))
+                                        .collect::<Result<Vec<_>>>()?,
+                                )
+                            },
+                            clear_dependencies: params.clear_dependencies,
+                            active: params.active,
                         },
                     )?;
                     output(
