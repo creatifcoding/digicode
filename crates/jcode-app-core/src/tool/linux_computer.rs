@@ -217,7 +217,13 @@ mod tests {
             .await
             .expect("window discovery should use the active compositor backend");
 
-        assert!(output.metadata.is_some());
+        let metadata = output.metadata.expect("window list should be structured");
+        assert!(matches!(metadata["backend"].as_str(), Some("niri" | "i3")));
+        assert!(
+            metadata["windows"]
+                .as_array()
+                .is_some_and(|windows| !windows.is_empty())
+        );
     }
 
     #[tokio::test]
