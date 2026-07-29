@@ -149,6 +149,26 @@ struct TaskerInput {
     metadata: Option<Value>,
     #[serde(default)]
     created_by: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    depth: Option<usize>,
+    #[serde(default)]
+    max_depth: Option<usize>,
+    #[serde(default)]
+    max_paths: Option<usize>,
+    #[serde(default)]
+    include_tasks: Option<bool>,
+    #[serde(default)]
+    include_done: Option<bool>,
 }
 
 fn required<T>(value: Option<T>, field: &'static str, action: &str) -> Result<T> {
@@ -285,7 +305,9 @@ impl Tool for TaskerTool {
                         "status", "ready", "show", "create_feature", "create", "add_dependency", "set_state",
                         "list", "search", "update", "add_note", "feature_list", "feature_update", "feature_status",
                         "link", "unlink", "batch", "plan", "feature_plan", "claim", "release", "working_set", "next_work_unit", "feature_gate",
-                        "task_artifact_create", "task_artifacts", "task_stage_report"
+                        "task_artifact_create", "task_artifacts", "task_stage_report",
+                        "task_graph", "task_structure", "topology_summary", "topology_anomalies", "topology_paths", "topology_frontier",
+                        "feature_children", "task_neighbors", "feature_tree"
                     ]
                 },
                 "title": {"type": "string"},
@@ -365,6 +387,16 @@ impl Tool for TaskerTool {
                 "mime_type": {"type": "string"},
                 "metadata": {"type": "object"},
                 "created_by": {"type": "string"},
+                "from": {"type": "string"},
+                "to": {"type": "string"},
+                "domain": {"type": "string", "enum": ["task", "feature"]},
+                "mode": {"type": "string", "enum": ["shortest", "all_up_to_depth"]},
+                "direction": {"type": "string", "enum": ["upstream", "downstream", "both"]},
+                "depth": {"type": "integer", "minimum": 0, "maximum": 64},
+                "max_depth": {"type": "integer", "minimum": 1, "maximum": 64},
+                "max_paths": {"type": "integer", "minimum": 1, "maximum": 100},
+                "include_tasks": {"type": "boolean"},
+                "include_done": {"type": "boolean"},
                 "feature": {
                     "type": "object",
                     "description": "Root of an atomic Pi-compatible feature plan.",
@@ -476,6 +508,77 @@ impl Tool for TaskerTool {
                         })),
                     )
                 }
+                "task_graph" => output(
+                    "Task graph projection",
+                    with_base(json!({"projection": store.task_graph_projection(limit)?})),
+                ),
+                "task_structure" => output(
+                    "Task structure projection",
+                    with_base(json!({"projection": store.task_structure_projection(limit)?})),
+                ),
+                "topology_summary" => output(
+                    "Topology summary",
+                    with_base(json!({"projection": store.topology_summary_projection(limit)?})),
+                ),
+                "topology_anomalies" => output(
+                    "Topology anomalies",
+                    with_base(json!({"projection": store.topology_anomalies_projection(limit)?})),
+                ),
+                "topology_paths" => {
+                    let domain = params.domain.unwrap_or_else(|| "task".into());
+                    validate_enum(&domain, &["task", "feature"], "domain")?;
+                    let mode = params.mode.unwrap_or_else(|| "shortest".into());
+                    validate_enum(&mode, &["shortest", "all_up_to_depth"], "mode")?;
+                    let from = required(params.from, "from", "topology_paths")?;
+                    let to = required(params.to, "to", "topology_paths")?;
+                    output(
+                        "Topology paths",
+                        with_base(json!({"projection": store.topology_paths_projection(
+                            &from,
+                            &to,
+                            &domain,
+                            &mode,
+                            params.max_depth.unwrap_or(8),
+                            params.max_paths.unwrap_or(5),
+                        )?})),
+                    )
+                }
+                "topology_frontier" => output(
+                    "Topology frontier",
+                    with_base(json!({"projection": store.topology_frontier_projection(limit)?})),
+                ),
+                "feature_children" => output(
+                    "Feature children",
+                    with_base(json!({"projection": store.feature_children_projection(
+                        &required(params.feature_id, "feature_id", "feature_children")?,
+                        params.depth.unwrap_or(1),
+                        limit,
+                        params.include_tasks.unwrap_or(false),
+                    )?})),
+                ),
+                "task_neighbors" => {
+                    let direction = params.direction.unwrap_or_else(|| "both".into());
+                    validate_enum(&direction, &["upstream", "downstream", "both"], "direction")?;
+                    let task_id = required(params.task_id, "task_id", "task_neighbors")?;
+                    output(
+                        "Task neighbors",
+                        with_base(json!({"projection": store.task_neighbors_projection(
+                            &task_id,
+                            &direction,
+                            params.depth.unwrap_or(1),
+                            limit,
+                            params.include_done.unwrap_or(false),
+                        )?})),
+                    )
+                }
+                "feature_tree" => output(
+                    "Feature tree",
+                    with_base(json!({"projection": store.feature_tree_projection(
+                        params.depth.unwrap_or(2),
+                        limit,
+                        params.include_tasks.unwrap_or(false),
+                    )?})),
+                ),
                 "list" => {
                     if let Some(state) = params.state.as_deref() {
                         validate_enum(state, TASK_STATES, "state")?;
@@ -1337,6 +1440,56 @@ mod tests {
             task_id
         );
         assert_eq!(report["reportInput"]["stage"], "validate");
+    }
+
+    #[tokio::test]
+    async fn read_projection_actions_are_provider_safe_and_bounded() {
+        let (database_dir, tool) = temp_tool();
+        let root = database_dir.path();
+        let schema = tool.parameters_schema();
+        assert!(
+            schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "topology_paths")
+        );
+        assert_eq!(schema["properties"]["max_depth"]["maximum"], 64);
+        assert_eq!(schema["additionalProperties"], false);
+
+        let feature_output = tool
+            .execute(
+                json!({"action": "create_feature", "title": "Projection Root"}),
+                context(root),
+            )
+            .await
+            .unwrap();
+        let feature_id = feature_output.metadata["feature"]["id"].as_str().unwrap();
+
+        let task_output = tool
+            .execute(
+                json!({"action": "create", "title": "Projection Task", "feature_id": feature_id}),
+                context(root),
+            )
+            .await
+            .unwrap();
+        let task_id = task_output.metadata["task"]["id"].as_str().unwrap();
+
+        let graph = tool
+            .execute(json!({"action": "task_graph", "limit": 1}), context(root))
+            .await
+            .unwrap();
+        assert_eq!(graph.metadata["projection"]["limit"], 1);
+        assert_eq!(graph.metadata["projection"]["counts"]["tasks"], 1);
+
+        let neighbors = tool
+            .execute(
+                json!({"action": "task_neighbors", "task_id": task_id, "direction": "both", "depth": 1, "limit": 5}),
+                context(root),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.metadata["projection"]["nodeCount"], 1);
     }
 
     #[tokio::test]

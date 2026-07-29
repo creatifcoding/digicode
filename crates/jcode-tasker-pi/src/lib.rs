@@ -889,6 +889,99 @@ impl PiTaskerStore {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn task_graph_projection(&self, limit: usize) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        Ok(task_graph_projection_from_snapshot(&snapshot, limit))
+    }
+
+    pub fn task_structure_projection(&self, limit: usize) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        Ok(task_structure_projection_from_snapshot(&snapshot, limit))
+    }
+
+    pub fn topology_summary_projection(&self, limit: usize) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        Ok(topology_summary_projection_from_snapshot(&snapshot, limit))
+    }
+
+    pub fn topology_anomalies_projection(&self, limit: usize) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        Ok(topology_anomalies_projection_from_snapshot(
+            &snapshot, limit,
+        ))
+    }
+
+    pub fn topology_paths_projection(
+        &self,
+        from: &str,
+        to: &str,
+        domain: &str,
+        mode: &str,
+        max_depth: usize,
+        max_paths: usize,
+    ) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        topology_paths_projection_from_snapshot(
+            &snapshot, from, to, domain, mode, max_depth, max_paths,
+        )
+    }
+
+    pub fn topology_frontier_projection(&self, limit: usize) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        Ok(topology_frontier_projection_from_snapshot(&snapshot, limit))
+    }
+
+    pub fn feature_children_projection(
+        &self,
+        feature_ref: &str,
+        depth: usize,
+        limit: usize,
+        include_tasks: bool,
+    ) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        feature_children_projection_from_snapshot(
+            &snapshot,
+            feature_ref,
+            depth,
+            limit,
+            include_tasks,
+        )
+    }
+
+    pub fn task_neighbors_projection(
+        &self,
+        task_ref: &str,
+        direction: &str,
+        depth: usize,
+        limit: usize,
+        include_done: bool,
+    ) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        task_neighbors_projection_from_snapshot(
+            &snapshot,
+            task_ref,
+            direction,
+            depth,
+            limit,
+            include_done,
+        )
+    }
+
+    pub fn feature_tree_projection(
+        &self,
+        depth: usize,
+        limit: usize,
+        include_tasks: bool,
+    ) -> Result<serde_json::Value> {
+        let snapshot = self.snapshot()?;
+        Ok(feature_tree_projection_from_snapshot(
+            &snapshot,
+            depth,
+            limit,
+            include_tasks,
+        ))
+    }
+
     pub fn create_visual_artifact(
         &mut self,
         input: VisualArtifactCreateInput,
@@ -2048,6 +2141,365 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn bounded_count(limit: usize) -> usize {
+    limit.clamp(1, 500)
+}
+fn tiny_task(task: &Task) -> serde_json::Value {
+    serde_json::json!({"id": task.id, "displayId": task.display_id, "title": task.title, "state": task.state, "featureId": task.feature_id})
+}
+fn tiny_feature(feature: &Feature) -> serde_json::Value {
+    serde_json::json!({"id": feature.id, "displayId": feature.display_id, "title": feature.title, "state": feature.state, "parentFeatureId": feature.parent_feature_id, "depth": feature.depth})
+}
+fn sort_tasks(mut tasks: Vec<Task>) -> Vec<Task> {
+    tasks.sort_by(|a, b| {
+        a.display_id
+            .cmp(&b.display_id)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    tasks
+}
+fn sort_features(mut features: Vec<Feature>) -> Vec<Feature> {
+    features.sort_by(|a, b| {
+        a.display_id
+            .cmp(&b.display_id)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    features
+}
+fn task_graph_projection_from_snapshot(snapshot: &Snapshot, limit: usize) -> serde_json::Value {
+    let limit = bounded_count(limit);
+    let tasks = sort_tasks(snapshot.tasks.clone());
+    let deps = &snapshot.dependencies;
+    let nodes: Vec<_> = tasks.iter().take(limit).map(tiny_task).collect();
+    let edges: Vec<_> = deps
+        .iter()
+        .take(limit)
+        .map(|d| serde_json::json!({"id": d.id, "from": d.task_id, "to": d.depends_on_id}))
+        .collect();
+    serde_json::json!({"nodes":nodes,"edges":edges,"counts":{"tasks":tasks.len(),"dependencies":deps.len()},"limit":limit,"truncated":tasks.len()>limit||deps.len()>limit})
+}
+fn task_structure_projection_from_snapshot(snapshot: &Snapshot, limit: usize) -> serde_json::Value {
+    let limit = bounded_count(limit);
+    let tasks = sort_tasks(snapshot.tasks.clone());
+    let features = sort_features(snapshot.features.clone());
+    serde_json::json!({"features":features.iter().take(limit).map(tiny_feature).collect::<Vec<_>>(),"tasks":tasks.iter().take(limit).map(tiny_task).collect::<Vec<_>>(),"dependencies":snapshot.dependencies.iter().take(limit).collect::<Vec<_>>(),"featureDependencies":snapshot.feature_dependencies.iter().take(limit).collect::<Vec<_>>(),"counts":{"tasks":tasks.len(),"features":features.len(),"dependencies":snapshot.dependencies.len(),"featureDependencies":snapshot.feature_dependencies.len()},"limit":limit,"truncated":tasks.len()>limit||features.len()>limit||snapshot.dependencies.len()>limit||snapshot.feature_dependencies.len()>limit})
+}
+fn topology_anomalies_projection_from_snapshot(
+    snapshot: &Snapshot,
+    limit: usize,
+) -> serde_json::Value {
+    let limit = bounded_count(limit);
+    let task_ids: std::collections::BTreeSet<_> =
+        snapshot.tasks.iter().map(|t| t.id.clone()).collect();
+    let feature_ids: std::collections::BTreeSet<_> =
+        snapshot.features.iter().map(|f| f.id.clone()).collect();
+    let dangling_tasks: Vec<_> = snapshot
+        .tasks
+        .iter()
+        .filter(|t| {
+            t.feature_id
+                .as_ref()
+                .is_some_and(|id| !feature_ids.contains(id))
+        })
+        .map(|t| t.id.clone())
+        .collect();
+    let invalid_deps: Vec<_> = snapshot
+        .dependencies
+        .iter()
+        .filter(|d| !task_ids.contains(&d.task_id) || !task_ids.contains(&d.depends_on_id))
+        .map(|d| serde_json::json!({"taskId":d.task_id,"dependsOnId":d.depends_on_id}))
+        .collect();
+    let dangling_parent_feature_ids: Vec<_> = snapshot
+        .features
+        .iter()
+        .filter_map(|f| f.parent_feature_id.as_ref())
+        .filter(|id| !feature_ids.contains(*id))
+        .cloned()
+        .collect();
+    let total = dangling_tasks.len() + invalid_deps.len() + dangling_parent_feature_ids.len();
+    serde_json::json!({"anomalies":{"danglingTaskIds":{"items":dangling_tasks.iter().take(limit).collect::<Vec<_>>(),"total":dangling_tasks.len(),"returned":dangling_tasks.len().min(limit)},"invalidDependencyRefs":{"items":invalid_deps.iter().take(limit).collect::<Vec<_>>(),"total":invalid_deps.len(),"returned":invalid_deps.len().min(limit)},"danglingParentFeatureIds":{"items":dangling_parent_feature_ids.iter().take(limit).collect::<Vec<_>>(),"total":dangling_parent_feature_ids.len(),"returned":dangling_parent_feature_ids.len().min(limit)}},"totals":{"total":total,"truncated":total>limit},"limit":limit})
+}
+fn topology_summary_projection_from_snapshot(
+    snapshot: &Snapshot,
+    limit: usize,
+) -> serde_json::Value {
+    let anomalies = topology_anomalies_projection_from_snapshot(snapshot, limit);
+    serde_json::json!({"counts":{"tasks":snapshot.tasks.len(),"features":snapshot.features.len(),"dependencies":snapshot.dependencies.len(),"featureDependencies":snapshot.feature_dependencies.len()},"diagnosticsSummary":anomalies["totals"].clone(),"limit":bounded_count(limit)})
+}
+fn resolve_task_in_snapshot(snapshot: &Snapshot, r: &str) -> Option<String> {
+    resolve_task_id_from(&snapshot.tasks, r).ok().flatten()
+}
+fn resolve_feature_in_snapshot(snapshot: &Snapshot, r: &str) -> Option<String> {
+    resolve_feature_id_from(&snapshot.features, r)
+        .ok()
+        .flatten()
+}
+fn topology_paths_projection_from_snapshot(
+    snapshot: &Snapshot,
+    from: &str,
+    to: &str,
+    domain: &str,
+    mode: &str,
+    max_depth: usize,
+    max_paths: usize,
+) -> Result<serde_json::Value> {
+    let max_depth = max_depth.clamp(1, 64);
+    let max_paths = max_paths.clamp(1, 100);
+    let task_domain = domain != "feature";
+    let from_id = if task_domain {
+        resolve_task_in_snapshot(snapshot, from)
+    } else {
+        resolve_feature_in_snapshot(snapshot, from)
+    }
+    .ok_or_else(|| PiTaskerError::NotFound("from not found".into()))?;
+    let to_id = if task_domain {
+        resolve_task_in_snapshot(snapshot, to)
+    } else {
+        resolve_feature_in_snapshot(snapshot, to)
+    }
+    .ok_or_else(|| PiTaskerError::NotFound("to not found".into()))?;
+    let mut adj: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    if task_domain {
+        for d in &snapshot.dependencies {
+            adj.entry(d.task_id.clone())
+                .or_default()
+                .push(d.depends_on_id.clone());
+        }
+    } else {
+        for d in &snapshot.feature_dependencies {
+            adj.entry(d.feature_id.clone())
+                .or_default()
+                .push(d.depends_on_id.clone());
+        }
+    }
+    for v in adj.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    let mut paths: Vec<Vec<String>> = Vec::new();
+    if mode == "all_up_to_depth" {
+        fn walk(
+            cur: &str,
+            target: (&str, usize, usize),
+            adj: &std::collections::BTreeMap<String, Vec<String>>,
+            path: &mut Vec<String>,
+            seen: &mut std::collections::BTreeSet<String>,
+            out: &mut Vec<Vec<String>>,
+        ) {
+            let (to, max_depth, max_paths) = target;
+            if out.len() >= max_paths || path.len() > max_depth {
+                return;
+            }
+            if cur == to {
+                out.push(path.clone());
+                return;
+            }
+            for n in adj.get(cur).into_iter().flatten() {
+                if seen.insert(n.clone()) {
+                    path.push(n.clone());
+                    walk(n, target, adj, path, seen, out);
+                    path.pop();
+                    seen.remove(n);
+                }
+                if out.len() >= max_paths {
+                    return;
+                }
+            }
+        }
+        let mut p = vec![from_id.clone()];
+        let mut seen = std::collections::BTreeSet::from([from_id.clone()]);
+        walk(
+            &from_id,
+            (&to_id, max_depth, max_paths),
+            &adj,
+            &mut p,
+            &mut seen,
+            &mut paths,
+        );
+    } else {
+        let mut q = std::collections::VecDeque::from([vec![from_id.clone()]]);
+        let mut seen = std::collections::BTreeSet::from([from_id.clone()]);
+        while let Some(path) = q.pop_front() {
+            let cur = path.last().unwrap().clone();
+            if cur == to_id {
+                paths.push(path);
+                break;
+            }
+            if path.len() > max_depth {
+                continue;
+            }
+            for n in adj.get(&cur).into_iter().flatten() {
+                if seen.insert(n.clone()) {
+                    let mut next = path.clone();
+                    next.push(n.clone());
+                    q.push_back(next);
+                }
+            }
+        }
+    }
+    Ok(
+        serde_json::json!({"domain":if task_domain{"task"}else{"feature"},"mode":mode,"from":{"id":from_id},"to":{"id":to_id},"maxDepth":max_depth,"maxPaths":max_paths,"foundPaths":paths.len(),"truncated":mode=="all_up_to_depth"&&paths.len()>=max_paths,"paths":paths}),
+    )
+}
+fn topology_frontier_projection_from_snapshot(
+    snapshot: &Snapshot,
+    limit: usize,
+) -> serde_json::Value {
+    let limit = bounded_count(limit);
+    let ready = compute_ready_tasks(snapshot.tasks.clone(), snapshot.dependencies.clone());
+    let ready_ids: std::collections::BTreeSet<_> = ready.iter().map(|t| t.id.clone()).collect();
+    let blocked: Vec<_> = sort_tasks(snapshot.tasks.clone())
+        .into_iter()
+        .filter(|t| t.state != "done" && !ready_ids.contains(&t.id))
+        .collect();
+    let wip: Vec<_> = sort_tasks(snapshot.tasks.clone())
+        .into_iter()
+        .filter(|t| t.state == "in_progress")
+        .collect();
+    serde_json::json!({"buckets":{"ready":ready.iter().take(limit).map(tiny_task).collect::<Vec<_>>(),"blocked":blocked.iter().take(limit).map(tiny_task).collect::<Vec<_>>(),"inProgress":wip.iter().take(limit).map(tiny_task).collect::<Vec<_>>()},"counts":{"ready":ready.len(),"blocked":blocked.len(),"inProgress":wip.len(),"done":snapshot.tasks.iter().filter(|t|t.state=="done").count()},"limit":limit,"truncated":ready.len()>limit||blocked.len()>limit||wip.len()>limit})
+}
+fn feature_children_projection_from_snapshot(
+    snapshot: &Snapshot,
+    feature_ref: &str,
+    depth: usize,
+    limit: usize,
+    include_tasks: bool,
+) -> Result<serde_json::Value> {
+    let root = resolve_feature_in_snapshot(snapshot, feature_ref)
+        .ok_or_else(|| PiTaskerError::NotFound("Feature not found".into()))?;
+    let limit = bounded_count(limit);
+    let mut out = Vec::new();
+    let mut q = std::collections::VecDeque::from([(root.clone(), 0usize)]);
+    while let Some((id, d)) = q.pop_front() {
+        if out.len() >= limit {
+            break;
+        }
+        let children = sort_features(
+            snapshot
+                .features
+                .iter()
+                .filter(|f| f.parent_feature_id.as_deref() == Some(&id))
+                .cloned()
+                .collect(),
+        );
+        for c in &children {
+            if d < depth {
+                q.push_back((c.id.clone(), d + 1));
+            }
+        }
+        let tasks = if include_tasks {
+            sort_tasks(
+                snapshot
+                    .tasks
+                    .iter()
+                    .filter(|t| t.feature_id.as_deref() == Some(&id))
+                    .cloned()
+                    .collect(),
+            )
+            .iter()
+            .map(tiny_task)
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        out.push(serde_json::json!({"parentFeatureId":id,"depth":d,"featureChildren":children.iter().take(limit).map(tiny_feature).collect::<Vec<_>>(),"taskChildren":tasks,"expanded":d<depth}));
+    }
+    Ok(
+        serde_json::json!({"root":{"id":root},"depthLimit":depth,"includeTasks":include_tasks,"entries":out,"returnedEntries":out.len(),"limit":limit,"truncated":out.len()>=limit}),
+    )
+}
+fn task_neighbors_projection_from_snapshot(
+    snapshot: &Snapshot,
+    task_ref: &str,
+    direction: &str,
+    depth: usize,
+    limit: usize,
+    include_done: bool,
+) -> Result<serde_json::Value> {
+    let origin = resolve_task_in_snapshot(snapshot, task_ref)
+        .ok_or_else(|| PiTaskerError::NotFound("Task not found".into()))?;
+    let limit = bounded_count(limit);
+    let task_map: std::collections::BTreeMap<_, _> =
+        snapshot.tasks.iter().map(|t| (t.id.clone(), t)).collect();
+    let mut nodes = std::collections::BTreeSet::from([origin.clone()]);
+    let mut edges = Vec::new();
+    let mut q = std::collections::VecDeque::from([(origin.clone(), 0usize)]);
+    while let Some((id, d)) = q.pop_front() {
+        if d >= depth || nodes.len() >= limit {
+            continue;
+        }
+        for dep in &snapshot.dependencies {
+            let cand = if (direction == "upstream" || direction == "both") && dep.task_id == id {
+                Some((
+                    dep.depends_on_id.clone(),
+                    dep.task_id.clone(),
+                    dep.depends_on_id.clone(),
+                    "upstream",
+                ))
+            } else if (direction == "downstream" || direction == "both") && dep.depends_on_id == id
+            {
+                Some((
+                    dep.task_id.clone(),
+                    dep.depends_on_id.clone(),
+                    dep.task_id.clone(),
+                    "downstream",
+                ))
+            } else {
+                None
+            };
+            if let Some(((nid, from, to, kind), t)) =
+                cand.and_then(|candidate| task_map.get(&candidate.0).map(|task| (candidate, *task)))
+            {
+                if !include_done && t.state == "done" {
+                    continue;
+                }
+                edges.push(serde_json::json!({"kind":kind,"from":{"id":from},"to":{"id":to}}));
+                if nodes.insert(nid.clone()) {
+                    q.push_back((nid, d + 1));
+                }
+            }
+        }
+    }
+    let node_values: Vec<_> = nodes
+        .iter()
+        .filter_map(|id| task_map.get(id).map(|t| tiny_task(t)))
+        .take(limit)
+        .collect();
+    Ok(
+        serde_json::json!({"origin":{"id":origin},"direction":direction,"depthLimit":depth,"includeDone":include_done,"nodes":node_values,"edges":edges.into_iter().take(limit).collect::<Vec<_>>(),"nodeCount":nodes.len().min(limit),"limit":limit,"truncated":nodes.len()>limit}),
+    )
+}
+fn feature_tree_projection_from_snapshot(
+    snapshot: &Snapshot,
+    depth: usize,
+    limit: usize,
+    include_tasks: bool,
+) -> serde_json::Value {
+    let limit = bounded_count(limit);
+    let roots = sort_features(
+        snapshot
+            .features
+            .iter()
+            .filter(|f| f.parent_feature_id.is_none())
+            .cloned()
+            .collect(),
+    );
+    let mut entries = Vec::new();
+    for root in roots.iter().take(limit) {
+        if let Ok(branch) = feature_children_projection_from_snapshot(
+            snapshot,
+            &root.id,
+            depth,
+            limit,
+            include_tasks,
+        ) {
+            entries.push(branch);
+        }
+    }
+    serde_json::json!({"roots":roots.iter().take(limit).map(tiny_feature).collect::<Vec<_>>(),"branches":entries,"totalRoots":roots.len(),"limit":limit,"truncated":roots.len()>limit})
+}
+
 fn load_features_tx(tx: &rusqlite::Transaction<'_>, p: &ProjectPartition) -> Result<Vec<Feature>> {
     let mut stmt = tx.prepare("SELECT id,list_id,project_root,display_id,parent_feature_id,title,description,state,priority,tags,brief,acceptance,owner,gates,indexes,depth,created_at,updated_at FROM features WHERE list_id=?1 AND project_root=?2 ORDER BY display_id ASC")?;
     Ok(stmt
@@ -3067,6 +3519,57 @@ mod tests {
             leaf_id_at_start: Some("leaf-start".into()),
             current_leaf_id: Some("leaf-current".into()),
         }
+    }
+
+    #[test]
+    fn bounded_topology_projections_are_snapshot_derived() {
+        let mut store = temp_store();
+        let root = store.create_feature(feature_input("Root")).unwrap();
+        let child = store
+            .create_feature(CreateFeature {
+                title: "Child".into(),
+                parent_feature_id: Some(root.id.clone()),
+                ..feature_input("Child")
+            })
+            .unwrap();
+        let first = store
+            .create_task(CreateTask {
+                title: "First".into(),
+                feature_id: Some(root.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let second = store
+            .create_task(CreateTask {
+                title: "Second".into(),
+                feature_id: Some(child.id.clone()),
+                depends_on: vec![first.id.clone()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let graph = store.task_graph_projection(1).unwrap();
+        assert_eq!(graph["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(graph["counts"]["tasks"], 2);
+        assert_eq!(graph["truncated"], true);
+
+        let paths = store
+            .topology_paths_projection(&second.id, &first.id, "task", "shortest", 8, 5)
+            .unwrap();
+        assert_eq!(paths["foundPaths"], 1);
+        assert_eq!(paths["paths"][0][0], second.id);
+        assert_eq!(paths["paths"][0][1], first.id);
+
+        let children = store
+            .feature_children_projection(&root.id, 1, 10, true)
+            .unwrap();
+        assert_eq!(children["returnedEntries"], 2);
+        assert_eq!(children["includeTasks"], true);
+
+        let neighbors = store
+            .task_neighbors_projection(&first.id, "downstream", 1, 10, false)
+            .unwrap();
+        assert_eq!(neighbors["nodeCount"], 2);
     }
 
     #[test]
