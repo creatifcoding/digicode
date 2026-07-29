@@ -60,6 +60,9 @@ const LEGACY_INDEX_FILE_NAME: &str = "session_search_recent_index_v1.json";
 #[derive(Debug, Deserialize)]
 struct SearchInput {
     query: String,
+    /// Open one returned result in the read-only transcript inspector. One-based.
+    #[serde(default)]
+    open_result: Option<i64>,
     #[serde(default)]
     working_dir: Option<String>,
     #[serde(default)]
@@ -307,6 +310,12 @@ impl Tool for SessionSearchTool {
                     "type": "string",
                     "description": "Search query. Use distinctive keywords; stop-word-only queries are rejected."
                 },
+                "open_result": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_LIMIT,
+                    "description": "After searching, open this one-based result in the read-only transcript inspector. The agent may set this after identifying the intended hit."
+                },
                 "working_dir": {
                     "type": "string",
                     "description": "Restrict results to sessions whose working directory matches this path or path prefix. Matching is normalized and case-insensitive."
@@ -526,10 +535,23 @@ impl Tool for SessionSearchTool {
                 .with_title("session_search"));
         }
 
+        let open_result = match params.open_result {
+            Some(value) if value < 1 || value as usize > report.results.len() => {
+                return Ok(ToolOutput::new(format!(
+                    "open_result must be between 1 and {} for this search.",
+                    report.results.len()
+                ))
+                .with_title("session_search"));
+            }
+            Some(value) => Some(value as usize),
+            None => None,
+        };
+
         let metadata = json!({
             "kind": "session_search_results",
             "query": params.query.trim(),
             "report": report,
+            "open_result": open_result,
         });
 
         Ok(

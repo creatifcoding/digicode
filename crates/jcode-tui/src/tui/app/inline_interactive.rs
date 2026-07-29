@@ -2196,9 +2196,9 @@ impl App {
         self.start_session_picker_load();
     }
 
-    pub(crate) fn record_session_search_metadata(&mut self, metadata: &serde_json::Value) {
+    pub(crate) fn record_session_search_metadata(&mut self, metadata: &serde_json::Value) -> bool {
         if metadata.get("kind").and_then(|v| v.as_str()) != Some("session_search_results") {
-            return;
+            return false;
         }
         let query = metadata
             .get("query")
@@ -2206,7 +2206,24 @@ impl App {
             .unwrap_or("")
             .trim()
             .to_string();
-        let session_ids = metadata
+        let open_result = metadata
+            .get("open_result")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        let selected_session_id =
+            open_result
+                .and_then(|value| value.checked_sub(1))
+                .and_then(|selected| {
+                    metadata
+                        .get("report")
+                        .and_then(|value| value.get("results"))
+                        .and_then(|value| value.as_array())
+                        .and_then(|results| results.get(selected))
+                        .and_then(|result| result.get("session_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                });
+        let mut session_ids = metadata
             .get("report")
             .and_then(|v| v.get("results"))
             .and_then(|v| v.as_array())
@@ -2222,10 +2239,19 @@ impl App {
                 ids
             })
             .unwrap_or_else(Vec::new);
+        if let Some(selected_session_id) = selected_session_id
+            && let Some(selected) = session_ids
+                .iter()
+                .position(|session_id| session_id == &selected_session_id)
+        {
+            session_ids.swap(0, selected);
+        }
         if !query.is_empty() && !session_ids.is_empty() {
             self.latest_session_search_hits =
                 Some(super::LatestSessionSearchHits { query, session_ids });
+            return open_result.is_some();
         }
+        false
     }
 
     pub(super) fn open_latest_session_search_hits(&mut self) {
