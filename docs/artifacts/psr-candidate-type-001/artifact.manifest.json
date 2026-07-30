@@ -1,0 +1,40 @@
+{
+  "schema": "https://digimasons.dev/schemas/artifact-library/artifact-manifest.proposed.v1.json",
+  "artifactId": "psr.artifact-library.candidate-type-001",
+  "artifactType": "psr",
+  "candidateType": "001",
+  "status": "dogfood-candidate",
+  "title": "Artifact Library PSR Candidate Type 001",
+  "summary": "A portable Product-Semantic Record bundle for dogfooding the planned Artifact Library store.",
+  "claimTiers": {
+    "observed": [
+      "The packet contains Markdown, manifests, revision notes, rendered HTML, and a seed script reference.",
+      "The packet is repository-local and reviewable without a live server."
+    ],
+    "proposed": [
+      "The future artifact-store CLI should ingest this packet atomically.",
+      "The artifact server/store should emit a durable receipt after successful ingestion."
+    ],
+    "blocked": [
+      "Live ingestion is blocked until the planned artifact-store CLI exists."
+    ]
+  },
+  "files": [
+    { "path": "psr.md", "role": "source", "mediaType": "text/markdown" },
+    { "path": "artifact.manifest.json", "role": "artifact-manifest", "mediaType": "application/json" },
+    { "path": "candidate.manifest.json", "role": "candidate-manifest", "mediaType": "application/json" },
+    { "path": "revisions.md", "role": "revision-annotation", "mediaType": "text/markdown" },
+    { "path": "rendered.html", "role": "rendered-preview", "mediaType": "text/html" }
+  ],
+  "rendering": {
+    "language": "rojo-brutalist",
+    "entry": "rendered.html",
+    "standalone": true,
+    "externalNetworkRequired": false
+  },
+  "provenance": {
+    "authoredAt": "2026-07-30T16:55:22Z",
+    "authoredFor": "Candidate Type 001 dogfood material",
+    "sourcePath": "examples/artifact-library/psr-candidate-type-001"
+  }
+}

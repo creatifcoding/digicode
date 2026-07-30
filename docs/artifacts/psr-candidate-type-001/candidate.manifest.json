@@ -1,0 +1,48 @@
+{
+  "schema": "https://digimasons.dev/schemas/artifact-library/candidate-manifest.proposed.v1.json",
+  "candidateType": "001",
+  "candidateName": "PSR dogfood packet",
+  "artifactId": "psr.artifact-library.candidate-type-001",
+  "dogfoodStage": "source-packet",
+  "reviewStatus": "ready-for-local-review",
+  "acceptanceChecks": [
+    {
+      "id": "source-present",
+      "description": "PSR Markdown source exists.",
+      "tier": "observed",
+      "status": "passed"
+    },
+    {
+      "id": "json-parse",
+      "description": "Both manifests parse as JSON.",
+      "tier": "observed",
+      "status": "passed"
+    },
+    {
+      "id": "html-standalone",
+      "description": "Rendered HTML is self-contained and requires no network assets.",
+      "tier": "observed",
+      "status": "passed"
+    },
+    {
+      "id": "cli-ingestion",
+      "description": "The packet can be ingested by artifact-store seed and returns a receipt.",
+      "tier": "blocked",
+      "status": "blocked",
+      "blocker": "The planned CLI is not implemented in this change."
+    }
+  ],
+  "operations": {
+    "localDryRun": "./scripts/seed_psr_artifact.sh --dry-run",
+    "localStoreDryRun": "./scripts/seed_psr_artifact.sh --store ./var/artifact-store --dry-run",
+    "dockerDryRun": "docker run --rm -v \"$PWD:/workspace\" -w /workspace artifact-store:proposed ./scripts/seed_psr_artifact.sh --store /workspace/var/artifact-store --dry-run"
+  },
+  "pathOwnership": {
+    "allowed": [
+      "docs/artifacts/**",
+      "examples/artifact-library/**",
+      "scripts/seed_psr_artifact.sh"
+    ],
+    "rustCratesModified": false
+  }
+}
