@@ -2,6 +2,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use jcode_tasker_pi::{
@@ -285,8 +288,10 @@ fn execute_command_with_timeout(spec: ResolverCommandSpec) -> Result<FeatureGate
     if let Some(env) = &spec.env {
         command.envs(env);
     }
+    #[cfg(unix)]
+    command.process_group(0);
 
-    let mut child = command.with_context(|| {
+    let mut child = command.spawn().with_context(|| {
         format!(
             "spawn gate resolver command {} in {}",
             spec.program,
@@ -294,17 +299,34 @@ fn execute_command_with_timeout(spec: ResolverCommandSpec) -> Result<FeatureGate
         )
     })?;
 
-    let timed_out = match child
+    let (timed_out, status) = match child
         .wait_timeout(timeout)
         .context("wait for gate resolver command")?
     {
-        Some(_) => false,
+        Some(status) => (false, status),
         None => {
-            let _ = child.kill();
-            true
+            #[cfg(unix)]
+            {
+                // The resolver is its own process-group leader. Killing the group also
+                // terminates shell descendants that may still hold capture files open.
+                // SAFETY: `child.id()` is the live group leader created immediately above,
+                // and a negative pid intentionally targets only that process group.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
+            (
+                true,
+                child
+                    .wait()
+                    .context("reap timed-out gate resolver command")?,
+            )
         }
     };
-    let status = child.wait().context("reap gate resolver command")?;
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
     let mut full_log = [stdout.trim(), stderr.trim()]
