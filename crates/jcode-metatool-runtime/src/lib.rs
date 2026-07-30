@@ -1,7 +1,9 @@
 use std::{path::PathBuf, process::Stdio, time::Instant};
 
 use async_trait::async_trait;
-use jcode_metatool_types::{ExecutionOutcome, ExecutionRequest, ExecutionResult, MetaToolError};
+use jcode_metatool_types::{
+    ExecutionEffect, ExecutionOutcome, ExecutionRequest, ExecutionResult, MetaToolError,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
@@ -152,6 +154,7 @@ impl JavaScriptExecutor for AgentOsExecutor {
                     .duration_ms
                     .unwrap_or(started.elapsed().as_millis() as u64),
                 termination_reason: Some(format_error(error)),
+                effects: Vec::new(),
             });
         }
 
@@ -185,6 +188,16 @@ impl JavaScriptExecutor for AgentOsExecutor {
                         .join("; ")
                 })
                 .filter(|joined| !joined.is_empty());
+            let effects = envelope["effects"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(serde_json::from_value::<ExecutionEffect>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| MetaToolError::Execution {
+                    message: format!("codemode guest returned invalid capability effects: {error}"),
+                })?;
             if ok {
                 return Ok(ExecutionResult {
                     id: request.id,
@@ -193,6 +206,7 @@ impl JavaScriptExecutor for AgentOsExecutor {
                     output: envelope["output"].as_str().unwrap_or_default().to_owned(),
                     duration_ms,
                     termination_reason: warnings,
+                    effects,
                 });
             }
             let message = envelope["error"]
@@ -206,6 +220,7 @@ impl JavaScriptExecutor for AgentOsExecutor {
                 output: String::new(),
                 duration_ms,
                 termination_reason: Some(message),
+                effects: Vec::new(),
             });
         }
 
@@ -234,6 +249,7 @@ impl JavaScriptExecutor for AgentOsExecutor {
                 .duration_ms
                 .unwrap_or(started.elapsed().as_millis() as u64),
             termination_reason: result.error.map(format_error),
+            effects: Vec::new(),
         })
     }
 }
@@ -325,6 +341,10 @@ mod tests {
         assert!(SIDECAR_SOURCE.contains("llm: disabledProvider(\"llm\")"));
         assert!(SIDECAR_SOURCE.contains("llm_batch: disabledProvider(\"llm_batch\")"));
         assert!(SIDECAR_SOURCE.contains("provider authority is brokered"));
+        assert!(SIDECAR_SOURCE.contains("createTaskerCapability"));
+        assert!(SIDECAR_SOURCE.contains("mt.tasker permits one atomic reconciliation"));
+        assert!(SIDECAR_SOURCE.contains("expected_snapshot_hash"));
+        assert!(SIDECAR_SOURCE.contains("effects.push(effect)"));
     }
 
     #[test]

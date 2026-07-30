@@ -3,7 +3,9 @@
   "notes": [
     "inputs is the JSON object passed to the call; history(n) returns recent call history entries.",
     "read/write/sh/exec operate on the GUEST filesystem (cwd /data, the durable workspace store mount), not the host repo.",
-    "Store data should include _meta: { summary } for catalog discipline."
+    "Store data should include _meta: { summary } for catalog discipline.",
+    "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot and may emit one atomic reconciliation effect; guest code never receives the database handle.",
+    "Use tasker_mode plan before apply when inspecting a new reconciliation. The host verifies the snapshot hash again before any apply."
   ],
   "undeclared": [
     "exec",
@@ -176,6 +178,40 @@
       {
         "name": "write",
         "signature": "async (path, content) → void"
+      }
+    ],
+    "tasker-capability": [
+      {
+        "name": "tasker.status",
+        "signature": "() → {mode, snapshotHash, counts, truncated}"
+      },
+      {
+        "name": "tasker.list",
+        "signature": "(options?) → Task[]"
+      },
+      {
+        "name": "tasker.ready",
+        "signature": "(limit?) → Task[]"
+      },
+      {
+        "name": "tasker.features",
+        "signature": "(options?) → Feature[]"
+      },
+      {
+        "name": "tasker.batch",
+        "signature": "async (operations) → ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.plan",
+        "signature": "async (tasks) → ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.featurePlan",
+        "signature": "async (feature) → ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.reconcile",
+        "signature": "async ({kind, payload}) → ReconciliationReceipt"
       }
     ]
   }

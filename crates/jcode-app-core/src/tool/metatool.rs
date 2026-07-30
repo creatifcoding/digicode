@@ -7,10 +7,15 @@ use jcode_metatool_runtime::{
     JavaScriptExecutor, SIDECAR_SOURCE,
 };
 use jcode_metatool_types::{
-    ExecutionId, ExecutionLimits, ExecutionProfile, ExecutionRequest, MetaToolError,
+    ExecutionEffect, ExecutionId, ExecutionLimits, ExecutionProfile, ExecutionRequest,
+    MetaToolError,
 };
-use serde::Deserialize;
+use jcode_tasker_pi::{
+    BatchOperation, FeaturePlanFeature, FeaturePlanInput, PiTaskerStore, PlanTask, ProjectPartition,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -27,15 +32,18 @@ const GUIDE_SOURCE: &str = include_str!(concat!(
 ));
 const MAX_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const TASKER_SNAPSHOT_LIMIT: usize = 500;
 
 pub struct MetaTool {
     store_root_override: Option<PathBuf>,
+    tasker_database_path_override: Option<PathBuf>,
 }
 
 impl MetaTool {
     pub fn new() -> Self {
         Self {
             store_root_override: None,
+            tasker_database_path_override: None,
         }
     }
 
@@ -43,7 +51,22 @@ impl MetaTool {
     fn with_store_root(store_root: PathBuf) -> Self {
         Self {
             store_root_override: Some(store_root),
+            tasker_database_path_override: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_store_and_tasker_roots(store_root: PathBuf, tasker_database_path: PathBuf) -> Self {
+        Self {
+            store_root_override: Some(store_root),
+            tasker_database_path_override: Some(tasker_database_path),
+        }
+    }
+
+    fn tasker_database_path(&self) -> PathBuf {
+        self.tasker_database_path_override
+            .clone()
+            .unwrap_or_else(jcode_tasker_pi::default_db_path)
     }
 
     /// Workspace-scoped durable store directory: the guest's /data mount is
@@ -210,6 +233,19 @@ impl MetaTool {
         })
         .map_err(anyhow::Error::new)
     }
+
+    fn tasker_store(&self, ctx: &ToolContext) -> Result<PiTaskerStore> {
+        let root = ctx
+            .working_dir
+            .as_deref()
+            .ok_or_else(|| anyhow!("Tasker codemode requires a session working directory"))?;
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        PiTaskerStore::open(ProjectPartition::with_db_path(
+            self.tasker_database_path(),
+            canonical.to_string_lossy().into_owned(),
+        ))
+        .map_err(anyhow::Error::new)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,6 +259,25 @@ struct MetaToolInput {
     inputs: Value,
     #[serde(default = "default_profile")]
     profile: ExecutionProfile,
+    #[serde(default)]
+    tasker_mode: TaskerMode,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskerMode {
+    #[default]
+    Off,
+    Plan,
+    Apply,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskerEffectInput {
+    kind: String,
+    payload: Value,
+    mode: TaskerMode,
+    expected_snapshot_hash: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -242,6 +297,144 @@ fn default_profile() -> ExecutionProfile {
     ExecutionProfile::Pure
 }
 
+fn tasker_snapshot(store: &PiTaskerStore) -> Result<(Value, String)> {
+    let snapshot = store.snapshot()?;
+    let ready = store.ready_tasks()?;
+    let canonical = json!({
+        "list_meta": snapshot.list_meta,
+        "tasks": snapshot.tasks,
+        "dependencies": snapshot.dependencies,
+        "features": snapshot.features,
+        "feature_dependencies": snapshot.feature_dependencies,
+        "task_notes": snapshot.task_notes,
+        "feature_notes": snapshot.feature_notes,
+    });
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).context("serialize Tasker snapshot")?)
+    );
+    let tasks = canonical["tasks"].as_array().cloned().unwrap_or_default();
+    let features = canonical["features"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let partition = store.partition();
+    let bounded = json!({
+        "partition": {
+            "database_path": partition.db_path,
+            "project_root": partition.project_root,
+            "list_id": partition.list_id,
+        },
+        "schema_fingerprint": store.schema_fingerprint()?,
+        "counts": {
+            "tasks": tasks.len(),
+            "features": features.len(),
+            "dependencies": canonical["dependencies"].as_array().map_or(0, Vec::len),
+            "ready": ready.len(),
+        },
+        "tasks": tasks.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
+        "features": features.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
+        "ready": ready.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
+        "truncated": canonical["tasks"].as_array().is_some_and(|items| items.len() > TASKER_SNAPSHOT_LIMIT)
+            || canonical["features"].as_array().is_some_and(|items| items.len() > TASKER_SNAPSHOT_LIMIT),
+    });
+    Ok((bounded, hash))
+}
+
+fn reconcile_tasker_effects(
+    store: &mut PiTaskerStore,
+    effects: &[ExecutionEffect],
+    requested_mode: TaskerMode,
+    initial_snapshot_hash: &str,
+) -> Result<Value> {
+    if effects.is_empty() {
+        return Ok(json!({
+            "mode": requested_mode,
+            "status": "read_only",
+            "effect_count": 0,
+            "snapshot_hash": initial_snapshot_hash,
+        }));
+    }
+    if effects.len() != 1 {
+        return Err(anyhow!(
+            "Tasker codemode requires exactly one atomic reconciliation; received {} effects",
+            effects.len()
+        ));
+    }
+    let effect = &effects[0];
+    if effect.capability != "tasker" || effect.operation != "reconcile" {
+        return Err(anyhow!(
+            "unsupported MetaTool capability effect {}.{}",
+            effect.capability,
+            effect.operation
+        ));
+    }
+    let input: TaskerEffectInput = serde_json::from_value(effect.input.clone())?;
+    if input.mode != requested_mode {
+        return Err(anyhow!(
+            "Tasker capability mode {:?} does not match requested mode {:?}",
+            input.mode,
+            requested_mode
+        ));
+    }
+    if input.expected_snapshot_hash.as_deref() != Some(initial_snapshot_hash) {
+        return Err(anyhow!("Tasker capability snapshot identity mismatch"));
+    }
+
+    let planned = json!({
+        "mode": requested_mode,
+        "status": if requested_mode == TaskerMode::Plan { "planned" } else { "admitted" },
+        "kind": input.kind,
+        "snapshot_hash": initial_snapshot_hash,
+        "payload": input.payload,
+    });
+    if requested_mode == TaskerMode::Plan {
+        return Ok(planned);
+    }
+    if requested_mode != TaskerMode::Apply {
+        return Err(anyhow!("Tasker effects require tasker_mode plan or apply"));
+    }
+
+    let (_, current_hash) = tasker_snapshot(store)?;
+    if current_hash != initial_snapshot_hash {
+        return Err(anyhow!(
+            "Tasker state changed during codemode evaluation; rerun to reconcile against the current snapshot"
+        ));
+    }
+
+    let applied = match input.kind.as_str() {
+        "batch" => {
+            let operations: Vec<BatchOperation> =
+                serde_json::from_value(input.payload.get("operations").cloned().ok_or_else(
+                    || anyhow!("Tasker batch reconciliation requires payload.operations"),
+                )?)?;
+            serde_json::to_value(store.batch_execute(operations)?)?
+        }
+        "plan" => {
+            let tasks: Vec<PlanTask> =
+                serde_json::from_value(input.payload.get("tasks").cloned().ok_or_else(|| {
+                    anyhow!("Tasker plan reconciliation requires payload.tasks")
+                })?)?;
+            serde_json::to_value(store.plan_import(tasks)?)?
+        }
+        "feature_plan" => {
+            let feature: FeaturePlanFeature =
+                serde_json::from_value(input.payload.get("feature").cloned().ok_or_else(
+                    || anyhow!("Tasker feature-plan reconciliation requires payload.feature"),
+                )?)?;
+            serde_json::to_value(store.feature_plan_import(FeaturePlanInput { feature })?)?
+        }
+        other => return Err(anyhow!("unsupported Tasker reconciliation kind: {other}")),
+    };
+    Ok(json!({
+        "mode": requested_mode,
+        "status": "applied",
+        "kind": input.kind,
+        "snapshot_hash": initial_snapshot_hash,
+        "result": applied,
+    }))
+}
+
 fn output(title: impl Into<String>, metadata: Value) -> Result<ToolOutput> {
     Ok(ToolOutput::new(serde_json::to_string_pretty(&metadata)?)
         .with_title(title)
@@ -255,7 +448,7 @@ impl Tool for MetaTool {
     }
 
     fn description(&self) -> &str {
-        "Run codemode JavaScript through Jcode's native MetaTool: your code executes inside a sandboxed AgentOS runtime with a live `mt` object offering the full metatool engine (durable workspace store: mt.put/get/query/search/collections, fluent mt.from/mt.into builders, procedures, catalog). State persists across calls in a workspace-scoped store. Use action=status to inspect availability."
+        "Run codemode JavaScript through Jcode's native MetaTool: your code executes inside a sandboxed AgentOS runtime with a live `mt` object offering the full metatool engine and an optional governed `mt.tasker` capability. Tasker plan/apply effects are reconciled atomically by the host against the canonical Pi-compatible database; the guest never receives direct host authority."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -278,6 +471,11 @@ impl Tool for MetaTool {
                     "type": "string",
                     "enum": ["pure", "workspace-read", "workspace-mutate"],
                     "description": "Execution profile. Defaults to pure; only pure is currently executable."
+                },
+                "tasker_mode": {
+                    "type": "string",
+                    "enum": ["off", "plan", "apply"],
+                    "description": "Optional native Tasker capability. plan returns a deterministic change set without writing; apply admits one atomic mt.tasker.batch/plan/featurePlan reconciliation against the canonical Pi-compatible database."
                 }
             }
         })
@@ -313,6 +511,22 @@ impl Tool for MetaTool {
                     return Err(anyhow!("inputs exceed the {MAX_INPUT_BYTES}-byte limit"));
                 }
                 let store_root = self.store_root(&ctx)?;
+                let tasker_context = if params.tasker_mode == TaskerMode::Off {
+                    None
+                } else {
+                    let store = self.tasker_store(&ctx)?;
+                    let (snapshot, snapshot_hash) = tasker_snapshot(&store)?;
+                    Some((snapshot, snapshot_hash))
+                };
+                let capabilities = tasker_context.as_ref().map(|(snapshot, snapshot_hash)| {
+                    json!({
+                        "tasker": {
+                            "mode": params.tasker_mode,
+                            "snapshot": snapshot,
+                            "snapshot_hash": snapshot_hash,
+                        }
+                    })
+                });
                 let request = ExecutionRequest {
                     id: ExecutionId::new(),
                     source,
@@ -320,11 +534,46 @@ impl Tool for MetaTool {
                     profile: ExecutionProfile::Pure,
                     limits: ExecutionLimits::default(),
                     store_root: Some(store_root.to_string_lossy().into_owned()),
+                    capabilities,
                 };
                 let result = Self::executor()?.execute(request).await?;
+                let reconciliation = match tasker_context {
+                    Some((_, snapshot_hash)) => {
+                        let database_path = self.tasker_database_path();
+                        let project_root = ctx.working_dir.clone().ok_or_else(|| {
+                            anyhow!("Tasker codemode requires a working directory")
+                        })?;
+                        let effects = result.effects.clone();
+                        let mode = params.tasker_mode;
+                        Some(
+                            tokio::task::spawn_blocking(move || {
+                                let canonical =
+                                    std::fs::canonicalize(&project_root).unwrap_or(project_root);
+                                let mut store =
+                                    PiTaskerStore::open(ProjectPartition::with_db_path(
+                                        database_path,
+                                        canonical.to_string_lossy().into_owned(),
+                                    ))?;
+                                reconcile_tasker_effects(&mut store, &effects, mode, &snapshot_hash)
+                            })
+                            .await
+                            .context("join Tasker codemode reconciler")??,
+                        )
+                    }
+                    None if result.effects.is_empty() => None,
+                    None => {
+                        return Err(anyhow!(
+                            "MetaTool guest emitted capability effects while tasker_mode was off"
+                        ));
+                    }
+                };
+                let mut metadata = serde_json::to_value(&result)?;
+                if let Some(reconciliation) = reconciliation {
+                    metadata["reconciliation"] = reconciliation;
+                }
                 output(
                     format!("MetaTool {:?} in {} ms", result.outcome, result.duration_ms),
-                    serde_json::to_value(result)?,
+                    metadata,
                 )
             }
         }
@@ -356,6 +605,10 @@ mod tests {
         assert_eq!(
             definition.input_schema["properties"]["action"]["enum"],
             json!(["status", "evaluate", "guide"])
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["tasker_mode"]["enum"],
+            json!(["off", "plan", "apply"])
         );
     }
 
@@ -395,6 +648,7 @@ mod tests {
             "guide should document the measured live surface, found {method_count}"
         );
         assert!(guide["notes"].is_array());
+        assert!(sections["tasker-capability"].is_array());
     }
 
     #[test]
@@ -403,6 +657,87 @@ mod tests {
         assert!(status["setup"].as_str().unwrap().contains(AGENTOS_PACKAGE));
         assert_eq!(status["version"], AGENTOS_VERSION);
         assert!(status["security_gate"].is_string());
+    }
+
+    #[test]
+    fn tasker_reconciler_plans_without_writing_then_applies_atomically() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let database = workspace.path().join("tasks.db");
+        super::super::tasker::tests::install_pi_schema(&database);
+        let partition = ProjectPartition::with_db_path(
+            &database,
+            workspace.path().to_string_lossy().into_owned(),
+        );
+        let mut store = PiTaskerStore::open(partition).expect("open Pi-compatible Tasker store");
+        let (_, snapshot_hash) = tasker_snapshot(&store).expect("initial Tasker snapshot");
+        let effect = ExecutionEffect {
+            capability: "tasker".into(),
+            operation: "reconcile".into(),
+            input: json!({
+                "kind": "batch",
+                "mode": "plan",
+                "expected_snapshot_hash": snapshot_hash,
+                "payload": {
+                    "operations": [{
+                        "op": "create",
+                        "key": "first",
+                        "title": "Created through mt.tasker",
+                        "dependsOn": [],
+                        "notes": []
+                    }]
+                }
+            }),
+        };
+
+        let planned = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&effect),
+            TaskerMode::Plan,
+            &snapshot_hash,
+        )
+        .expect("plan reconciliation");
+        assert_eq!(planned["status"], "planned");
+        assert!(store.list_tasks(None).expect("list after plan").is_empty());
+
+        let mut apply_effect = effect;
+        apply_effect.input["mode"] = json!("apply");
+        let applied = reconcile_tasker_effects(
+            &mut store,
+            &[apply_effect],
+            TaskerMode::Apply,
+            &snapshot_hash,
+        )
+        .expect("apply reconciliation");
+        assert_eq!(applied["status"], "applied");
+        let tasks = store.list_tasks(None).expect("list after apply");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Created through mt.tasker");
+    }
+
+    #[test]
+    fn tasker_reconciler_rejects_stale_snapshot_identity() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let database = workspace.path().join("tasks.db");
+        super::super::tasker::tests::install_pi_schema(&database);
+        let partition = ProjectPartition::with_db_path(
+            &database,
+            workspace.path().to_string_lossy().into_owned(),
+        );
+        let mut store = PiTaskerStore::open(partition).expect("open Pi-compatible Tasker store");
+        let effect = ExecutionEffect {
+            capability: "tasker".into(),
+            operation: "reconcile".into(),
+            input: json!({
+                "kind": "batch",
+                "mode": "apply",
+                "expected_snapshot_hash": "stale",
+                "payload": {"operations": []}
+            }),
+        };
+
+        let error = reconcile_tasker_effects(&mut store, &[effect], TaskerMode::Apply, "current")
+            .expect_err("stale snapshot must fail");
+        assert!(error.to_string().contains("snapshot identity mismatch"));
     }
 
     #[tokio::test]
@@ -446,5 +781,65 @@ mod tests {
         assert_eq!(read["outcome"], "succeeded");
         assert_eq!(read["value"]["persisted"], 21);
         assert_eq!(read["value"]["hits"], 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a pinned AgentOS runtime via JCODE_METATOOL_RUNTIME_DIR"]
+    async fn evaluates_tasker_plan_then_apply_through_agentos() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let store_root = tempfile::tempdir().expect("store tempdir");
+        let tasker_database = workspace.path().join("tasks.db");
+        super::super::tasker::tests::install_pi_schema(&tasker_database);
+        let tool = MetaTool::with_store_and_tasker_roots(
+            store_root.path().to_path_buf(),
+            tasker_database.clone(),
+        );
+        let code = "await mt.tasker.batch([{ op: 'create', key: 'first', title: 'AgentOS reconciled task', dependsOn: [], notes: [] }]); return mt.tasker.status();";
+
+        let planned = tool
+            .execute(
+                json!({
+                    "action": "evaluate",
+                    "code": code,
+                    "profile": "pure",
+                    "tasker_mode": "plan"
+                }),
+                context(workspace.path()),
+            )
+            .await
+            .expect("Tasker plan evaluation")
+            .metadata
+            .expect("plan metadata");
+        assert_eq!(planned["outcome"], "succeeded");
+        assert_eq!(planned["reconciliation"]["status"], "planned");
+
+        let partition = ProjectPartition::with_db_path(
+            &tasker_database,
+            workspace.path().to_string_lossy().into_owned(),
+        );
+        let store = PiTaskerStore::open(partition.clone()).expect("open Tasker after plan");
+        assert!(store.list_tasks(None).expect("list after plan").is_empty());
+
+        let applied = tool
+            .execute(
+                json!({
+                    "action": "evaluate",
+                    "code": code,
+                    "profile": "pure",
+                    "tasker_mode": "apply"
+                }),
+                context(workspace.path()),
+            )
+            .await
+            .expect("Tasker apply evaluation")
+            .metadata
+            .expect("apply metadata");
+        assert_eq!(applied["outcome"], "succeeded");
+        assert_eq!(applied["reconciliation"]["status"], "applied");
+
+        let store = PiTaskerStore::open(partition).expect("open Tasker after apply");
+        let tasks = store.list_tasks(None).expect("list after apply");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "AgentOS reconciled task");
     }
 }

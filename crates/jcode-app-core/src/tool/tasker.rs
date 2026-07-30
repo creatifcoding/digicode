@@ -1629,7 +1629,7 @@ impl Tool for TaskerTool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use jcode_tool_core::ToolExecutionMode;
     use rusqlite::Connection;
@@ -1648,7 +1648,7 @@ mod tests {
         }
     }
 
-    fn install_pi_schema(path: &Path) {
+    pub(crate) fn install_pi_schema(path: &Path) {
         let conn = Connection::open(path).expect("open temp pi db");
         conn.execute_batch(
             r#"

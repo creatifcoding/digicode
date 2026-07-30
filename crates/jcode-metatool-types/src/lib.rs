@@ -127,6 +127,18 @@ pub struct ExecutionRequest {
     /// codemode sidecar; ignored by the plain evaluation sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_root: Option<String>,
+    /// Host-brokered capabilities projected into the AgentOS guest. Capability
+    /// payloads are inert data. Guest code may inspect them and emit effects,
+    /// but it never receives direct host authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionEffect {
+    pub capability: String,
+    pub operation: String,
+    pub input: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,6 +149,8 @@ pub struct ExecutionResult {
     pub output: String,
     pub duration_ms: u64,
     pub termination_reason: Option<String>,
+    #[serde(default)]
+    pub effects: Vec<ExecutionEffect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

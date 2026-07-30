@@ -116,6 +116,81 @@ try {
 	  };
 	}
 
+	function createTaskerCapability(config, effects) {
+	  if (!config || typeof config !== "object") return undefined;
+	  const mode = config.mode === "apply" ? "apply" : "plan";
+	  const snapshot = config.snapshot && typeof config.snapshot === "object"
+	    ? config.snapshot
+	    : { tasks: [], features: [], ready: [] };
+	  const expectedSnapshotHash = typeof config.snapshot_hash === "string"
+	    ? config.snapshot_hash
+	    : null;
+	  let reconciled = false;
+
+	  const limited = (items, limit) => Array.isArray(items)
+	    ? items.slice(0, Math.max(0, Math.min(Number(limit ?? 100), 500)))
+	    : [];
+	  const clone = (value) => JSON.parse(JSON.stringify(value));
+	  const reconcile = async (kind, payload) => {
+	    if (reconciled) throw new Error("mt.tasker permits one atomic reconciliation per evaluation");
+	    if (!["batch", "plan", "feature_plan"].includes(kind)) {
+	      throw new Error("unsupported Tasker reconciliation kind: " + kind);
+	    }
+	    if (!payload || typeof payload !== "object") {
+	      throw new Error("Tasker reconciliation payload must be an object");
+	    }
+	    const effect = {
+	      capability: "tasker",
+	      operation: "reconcile",
+	      input: {
+	        kind,
+	        payload: clone(payload),
+	        mode,
+	        expected_snapshot_hash: expectedSnapshotHash,
+	      },
+	    };
+	    effects.push(effect);
+	    reconciled = true;
+	    return {
+	      queued: true,
+	      mode,
+	      kind,
+	      expectedSnapshotHash,
+	      effectIndex: effects.length - 1,
+	    };
+	  };
+
+	  return Object.freeze({
+	    mode,
+	    snapshotHash: expectedSnapshotHash,
+	    status: () => ({
+	      mode,
+	      snapshotHash: expectedSnapshotHash,
+	      counts: snapshot.counts ?? {},
+	      truncated: snapshot.truncated === true,
+	    }),
+	    list: (options = {}) => {
+	      const state = options.state;
+	      const tasks = state
+	        ? limited(snapshot.tasks, 500).filter((task) => task?.state === state)
+	        : limited(snapshot.tasks, 500);
+	      return limited(tasks, options.limit);
+	    },
+	    ready: (limit = 100) => limited(snapshot.ready, limit),
+	    features: (options = {}) => {
+	      const state = options.state;
+	      const features = state
+	        ? limited(snapshot.features, 500).filter((feature) => feature?.state === state)
+	        : limited(snapshot.features, 500);
+	      return limited(features, options.limit);
+	    },
+	    reconcile: async (program) => reconcile(program?.kind, program?.payload),
+	    batch: async (operations) => reconcile("batch", { operations }),
+	    plan: async (tasks) => reconcile("plan", { tasks }),
+	    featurePlan: async (feature) => reconcile("feature_plan", { feature }),
+	  });
+	}
+
 export async function run(request) {
   const consoleLines = [];
   const capture = (...args) => {
@@ -127,7 +202,8 @@ export async function run(request) {
   const original = { log: console.log, info: console.info, warn: console.warn, error: console.error };
   console.log = capture; console.info = capture; console.warn = capture; console.error = capture;
 
-  let metatool;
+	  let metatool;
+	  const effects = [];
   try {
 	    metatool = await createMetatool({
       sqlLayer: sqliteNodeLayer({ filename: "/data/store.db" }),
@@ -171,8 +247,10 @@ export async function run(request) {
 	        history: { limit: HISTORY_LIMIT, count: (await readHistory(HISTORY_LIMIT)).length },
 	      };
 	    }
+	    const tasker = createTaskerCapability(request.capabilities?.tasker, effects);
 	    const extensionMethods = {
 	      inputs: request.inputs,
+	      ...(tasker ? { tasker } : {}),
 	      get context() { return contextSnapshot(); },
 	      history: readHistory,
 	      recordHistory: writeHistory,
@@ -226,8 +304,9 @@ export async function run(request) {
       result: value,
       resultIsUndefined: value === undefined,
       output: stringifyForToolContent(value),
-      sanitizerWarnings: allWarnings,
-    };
+	      sanitizerWarnings: allWarnings,
+	      effects,
+	    };
   } catch (error) {
     return {
       ok: false,
@@ -250,8 +329,9 @@ export async function run(request) {
 	    source: request.source,
 	    inputs: request.inputs,
 	    profile: request.profile ?? "pure",
-	    promise_timeout_ms: request.promise_timeout_ms,
-	  })});
+		    promise_timeout_ms: request.promise_timeout_ms,
+		    capabilities: request.capabilities,
+		  })});
 })()`;
 
   const evaluation = await runtime.javascript.evaluate(guestProgram, {
