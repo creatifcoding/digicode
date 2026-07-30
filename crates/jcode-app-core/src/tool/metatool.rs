@@ -1,4 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -33,10 +37,13 @@ const GUIDE_SOURCE: &str = include_str!(concat!(
 const MAX_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const TASKER_SNAPSHOT_LIMIT: usize = 500;
+const TASKER_RECEIPT_TTL_SECONDS: u64 = 30 * 60;
+const TASKER_RECEIPT_PREFIX: &str = "tpr_";
 
 pub struct MetaTool {
     store_root_override: Option<PathBuf>,
     tasker_database_path_override: Option<PathBuf>,
+    tasker_receipt_root_override: Option<PathBuf>,
 }
 
 impl MetaTool {
@@ -44,6 +51,7 @@ impl MetaTool {
         Self {
             store_root_override: None,
             tasker_database_path_override: None,
+            tasker_receipt_root_override: None,
         }
     }
 
@@ -52,14 +60,17 @@ impl MetaTool {
         Self {
             store_root_override: Some(store_root),
             tasker_database_path_override: None,
+            tasker_receipt_root_override: None,
         }
     }
 
     #[cfg(test)]
     fn with_store_and_tasker_roots(store_root: PathBuf, tasker_database_path: PathBuf) -> Self {
+        let tasker_receipt_root = tasker_database_path.with_extension("receipts");
         Self {
             store_root_override: Some(store_root),
             tasker_database_path_override: Some(tasker_database_path),
+            tasker_receipt_root_override: Some(tasker_receipt_root),
         }
     }
 
@@ -67,6 +78,13 @@ impl MetaTool {
         self.tasker_database_path_override
             .clone()
             .unwrap_or_else(jcode_tasker_pi::default_db_path)
+    }
+
+    fn tasker_receipt_root(&self) -> Result<PathBuf> {
+        self.tasker_receipt_root_override
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| Ok(crate::storage::jcode_dir()?.join("tasker-plan-receipts")))
     }
 
     /// Workspace-scoped durable store directory: the guest's /data mount is
@@ -261,6 +279,8 @@ struct MetaToolInput {
     profile: ExecutionProfile,
     #[serde(default)]
     tasker_mode: TaskerMode,
+    #[serde(default)]
+    tasker_receipt: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +298,129 @@ struct TaskerEffectInput {
     payload: Value,
     mode: TaskerMode,
     expected_snapshot_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct TaskerPlanReceipt {
+    version: u8,
+    id: String,
+    project_root: String,
+    list_id: String,
+    snapshot_hash: String,
+    change_digest: String,
+    issued_at: u64,
+    expires_at: u64,
+}
+
+fn unix_timestamp() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs())
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn tasker_change_digest(input: &TaskerEffectInput) -> Result<String> {
+    let canonical = canonical_json(&json!({
+        "kind": input.kind,
+        "payload": input.payload,
+    }));
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical).context("serialize Tasker change set")?)
+    ))
+}
+
+fn validate_receipt_id(id: &str) -> Result<()> {
+    if !id.starts_with(TASKER_RECEIPT_PREFIX)
+        || id.len() > 64
+        || !id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        return Err(anyhow!("invalid Tasker plan receipt id"));
+    }
+    Ok(())
+}
+
+fn receipt_path(root: &Path, id: &str) -> Result<PathBuf> {
+    validate_receipt_id(id)?;
+    Ok(root.join(format!("{id}.json")))
+}
+
+fn issue_tasker_receipt(
+    root: &Path,
+    store: &PiTaskerStore,
+    snapshot_hash: &str,
+    input: &TaskerEffectInput,
+) -> Result<TaskerPlanReceipt> {
+    std::fs::create_dir_all(root).context("create Tasker plan receipt directory")?;
+    let issued_at = unix_timestamp()?;
+    let partition = store.partition();
+    let receipt = TaskerPlanReceipt {
+        version: 1,
+        id: format!("{TASKER_RECEIPT_PREFIX}{}", uuid::Uuid::now_v7()),
+        project_root: partition.project_root.clone(),
+        list_id: partition.list_id.clone(),
+        snapshot_hash: snapshot_hash.to_owned(),
+        change_digest: tasker_change_digest(input)?,
+        issued_at,
+        expires_at: issued_at + TASKER_RECEIPT_TTL_SECONDS,
+    };
+    let path = receipt_path(root, &receipt.id)?;
+    let temporary = root.join(format!(".{}.{}.tmp", receipt.id, uuid::Uuid::now_v7()));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec_pretty(&receipt).context("serialize Tasker plan receipt")?,
+    )
+    .context("write Tasker plan receipt")?;
+    std::fs::rename(&temporary, &path).context("publish Tasker plan receipt")?;
+    Ok(receipt)
+}
+
+fn verify_tasker_receipt(
+    root: &Path,
+    id: &str,
+    store: &PiTaskerStore,
+    snapshot_hash: &str,
+    input: &TaskerEffectInput,
+) -> Result<TaskerPlanReceipt> {
+    let path = receipt_path(root, id)?;
+    let receipt: TaskerPlanReceipt =
+        serde_json::from_slice(&std::fs::read(path).context("Tasker plan receipt not found")?)
+            .context("parse Tasker plan receipt")?;
+    let partition = store.partition();
+    if receipt.version != 1
+        || receipt.id != id
+        || receipt.project_root != partition.project_root
+        || receipt.list_id != partition.list_id
+    {
+        return Err(anyhow!("Tasker plan receipt scope mismatch"));
+    }
+    if receipt.expires_at < unix_timestamp()? {
+        return Err(anyhow!("Tasker plan receipt expired"));
+    }
+    if receipt.snapshot_hash != snapshot_hash {
+        return Err(anyhow!("Tasker plan receipt snapshot mismatch"));
+    }
+    if receipt.change_digest != tasker_change_digest(input)? {
+        return Err(anyhow!("Tasker plan receipt change-set mismatch"));
+    }
+    Ok(receipt)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -346,6 +489,8 @@ fn reconcile_tasker_effects(
     effects: &[ExecutionEffect],
     requested_mode: TaskerMode,
     initial_snapshot_hash: &str,
+    receipt_root: &Path,
+    requested_receipt: Option<&str>,
 ) -> Result<Value> {
     if effects.is_empty() {
         return Ok(json!({
@@ -382,9 +527,13 @@ fn reconcile_tasker_effects(
     }
 
     if requested_mode == TaskerMode::Plan {
+        if requested_receipt.is_some() {
+            return Err(anyhow!("tasker_receipt is valid only for apply mode"));
+        }
         let mut simulation = store.fork_in_memory()?;
         let simulated = execute_tasker_reconciliation(&mut simulation, &input)?;
         let simulated = normalize_tasker_simulation(&input, &simulated);
+        let receipt = issue_tasker_receipt(receipt_root, store, initial_snapshot_hash, &input)?;
         return Ok(json!({
             "mode": requested_mode,
             "status": "simulated",
@@ -393,11 +542,22 @@ fn reconcile_tasker_effects(
             "snapshot_hash": initial_snapshot_hash,
             "change_set": input.payload,
             "simulation": simulated,
+            "receipt": receipt,
         }));
     }
     if requested_mode != TaskerMode::Apply {
         return Err(anyhow!("Tasker effects require tasker_mode plan or apply"));
     }
+
+    let receipt_id = requested_receipt
+        .ok_or_else(|| anyhow!("tasker_receipt from a successful plan is required for apply"))?;
+    let receipt = verify_tasker_receipt(
+        receipt_root,
+        receipt_id,
+        store,
+        initial_snapshot_hash,
+        &input,
+    )?;
 
     let (_, current_hash) = tasker_snapshot(store)?;
     if current_hash != initial_snapshot_hash {
@@ -412,6 +572,10 @@ fn reconcile_tasker_effects(
         "status": "applied",
         "kind": input.kind,
         "snapshot_hash": initial_snapshot_hash,
+        "receipt": {
+            "id": receipt.id,
+            "change_digest": receipt.change_digest,
+        },
         "result": applied,
     }))
 }
@@ -542,7 +706,11 @@ impl Tool for MetaTool {
                 "tasker_mode": {
                     "type": "string",
                     "enum": ["off", "plan", "apply"],
-                    "description": "Optional native Tasker capability. plan returns a deterministic change set without writing; apply admits one atomic mt.tasker.batch/plan/featurePlan reconciliation against the canonical Pi-compatible database."
+                    "description": "Optional native Tasker capability. plan canonically simulates one reconciliation and issues a receipt; apply requires that receipt and executes the exact reviewed change set against the canonical Pi-compatible database."
+                },
+                "tasker_receipt": {
+                    "type": "string",
+                    "description": "Receipt id returned by a successful tasker_mode=plan call. Required for apply and bound to the project, canonical snapshot, exact change set, and expiry."
                 }
             }
         })
@@ -607,11 +775,13 @@ impl Tool for MetaTool {
                 let reconciliation = match tasker_context {
                     Some((_, snapshot_hash)) => {
                         let database_path = self.tasker_database_path();
+                        let receipt_root = self.tasker_receipt_root()?;
                         let project_root = ctx.working_dir.clone().ok_or_else(|| {
                             anyhow!("Tasker codemode requires a working directory")
                         })?;
                         let effects = result.effects.clone();
                         let mode = params.tasker_mode;
+                        let requested_receipt = params.tasker_receipt.clone();
                         Some(
                             tokio::task::spawn_blocking(move || {
                                 let canonical =
@@ -621,7 +791,14 @@ impl Tool for MetaTool {
                                         database_path,
                                         canonical.to_string_lossy().into_owned(),
                                     ))?;
-                                reconcile_tasker_effects(&mut store, &effects, mode, &snapshot_hash)
+                                reconcile_tasker_effects(
+                                    &mut store,
+                                    &effects,
+                                    mode,
+                                    &snapshot_hash,
+                                    &receipt_root,
+                                    requested_receipt.as_deref(),
+                                )
                             })
                             .await
                             .context("join Tasker codemode reconciler")??,
@@ -736,6 +913,7 @@ mod tests {
             workspace.path().to_string_lossy().into_owned(),
         );
         let mut store = PiTaskerStore::open(partition).expect("open Pi-compatible Tasker store");
+        let receipts = workspace.path().join("receipts");
         let (_, snapshot_hash) = tasker_snapshot(&store).expect("initial Tasker snapshot");
         let effect = ExecutionEffect {
             capability: "tasker".into(),
@@ -761,6 +939,8 @@ mod tests {
             std::slice::from_ref(&effect),
             TaskerMode::Plan,
             &snapshot_hash,
+            &receipts,
+            None,
         )
         .expect("plan reconciliation");
         assert_eq!(planned["status"], "simulated");
@@ -773,18 +953,93 @@ mod tests {
             std::slice::from_ref(&effect),
             TaskerMode::Plan,
             &snapshot_hash,
+            &receipts,
+            None,
         )
         .expect("repeat plan reconciliation");
-        assert_eq!(repeated, planned);
+        assert_eq!(repeated["simulation"], planned["simulation"]);
+        assert_eq!(
+            repeated["receipt"]["change_digest"],
+            planned["receipt"]["change_digest"]
+        );
         assert!(store.list_tasks(None).expect("list after plan").is_empty());
+
+        let receipt = planned["receipt"]["id"]
+            .as_str()
+            .expect("receipt id")
+            .to_owned();
+        let expired_receipt = repeated["receipt"]["id"]
+            .as_str()
+            .expect("repeated receipt id")
+            .to_owned();
+        let expired_path = receipt_path(&receipts, &expired_receipt).expect("expired receipt path");
+        let mut expired_record: TaskerPlanReceipt =
+            serde_json::from_slice(&std::fs::read(&expired_path).expect("read repeated receipt"))
+                .expect("parse repeated receipt");
+        expired_record.expires_at = 0;
+        std::fs::write(
+            &expired_path,
+            serde_json::to_vec_pretty(&expired_record).expect("serialize expired receipt"),
+        )
+        .expect("expire repeated receipt");
 
         let mut apply_effect = effect;
         apply_effect.input["mode"] = json!("apply");
+        let missing = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&apply_effect),
+            TaskerMode::Apply,
+            &snapshot_hash,
+            &receipts,
+            None,
+        )
+        .expect_err("apply without a receipt must fail");
+        assert!(missing.to_string().contains("receipt"));
+
+        let expired = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&apply_effect),
+            TaskerMode::Apply,
+            &snapshot_hash,
+            &receipts,
+            Some(&expired_receipt),
+        )
+        .expect_err("expired receipt must fail");
+        assert!(expired.to_string().contains("expired"));
+        assert!(
+            store
+                .list_tasks(None)
+                .expect("list after expiry")
+                .is_empty()
+        );
+
+        let mut mismatched_effect = apply_effect.clone();
+        mismatched_effect.input["payload"]["operations"][0]["title"] =
+            json!("Changed after review");
+        let mismatch = reconcile_tasker_effects(
+            &mut store,
+            &[mismatched_effect],
+            TaskerMode::Apply,
+            &snapshot_hash,
+            &receipts,
+            Some(&receipt),
+        )
+        .expect_err("receipt must reject a changed apply payload");
+        assert!(mismatch.to_string().contains("change-set mismatch"));
+        assert!(
+            store
+                .list_tasks(None)
+                .expect("list after mismatch")
+                .is_empty()
+        );
+
         let applied = reconcile_tasker_effects(
             &mut store,
             &[apply_effect],
             TaskerMode::Apply,
             &snapshot_hash,
+            &receipts,
+            Some(&receipt),
         )
         .expect("apply reconciliation");
         assert_eq!(applied["status"], "applied");
@@ -814,8 +1069,15 @@ mod tests {
             }),
         };
 
-        let error = reconcile_tasker_effects(&mut store, &[effect], TaskerMode::Apply, "current")
-            .expect_err("stale snapshot must fail");
+        let error = reconcile_tasker_effects(
+            &mut store,
+            &[effect],
+            TaskerMode::Apply,
+            "current",
+            workspace.path(),
+            None,
+        )
+        .expect_err("stale snapshot must fail");
         assert!(error.to_string().contains("snapshot identity mismatch"));
     }
 
@@ -849,9 +1111,15 @@ mod tests {
             }),
         };
 
-        let error =
-            reconcile_tasker_effects(&mut store, &[effect], TaskerMode::Plan, &snapshot_hash)
-                .expect_err("canonical validation should reject missing dependency");
+        let error = reconcile_tasker_effects(
+            &mut store,
+            &[effect],
+            TaskerMode::Plan,
+            &snapshot_hash,
+            workspace.path(),
+            None,
+        )
+        .expect_err("canonical validation should reject missing dependency");
         assert!(error.to_string().contains("invalid reference"));
         assert!(store.list_tasks(None).expect("source list").is_empty());
     }
@@ -930,6 +1198,9 @@ mod tests {
         assert_eq!(planned["reconciliation"]["status"], "simulated");
         assert_eq!(planned["reconciliation"]["validated"], true);
         assert_eq!(planned["reconciliation"]["simulation"]["created"], 1);
+        let receipt = planned["reconciliation"]["receipt"]["id"]
+            .as_str()
+            .expect("plan receipt id");
 
         let partition = ProjectPartition::with_db_path(
             &tasker_database,
@@ -944,7 +1215,8 @@ mod tests {
                     "action": "evaluate",
                     "code": code,
                     "profile": "pure",
-                    "tasker_mode": "apply"
+                    "tasker_mode": "apply",
+                    "tasker_receipt": receipt
                 }),
                 context(workspace.path()),
             )
