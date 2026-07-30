@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use jcode_artifact_store::{AdmitBundleInput, ArtifactStore};
 use jcode_metatool_runtime::{
     AGENTOS_PACKAGE, AGENTOS_VERSION, AgentOsExecutor, AgentOsRuntimeConfig, GUEST_ENGINE_FILE,
     JavaScriptExecutor, SIDECAR_SOURCE,
@@ -39,11 +40,14 @@ const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const TASKER_SNAPSHOT_LIMIT: usize = 500;
 const TASKER_RECEIPT_TTL_SECONDS: u64 = 30 * 60;
 const TASKER_RECEIPT_PREFIX: &str = "tpr_";
+const ARTIFACT_CATALOG_LIMIT: usize = 200;
+const ARTIFACT_MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 pub struct MetaTool {
     store_root_override: Option<PathBuf>,
     tasker_database_path_override: Option<PathBuf>,
     tasker_receipt_root_override: Option<PathBuf>,
+    artifact_root_override: Option<PathBuf>,
 }
 
 impl MetaTool {
@@ -52,6 +56,7 @@ impl MetaTool {
             store_root_override: None,
             tasker_database_path_override: None,
             tasker_receipt_root_override: None,
+            artifact_root_override: None,
         }
     }
 
@@ -61,6 +66,7 @@ impl MetaTool {
             store_root_override: Some(store_root),
             tasker_database_path_override: None,
             tasker_receipt_root_override: None,
+            artifact_root_override: None,
         }
     }
 
@@ -71,6 +77,7 @@ impl MetaTool {
             store_root_override: Some(store_root),
             tasker_database_path_override: Some(tasker_database_path),
             tasker_receipt_root_override: Some(tasker_receipt_root),
+            artifact_root_override: None,
         }
     }
 
@@ -252,6 +259,19 @@ impl MetaTool {
         .map_err(anyhow::Error::new)
     }
 
+    fn artifact_root(&self) -> Result<PathBuf> {
+        self.artifact_root_override
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| Ok(crate::storage::jcode_dir()?.join("artifacts")))
+    }
+
+    fn artifact_store(&self) -> Result<ArtifactStore> {
+        let root = self.artifact_root()?;
+        ArtifactStore::open_migrate(root.join("artifacts.sqlite3"), root.join("assets"))
+            .map_err(anyhow::Error::new)
+    }
+
     fn tasker_store(&self, ctx: &ToolContext) -> Result<PiTaskerStore> {
         let root = ctx
             .working_dir
@@ -281,6 +301,8 @@ struct MetaToolInput {
     tasker_mode: TaskerMode,
     #[serde(default)]
     tasker_receipt: Option<String>,
+    #[serde(default)]
+    artifact_mode: ArtifactMode,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,12 +314,33 @@ enum TaskerMode {
     Apply,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ArtifactMode {
+    #[default]
+    Off,
+    Apply,
+}
+
 #[derive(Debug, Deserialize)]
 struct TaskerEffectInput {
     kind: String,
     payload: Value,
     mode: TaskerMode,
     expected_snapshot_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtifactBundleInput {
+    key: String,
+    title: String,
+    source: String,
+    rendered: String,
+    #[serde(default)]
+    annotation: Option<String>,
+    #[serde(default)]
+    template_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -666,6 +709,120 @@ fn summarize_feature_plan(feature: &Value) -> Value {
     })
 }
 
+fn artifact_catalog(store: &ArtifactStore) -> Result<Value> {
+    let artifacts = store.list_artifacts()?;
+    let mut entries = Vec::new();
+    let mut candidates = Vec::new();
+    for artifact in artifacts.into_iter().take(ARTIFACT_CATALOG_LIMIT) {
+        let revisions = store.list_revisions(&artifact.id)?;
+        let latest = revisions.last().cloned();
+        for candidate in store.list_candidates(&artifact.id)? {
+            candidates.push(json!({
+                "id": candidate.id,
+                "artifactId": candidate.artifact_id,
+                "revisionId": candidate.revision_id,
+                "templateKey": candidate.template_key,
+                "status": candidate.status,
+                "createdAt": candidate.created_at,
+                "updatedAt": candidate.updated_at,
+            }));
+        }
+        entries.push(json!({
+            "id": artifact.id,
+            "key": artifact.key,
+            "title": artifact.title,
+            "createdAt": artifact.created_at,
+            "revisionCount": revisions.len(),
+            "latestRevision": latest.map(|revision| json!({
+                "id": revision.id,
+                "number": revision.number,
+                "sourceDigest": revision.source_digest,
+                "renderedDigest": revision.rendered_digest,
+                "createdAt": revision.created_at,
+            })),
+        }));
+    }
+    Ok(json!({
+        "root": "JCODE_HOME/artifacts",
+        "limit": ARTIFACT_CATALOG_LIMIT,
+        "artifacts": entries,
+        "candidates": candidates.into_iter().take(ARTIFACT_CATALOG_LIMIT).collect::<Vec<_>>(),
+    }))
+}
+
+fn validate_artifact_bundle(bundle: &ArtifactBundleInput) -> Result<()> {
+    if bundle.key.trim().is_empty() || bundle.title.trim().is_empty() {
+        return Err(anyhow!("artifact bundle key and title are required"));
+    }
+    if bundle.source.len() > ARTIFACT_MAX_TEXT_BYTES
+        || bundle.rendered.len() > ARTIFACT_MAX_TEXT_BYTES
+    {
+        return Err(anyhow!(
+            "artifact bundle source/rendered exceeds {ARTIFACT_MAX_TEXT_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
+fn admit_artifact_bundle(store: &ArtifactStore, bundle: ArtifactBundleInput) -> Result<Value> {
+    validate_artifact_bundle(&bundle)?;
+    let template_key = bundle.template_key.clone();
+    let receipt = store.admit_bundle(AdmitBundleInput {
+        artifact_key: bundle.key,
+        artifact_title: bundle.title,
+        source_bytes: bundle.source.into_bytes(),
+        rendered_bytes: bundle.rendered.into_bytes(),
+        annotation: bundle.annotation.filter(|body| !body.trim().is_empty()),
+        candidate_template_key: template_key.clone(),
+    })?;
+    Ok(json!({
+        "version": 1,
+        "artifact": receipt.artifact,
+        "revision": receipt.revision,
+        "candidate": receipt.candidate,
+        "annotation": receipt.annotation,
+        "templateKey": template_key,
+    }))
+}
+
+fn reconcile_artifact_effects(
+    store: &ArtifactStore,
+    effects: &[ExecutionEffect],
+    requested_mode: ArtifactMode,
+) -> Result<Value> {
+    if effects.is_empty() {
+        return Ok(json!({
+            "mode": requested_mode,
+            "status": "read_only",
+            "effect_count": 0,
+        }));
+    }
+    if requested_mode == ArtifactMode::Off {
+        return Err(anyhow!("Artifact effects require artifact_mode apply"));
+    }
+    if effects.len() != 1 {
+        return Err(anyhow!(
+            "Artifact codemode requires exactly one admission effect; received {} effects",
+            effects.len()
+        ));
+    }
+    let effect = &effects[0];
+    if effect.capability != "artifacts" || effect.operation != "admit_bundle" {
+        return Err(anyhow!(
+            "unsupported MetaTool capability effect {}.{}",
+            effect.capability,
+            effect.operation
+        ));
+    }
+    let bundle: ArtifactBundleInput = serde_json::from_value(effect.input.clone())?;
+    let receipt = admit_artifact_bundle(store, bundle)?;
+    Ok(json!({
+        "mode": requested_mode,
+        "status": "applied",
+        "receipt": receipt,
+    }))
+}
+
 fn output(title: impl Into<String>, metadata: Value) -> Result<ToolOutput> {
     Ok(ToolOutput::new(serde_json::to_string_pretty(&metadata)?)
         .with_title(title)
@@ -679,7 +836,7 @@ impl Tool for MetaTool {
     }
 
     fn description(&self) -> &str {
-        "Run codemode JavaScript through Jcode's native MetaTool: your code executes inside a sandboxed AgentOS runtime with a live `mt` object offering the full metatool engine and an optional governed `mt.tasker` capability. Tasker plan/apply effects are reconciled atomically by the host against the canonical Pi-compatible database; the guest never receives direct host authority."
+        "Run codemode JavaScript through Jcode's native MetaTool: your code executes inside a sandboxed AgentOS runtime with a live `mt` object offering the full metatool engine and optional governed `mt.tasker` and `mt.artifacts` capabilities. Tasker plan/apply effects are reconciled atomically by the host against the canonical Pi-compatible database; artifact admissions are reconciled into the host artifact store. The guest never receives direct host authority."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -711,6 +868,11 @@ impl Tool for MetaTool {
                 "tasker_receipt": {
                     "type": "string",
                     "description": "Receipt id returned by a successful tasker_mode=plan call. Required for apply and bound to the project, canonical snapshot, exact change set, and expiry."
+                },
+                "artifact_mode": {
+                    "type": "string",
+                    "enum": ["off", "apply"],
+                    "description": "Optional native artifact-library capability. apply exposes a bounded read-only catalog and admits exactly one bundle through the host artifact store; the guest receives no filesystem or database authority."
                 }
             }
         })
@@ -753,15 +915,37 @@ impl Tool for MetaTool {
                     let (snapshot, snapshot_hash) = tasker_snapshot(&store)?;
                     Some((snapshot, snapshot_hash))
                 };
-                let capabilities = tasker_context.as_ref().map(|(snapshot, snapshot_hash)| {
-                    json!({
-                        "tasker": {
-                            "mode": params.tasker_mode,
-                            "snapshot": snapshot,
-                            "snapshot_hash": snapshot_hash,
-                        }
-                    })
-                });
+                let artifact_context = if params.artifact_mode == ArtifactMode::Off {
+                    None
+                } else {
+                    let store = self.artifact_store()?;
+                    Some(artifact_catalog(&store)?)
+                };
+                let capabilities = if tasker_context.is_some() || artifact_context.is_some() {
+                    let mut capabilities = serde_json::Map::new();
+                    if let Some((snapshot, snapshot_hash)) = tasker_context.as_ref() {
+                        capabilities.insert(
+                            "tasker".into(),
+                            json!({
+                                "mode": params.tasker_mode,
+                                "snapshot": snapshot,
+                                "snapshot_hash": snapshot_hash,
+                            }),
+                        );
+                    }
+                    if let Some(catalog) = artifact_context.as_ref() {
+                        capabilities.insert(
+                            "artifacts".into(),
+                            json!({
+                                "mode": params.artifact_mode,
+                                "catalog": catalog,
+                            }),
+                        );
+                    }
+                    Some(Value::Object(capabilities))
+                } else {
+                    None
+                };
                 let request = ExecutionRequest {
                     id: ExecutionId::new(),
                     source,
@@ -772,6 +956,31 @@ impl Tool for MetaTool {
                     capabilities,
                 };
                 let result = Self::executor()?.execute(request).await?;
+                let tasker_effects: Vec<_> = result
+                    .effects
+                    .iter()
+                    .filter(|effect| effect.capability == "tasker")
+                    .cloned()
+                    .collect();
+                let artifact_effects: Vec<_> = result
+                    .effects
+                    .iter()
+                    .filter(|effect| effect.capability == "artifacts")
+                    .cloned()
+                    .collect();
+                let unsupported_effects: Vec<_> = result
+                    .effects
+                    .iter()
+                    .filter(|effect| {
+                        effect.capability != "tasker" && effect.capability != "artifacts"
+                    })
+                    .cloned()
+                    .collect();
+                if !unsupported_effects.is_empty() {
+                    return Err(anyhow!(
+                        "MetaTool guest emitted unsupported capability effects"
+                    ));
+                }
                 let reconciliation = match tasker_context {
                     Some((_, snapshot_hash)) => {
                         let database_path = self.tasker_database_path();
@@ -779,7 +988,7 @@ impl Tool for MetaTool {
                         let project_root = ctx.working_dir.clone().ok_or_else(|| {
                             anyhow!("Tasker codemode requires a working directory")
                         })?;
-                        let effects = result.effects.clone();
+                        let effects = tasker_effects.clone();
                         let mode = params.tasker_mode;
                         let requested_receipt = params.tasker_receipt.clone();
                         Some(
@@ -804,16 +1013,35 @@ impl Tool for MetaTool {
                             .context("join Tasker codemode reconciler")??,
                         )
                     }
-                    None if result.effects.is_empty() => None,
+                    None if tasker_effects.is_empty() => None,
                     None => {
                         return Err(anyhow!(
-                            "MetaTool guest emitted capability effects while tasker_mode was off"
+                            "MetaTool guest emitted Tasker effects while tasker_mode was off"
+                        ));
+                    }
+                };
+                let artifact_admission = match artifact_context {
+                    Some(_) => {
+                        let store = self.artifact_store()?;
+                        Some(reconcile_artifact_effects(
+                            &store,
+                            &artifact_effects,
+                            params.artifact_mode,
+                        )?)
+                    }
+                    None if artifact_effects.is_empty() => None,
+                    None => {
+                        return Err(anyhow!(
+                            "MetaTool guest emitted artifact effects while artifact_mode was off"
                         ));
                     }
                 };
                 let mut metadata = serde_json::to_value(&result)?;
                 if let Some(reconciliation) = reconciliation {
                     metadata["reconciliation"] = reconciliation;
+                }
+                if let Some(admission) = artifact_admission {
+                    metadata["artifactAdmission"] = admission;
                 }
                 output(
                     format!("MetaTool {:?} in {} ms", result.outcome, result.duration_ms),
@@ -854,6 +1082,10 @@ mod tests {
             definition.input_schema["properties"]["tasker_mode"]["enum"],
             json!(["off", "plan", "apply"])
         );
+        assert_eq!(
+            definition.input_schema["properties"]["artifact_mode"]["enum"],
+            json!(["off", "apply"])
+        );
     }
 
     #[test]
@@ -893,6 +1125,7 @@ mod tests {
         );
         assert!(guide["notes"].is_array());
         assert!(sections["tasker-capability"].is_array());
+        assert!(sections["artifacts-capability"].is_array());
     }
 
     #[test]
@@ -1231,5 +1464,86 @@ mod tests {
         let tasks = store.list_tasks(None).expect("list after apply");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "AgentOS reconciled task");
+    }
+
+    #[test]
+    fn artifact_reconciler_admits_one_bundle_to_host_store() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let store = ArtifactStore::open_migrate(
+            workspace.path().join("artifacts.sqlite3"),
+            workspace.path().join("assets"),
+        )
+        .expect("open artifact store");
+        let effect = ExecutionEffect {
+            capability: "artifacts".into(),
+            operation: "admit_bundle".into(),
+            input: json!({
+                "key": "deck/a",
+                "title": "Deck A",
+                "source": "# Deck",
+                "rendered": "<h1>Deck</h1>",
+                "annotation": "first admission",
+                "templateKey": "html-deck"
+            }),
+        };
+
+        let admitted = reconcile_artifact_effects(&store, &[effect], ArtifactMode::Apply)
+            .expect("artifact admission");
+
+        assert_eq!(admitted["status"], "applied");
+        assert_eq!(admitted["receipt"]["artifact"]["key"], "deck/a");
+        assert_eq!(admitted["receipt"]["templateKey"], "html-deck");
+        let artifacts = store.list_artifacts().expect("list artifacts");
+        assert_eq!(artifacts.len(), 1);
+        let revisions = store
+            .list_revisions(&artifacts[0].id)
+            .expect("list revisions");
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(store.read_source_bytes(&revisions[0]).unwrap(), b"# Deck");
+        assert_eq!(store.list_annotations(&artifacts[0].id).unwrap().len(), 1);
+        let candidates = store.list_candidates(&artifacts[0].id).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].template_key, "html-deck");
+    }
+
+    #[test]
+    fn artifact_reconciler_rejects_off_multiple_and_wrong_operation() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let store = ArtifactStore::open_migrate(
+            workspace.path().join("artifacts.sqlite3"),
+            workspace.path().join("assets"),
+        )
+        .expect("open artifact store");
+        let effect = ExecutionEffect {
+            capability: "artifacts".into(),
+            operation: "admit_bundle".into(),
+            input: json!({"key":"k","title":"T","source":"s","rendered":"r"}),
+        };
+        assert!(
+            reconcile_artifact_effects(&store, std::slice::from_ref(&effect), ArtifactMode::Off)
+                .unwrap_err()
+                .to_string()
+                .contains("artifact_mode apply")
+        );
+        assert!(
+            reconcile_artifact_effects(
+                &store,
+                &[effect.clone(), effect.clone()],
+                ArtifactMode::Apply
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one")
+        );
+        let wrong = ExecutionEffect {
+            operation: "nope".into(),
+            ..effect
+        };
+        assert!(
+            reconcile_artifact_effects(&store, &[wrong], ArtifactMode::Apply)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
     }
 }
