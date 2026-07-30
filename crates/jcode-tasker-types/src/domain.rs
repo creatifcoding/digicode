@@ -81,6 +81,11 @@ typed_id!(ProjectId, "proj_");
 typed_id!(FeatureId, "feat_");
 typed_id!(TaskId, "task_");
 typed_id!(OutboxEventId, "evt_");
+typed_id!(CandidateSetId, "cset_");
+typed_id!(CandidateId, "cand_");
+typed_id!(AdjudicationRoundId, "adj_");
+typed_id!(BallotId, "ballot_");
+typed_id!(PromotionIntentId, "promote_");
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
