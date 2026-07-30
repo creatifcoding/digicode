@@ -39,35 +39,6 @@ pub struct Annotation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CandidateType {
-    Primary,
-    Alternate,
-    Experimental,
-}
-
-impl fmt::Display for CandidateType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            CandidateType::Primary => "primary",
-            CandidateType::Alternate => "alternate",
-            CandidateType::Experimental => "experimental",
-        })
-    }
-}
-
-impl CandidateType {
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "primary" => Ok(Self::Primary),
-            "alternate" => Ok(Self::Alternate),
-            "experimental" => Ok(Self::Experimental),
-            other => Err(ArtifactStoreError::InvalidEnum(other.to_owned())),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum CandidateStatus {
     Proposed,
     Trial,
@@ -106,7 +77,7 @@ pub struct Candidate {
     pub id: String,
     pub artifact_id: String,
     pub revision_id: String,
-    pub candidate_type: CandidateType,
+    pub template_key: String,
     pub status: CandidateStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -122,6 +93,8 @@ pub enum ArtifactStoreError {
     Time(#[from] chrono::ParseError),
     #[error("invalid enum value: {0}")]
     InvalidEnum(String),
+    #[error("invalid template key: {0}")]
+    InvalidTemplateKey(String),
     #[error("candidate transition from {from:?} to {to:?} is not allowed")]
     InvalidCandidateTransition {
         from: CandidateStatus,
@@ -130,6 +103,24 @@ pub enum ArtifactStoreError {
 }
 
 pub type Result<T> = std::result::Result<T, ArtifactStoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmitBundleInput {
+    pub artifact_key: String,
+    pub artifact_title: String,
+    pub source_bytes: Vec<u8>,
+    pub rendered_bytes: Vec<u8>,
+    pub annotation: Option<String>,
+    pub candidate_template_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionReceipt {
+    pub artifact: Artifact,
+    pub revision: Revision,
+    pub annotation: Option<Annotation>,
+    pub candidate: Option<Candidate>,
+}
 
 pub struct ArtifactStore {
     conn: Connection,
@@ -180,6 +171,17 @@ impl ArtifactStore {
             .query_row(
                 "SELECT id, key, title, created_at FROM artifacts WHERE id = ?1",
                 params![artifact_id.as_ref()],
+                artifact_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_artifact_by_key(&self, key: impl AsRef<str>) -> Result<Option<Artifact>> {
+        self.conn
+            .query_row(
+                "SELECT id, key, title, created_at FROM artifacts WHERE key = ?1",
+                params![key.as_ref()],
                 artifact_from_row,
             )
             .optional()
@@ -287,9 +289,10 @@ impl ArtifactStore {
     pub fn register_candidate(
         &self,
         revision_id: impl AsRef<str>,
-        candidate_type: CandidateType,
+        template_key: impl AsRef<str>,
         status: CandidateStatus,
     ) -> Result<Candidate> {
+        let template_key = validate_template_key(template_key.as_ref())?;
         let revision = self
             .get_revision(revision_id.as_ref())?
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
@@ -298,16 +301,127 @@ impl ArtifactStore {
             id: Uuid::new_v4().to_string(),
             artifact_id: revision.artifact_id,
             revision_id: revision_id.as_ref().to_owned(),
-            candidate_type,
+            template_key,
             status,
             created_at: now,
             updated_at: now,
         };
         self.conn.execute(
-            "INSERT INTO candidates (id, artifact_id, revision_id, candidate_type, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![candidate.id, candidate.artifact_id, candidate.revision_id, candidate.candidate_type.to_string(), candidate.status.to_string(), candidate.created_at.to_rfc3339(), candidate.updated_at.to_rfc3339()],
+            "INSERT INTO candidates (id, artifact_id, revision_id, template_key, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![candidate.id, candidate.artifact_id, candidate.revision_id, candidate.template_key, candidate.status.to_string(), candidate.created_at.to_rfc3339(), candidate.updated_at.to_rfc3339()],
         )?;
         Ok(candidate)
+    }
+
+    pub fn admit_bundle(&self, input: AdmitBundleInput) -> Result<AdmissionReceipt> {
+        let artifact_key = input.artifact_key.trim().to_owned();
+        let artifact_title = input.artifact_title.trim().to_owned();
+        let candidate_template_key = input
+            .candidate_template_key
+            .as_deref()
+            .map(validate_template_key)
+            .transpose()?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        let artifact = match tx
+            .query_row(
+                "SELECT id, key, title, created_at FROM artifacts WHERE key = ?1",
+                params![artifact_key],
+                artifact_from_row,
+            )
+            .optional()?
+        {
+            Some(artifact) => artifact,
+            None => {
+                let artifact = Artifact {
+                    id: Uuid::new_v4().to_string(),
+                    key: artifact_key,
+                    title: artifact_title,
+                    created_at: Utc::now(),
+                };
+                tx.execute(
+                    "INSERT INTO artifacts (id, key, title, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        artifact.id,
+                        artifact.key,
+                        artifact.title,
+                        artifact.created_at.to_rfc3339()
+                    ],
+                )?;
+                artifact
+            }
+        };
+
+        let number = tx.query_row(
+            "SELECT COALESCE(MAX(number), 0) + 1 FROM revisions WHERE artifact_id = ?1",
+            params![artifact.id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let revision = build_revision(
+            &artifact.id,
+            number,
+            &input.source_bytes,
+            &input.rendered_bytes,
+        );
+        atomic_write(
+            &self.asset_root.join(&revision.source_path),
+            &input.source_bytes,
+        )?;
+        atomic_write(
+            &self.asset_root.join(&revision.rendered_path),
+            &input.rendered_bytes,
+        )?;
+        tx.execute(
+            "INSERT INTO revisions (id, artifact_id, number, source_digest, rendered_digest, source_path, rendered_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![revision.id, revision.artifact_id, revision.number, revision.source_digest, revision.rendered_digest, path_to_db(&revision.source_path), path_to_db(&revision.rendered_path), revision.created_at.to_rfc3339()],
+        )?;
+
+        let annotation = match input.annotation {
+            Some(body) => {
+                let annotation = Annotation {
+                    id: Uuid::new_v4().to_string(),
+                    artifact_id: artifact.id.clone(),
+                    revision_id: Some(revision.id.clone()),
+                    body,
+                    created_at: Utc::now(),
+                };
+                tx.execute(
+                    "INSERT INTO annotations (id, artifact_id, revision_id, body, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![annotation.id, annotation.artifact_id, annotation.revision_id, annotation.body, annotation.created_at.to_rfc3339()],
+                )?;
+                Some(annotation)
+            }
+            None => None,
+        };
+
+        let candidate = match candidate_template_key {
+            Some(template_key) => {
+                let now = Utc::now();
+                let candidate = Candidate {
+                    id: Uuid::new_v4().to_string(),
+                    artifact_id: artifact.id.clone(),
+                    revision_id: revision.id.clone(),
+                    template_key,
+                    status: CandidateStatus::Proposed,
+                    created_at: now,
+                    updated_at: now,
+                };
+                tx.execute(
+                    "INSERT INTO candidates (id, artifact_id, revision_id, template_key, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![candidate.id, candidate.artifact_id, candidate.revision_id, candidate.template_key, candidate.status.to_string(), candidate.created_at.to_rfc3339(), candidate.updated_at.to_rfc3339()],
+                )?;
+                Some(candidate)
+            }
+            None => None,
+        };
+
+        tx.commit()?;
+        Ok(AdmissionReceipt {
+            artifact,
+            revision,
+            annotation,
+            candidate,
+        })
     }
 
     pub fn update_candidate_status(
@@ -343,7 +457,7 @@ impl ArtifactStore {
     pub fn get_candidate(&self, candidate_id: impl AsRef<str>) -> Result<Option<Candidate>> {
         self.conn
             .query_row(
-                "SELECT id, artifact_id, revision_id, candidate_type, status, created_at, updated_at FROM candidates WHERE id = ?1",
+                "SELECT id, artifact_id, revision_id, template_key, status, created_at, updated_at FROM candidates WHERE id = ?1",
                 params![candidate_id.as_ref()],
                 candidate_from_row,
             )
@@ -352,7 +466,7 @@ impl ArtifactStore {
     }
 
     pub fn list_candidates(&self, artifact_id: impl AsRef<str>) -> Result<Vec<Candidate>> {
-        let mut stmt = self.conn.prepare("SELECT id, artifact_id, revision_id, candidate_type, status, created_at, updated_at FROM candidates WHERE artifact_id = ?1 ORDER BY created_at, id")?;
+        let mut stmt = self.conn.prepare("SELECT id, artifact_id, revision_id, template_key, status, created_at, updated_at FROM candidates WHERE artifact_id = ?1 ORDER BY created_at, id")?;
         let rows = stmt.query_map(params![artifact_id.as_ref()], candidate_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -398,7 +512,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   id TEXT PRIMARY KEY,
   artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
   revision_id TEXT NOT NULL REFERENCES revisions(id),
-  candidate_type TEXT NOT NULL CHECK(candidate_type IN ('primary','alternate','experimental')),
+  template_key TEXT NOT NULL CHECK(length(template_key) > 0),
   status TEXT NOT NULL CHECK(status IN ('proposed','trial','ratified','deprecated','superseded')),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -443,7 +557,7 @@ fn annotation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Annotation> 
 }
 
 fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
-    let candidate_type: String = row.get(3)?;
+    let template_key: String = row.get(3)?;
     let status: String = row.get(4)?;
     let created_at: String = row.get(5)?;
     let updated_at: String = row.get(6)?;
@@ -451,7 +565,7 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
         id: row.get(0)?,
         artifact_id: row.get(1)?,
         revision_id: row.get(2)?,
-        candidate_type: CandidateType::parse(&candidate_type).map_err(to_sql_error)?,
+        template_key,
         status: CandidateStatus::parse(&status).map_err(to_sql_error)?,
         created_at: parse_time_sql(&created_at)?,
         updated_at: parse_time_sql(&updated_at)?,
@@ -469,6 +583,39 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+}
+
+fn build_revision(
+    artifact_id: &str,
+    number: i64,
+    source_bytes: &[u8],
+    rendered_bytes: &[u8],
+) -> Revision {
+    let source_digest = digest_hex(source_bytes);
+    let rendered_digest = digest_hex(rendered_bytes);
+    Revision {
+        id: Uuid::new_v4().to_string(),
+        artifact_id: artifact_id.to_owned(),
+        number,
+        source_path: revision_asset_path(artifact_id, number, "source", &source_digest),
+        rendered_path: revision_asset_path(artifact_id, number, "rendered", &rendered_digest),
+        source_digest,
+        rendered_digest,
+        created_at: Utc::now(),
+    }
+}
+
+fn validate_template_key(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    if valid {
+        Ok(trimmed.to_owned())
+    } else {
+        Err(ArtifactStoreError::InvalidTemplateKey(value.to_owned()))
+    }
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
@@ -604,12 +751,9 @@ mod tests {
             .add_revision(&artifact.id, b"source", b"rendered")
             .unwrap();
         let candidate = store
-            .register_candidate(
-                &revision.id,
-                CandidateType::Primary,
-                CandidateStatus::Proposed,
-            )
+            .register_candidate(&revision.id, "psr", CandidateStatus::Proposed)
             .unwrap();
+        assert_eq!(candidate.template_key, "psr");
         assert_eq!(candidate.status, CandidateStatus::Proposed);
 
         let trial = store
@@ -638,5 +782,109 @@ mod tests {
         let candidates = store.list_candidates(&artifact.id).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].status, CandidateStatus::Superseded);
+    }
+
+    #[test]
+    fn admit_bundle_creates_artifact_revision_annotation_and_candidate() {
+        let (_dir, store) = store();
+
+        let receipt = store
+            .admit_bundle(AdmitBundleInput {
+                artifact_key: "deck/psr".to_owned(),
+                artifact_title: "PSR Deck".to_owned(),
+                source_bytes: b"source one".to_vec(),
+                rendered_bytes: b"rendered one".to_vec(),
+                annotation: Some("initial proposal".to_owned()),
+                candidate_template_key: Some("psr".to_owned()),
+            })
+            .unwrap();
+
+        assert_eq!(receipt.artifact.key, "deck/psr");
+        assert_eq!(receipt.revision.number, 1);
+        assert_eq!(receipt.revision.source_digest, digest_hex(b"source one"));
+        assert_eq!(
+            store.read_source_bytes(&receipt.revision).unwrap(),
+            b"source one"
+        );
+        assert_eq!(
+            store.read_rendered_bytes(&receipt.revision).unwrap(),
+            b"rendered one"
+        );
+        assert_eq!(
+            receipt.annotation.as_ref().unwrap().body,
+            "initial proposal"
+        );
+        let candidate = receipt.candidate.as_ref().unwrap();
+        assert_eq!(candidate.template_key, "psr");
+        assert_eq!(candidate.status, CandidateStatus::Proposed);
+        assert_eq!(candidate.revision_id, receipt.revision.id);
+        assert_eq!(store.list_artifacts().unwrap().len(), 1);
+        assert_eq!(store.list_revisions(&receipt.artifact.id).unwrap().len(), 1);
+        assert_eq!(
+            store.list_annotations(&receipt.artifact.id).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.list_candidates(&receipt.artifact.id).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn admit_bundle_reuses_artifact_key_and_appends_second_revision() {
+        let (_dir, store) = store();
+
+        let first = store
+            .admit_bundle(AdmitBundleInput {
+                artifact_key: "deck/psr".to_owned(),
+                artifact_title: "PSR Deck".to_owned(),
+                source_bytes: b"source one".to_vec(),
+                rendered_bytes: b"rendered one".to_vec(),
+                annotation: None,
+                candidate_template_key: Some("psr".to_owned()),
+            })
+            .unwrap();
+        let second = store
+            .admit_bundle(AdmitBundleInput {
+                artifact_key: "deck/psr".to_owned(),
+                artifact_title: "Ignored Replacement Title".to_owned(),
+                source_bytes: b"source two".to_vec(),
+                rendered_bytes: b"rendered two".to_vec(),
+                annotation: Some("second revision".to_owned()),
+                candidate_template_key: Some("psr".to_owned()),
+            })
+            .unwrap();
+
+        assert_eq!(first.artifact.id, second.artifact.id);
+        assert_eq!(second.artifact.title, "PSR Deck");
+        assert_eq!(first.revision.number, 1);
+        assert_eq!(second.revision.number, 2);
+        assert_ne!(first.revision.id, second.revision.id);
+        assert_eq!(store.list_artifacts().unwrap().len(), 1);
+        let revisions = store.list_revisions(&first.artifact.id).unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].id, first.revision.id);
+        assert_eq!(revisions[1].id, second.revision.id);
+        assert_eq!(store.list_candidates(&first.artifact.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn admit_bundle_rejects_invalid_template_key_without_partial_lineage() {
+        let (_dir, store) = store();
+
+        let error = store
+            .admit_bundle(AdmitBundleInput {
+                artifact_key: "deck/psr".to_owned(),
+                artifact_title: "PSR Deck".to_owned(),
+                source_bytes: b"source one".to_vec(),
+                rendered_bytes: b"rendered one".to_vec(),
+                annotation: Some("should not persist".to_owned()),
+                candidate_template_key: Some("Primary".to_owned()),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, ArtifactStoreError::InvalidTemplateKey(_)));
+        assert!(store.get_artifact_by_key("deck/psr").unwrap().is_none());
+        assert!(store.list_artifacts().unwrap().is_empty());
     }
 }
