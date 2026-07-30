@@ -116,6 +116,66 @@ try {
 	  };
 	}
 
+	function createArtifactsCapability(config, effects) {
+	  if (!config || typeof config !== "object") return undefined;
+	  const mode = config.mode === "apply" ? "apply" : "off";
+	  const catalogSnapshot = config.catalog && typeof config.catalog === "object"
+	    ? config.catalog
+	    : { artifacts: [], candidates: [] };
+	  let admitted = false;
+	  const limited = (items, limit) => Array.isArray(items)
+	    ? items.slice(0, Math.max(0, Math.min(Number(limit ?? 100), 200)))
+	    : [];
+	  const clone = (value) => JSON.parse(JSON.stringify(value));
+	  const assertText = (name, value) => {
+	    if (typeof value !== "string" || value.length === 0) {
+	      throw new Error("artifact bundle " + name + " must be a non-empty string");
+	    }
+	    return value;
+	  };
+	  const normalizeBundle = (bundle) => {
+	    if (!bundle || typeof bundle !== "object") throw new Error("artifact bundle must be an object");
+	    const normalized = {
+	      key: assertText("key", bundle.key),
+	      title: assertText("title", bundle.title),
+	      source: assertText("source", bundle.source),
+	      rendered: assertText("rendered", bundle.rendered),
+	    };
+	    if (bundle.annotation != null) normalized.annotation = assertText("annotation", bundle.annotation);
+	    if (bundle.templateKey != null) normalized.templateKey = assertText("templateKey", bundle.templateKey);
+	    return normalized;
+	  };
+	  return Object.freeze({
+	    mode,
+	    status: () => ({
+	      mode,
+	      counts: {
+	        artifacts: Array.isArray(catalogSnapshot.artifacts) ? catalogSnapshot.artifacts.length : 0,
+	        candidates: Array.isArray(catalogSnapshot.candidates) ? catalogSnapshot.candidates.length : 0,
+	      },
+	      limit: catalogSnapshot.limit ?? 200,
+	    }),
+	    catalog: (limit = 100) => ({
+	      ...clone(catalogSnapshot),
+	      artifacts: limited(catalogSnapshot.artifacts, limit),
+	      candidates: limited(catalogSnapshot.candidates, limit),
+	    }),
+	    candidates: (limit = 100) => limited(catalogSnapshot.candidates, limit).map(clone),
+	    admitBundle: async (bundle) => {
+	      if (mode !== "apply") throw new Error("mt.artifacts.admitBundle requires artifact_mode apply");
+	      if (admitted) throw new Error("mt.artifacts permits one bundle admission per evaluation");
+	      const effect = {
+	        capability: "artifacts",
+	        operation: "admit_bundle",
+	        input: normalizeBundle(bundle),
+	      };
+	      effects.push(effect);
+	      admitted = true;
+	      return { queued: true, mode, effectIndex: effects.length - 1 };
+	    },
+	  });
+	}
+
 	function createTaskerCapability(config, effects) {
 	  if (!config || typeof config !== "object") return undefined;
 	  const mode = config.mode === "apply" ? "apply" : "plan";
@@ -248,9 +308,11 @@ export async function run(request) {
 	      };
 	    }
 	    const tasker = createTaskerCapability(request.capabilities?.tasker, effects);
+	    const artifacts = createArtifactsCapability(request.capabilities?.artifacts, effects);
 	    const extensionMethods = {
 	      inputs: request.inputs,
 	      ...(tasker ? { tasker } : {}),
+	      ...(artifacts ? { artifacts } : {}),
 	      get context() { return contextSnapshot(); },
 	      history: readHistory,
 	      recordHistory: writeHistory,

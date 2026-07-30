@@ -5,7 +5,8 @@
     "read/write/sh/exec operate on the GUEST filesystem (cwd /data, the durable workspace store mount), not the host repo.",
     "Store data should include _meta: { summary } for catalog discipline.",
     "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot and may emit one atomic reconciliation effect; guest code never receives the database handle.",
-    "Use tasker_mode plan before apply when inspecting a new reconciliation. Plan executes the same canonical mutation semantics against an in-memory SQLite fork, returns a normalized stable simulation, and issues a time-bounded host receipt without changing the source database. Apply requires tasker_receipt and verifies its project, snapshot, exact change-set digest, and expiry before mutating canonical state."
+    "Use tasker_mode plan before apply when inspecting a new reconciliation. Plan executes the same canonical mutation semantics against an in-memory SQLite fork, returns a normalized stable simulation, and issues a time-bounded host receipt without changing the source database. Apply requires tasker_receipt and verifies its project, snapshot, exact change-set digest, and expiry before mutating canonical state.",
+    "mt.artifacts is present only when the host grants artifact_mode apply. It exposes a bounded read-only catalog and candidates list, and admitBundle(bundle) emits exactly one host-admitted artifacts.admit_bundle effect; guest code never receives artifact-store filesystem or database authority."
   ],
   "undeclared": [
     "exec",
@@ -15,203 +16,221 @@
     "stored-procedures": [
       {
         "name": "call",
-        "signature": "async (name, args?) → any"
+        "signature": "async (name, args?) \u2192 any"
       },
       {
         "name": "define",
-        "signature": "async (name, fn, opts) → ProcedureRecord"
+        "signature": "async (name, fn, opts) \u2192 ProcedureRecord"
       },
       {
         "name": "defineCode",
-        "signature": "async (name, code, opts) → ProcedureRecord"
+        "signature": "async (name, code, opts) \u2192 ProcedureRecord"
       },
       {
         "name": "describeProcedure",
-        "signature": "async (name) → ProcedureRecord | null"
+        "signature": "async (name) \u2192 ProcedureRecord | null"
       },
       {
         "name": "fn",
-        "signature": "→ Proxy (calls are awaitable)"
+        "signature": "\u2192 Proxy (calls are awaitable)"
       },
       {
         "name": "procedures",
-        "signature": "async () → ProcedureSummary[]"
+        "signature": "async () \u2192 ProcedureSummary[]"
       },
       {
         "name": "removeProcedure",
-        "signature": "async (name) → boolean"
+        "signature": "async (name) \u2192 boolean"
       },
       {
         "name": "source",
-        "signature": "async (name) → string | null"
+        "signature": "async (name) \u2192 string | null"
       }
     ],
     "store-api": [
       {
         "name": "catalog",
-        "signature": "async (nsGlob?) → CatalogEntry[]"
+        "signature": "async (nsGlob?) \u2192 CatalogEntry[]"
       },
       {
         "name": "clear",
-        "signature": "async (ns) → number"
+        "signature": "async (ns) \u2192 number"
       },
       {
         "name": "collections",
-        "signature": "async () → [{name, count}]"
+        "signature": "async () \u2192 [{name, count}]"
       },
       {
         "name": "delete",
-        "signature": "async (ns, key) → boolean"
+        "signature": "async (ns, key) \u2192 boolean"
       },
       {
         "name": "describe",
-        "signature": "async (ns, key) → _meta | null"
+        "signature": "async (ns, key) \u2192 _meta | null"
       },
       {
         "name": "domain",
-        "signature": "async (name, config) → void"
+        "signature": "async (name, config) \u2192 void"
       },
       {
         "name": "domains",
-        "signature": "async () → DomainConfig[]"
+        "signature": "async () \u2192 DomainConfig[]"
       },
       {
         "name": "exportStore",
-        "signature": "async (opts) → ExportManifest"
+        "signature": "async (opts) \u2192 ExportManifest"
       },
       {
         "name": "get",
-        "signature": "async (ns, key) → data | null"
+        "signature": "async (ns, key) \u2192 data | null"
       },
       {
         "name": "getRaw",
-        "signature": "async (ns, key) → envelope | null"
+        "signature": "async (ns, key) \u2192 envelope | null"
       },
       {
         "name": "importStore",
-        "signature": "async (opts) → ImportResult"
+        "signature": "async (opts) \u2192 ImportResult"
       },
       {
         "name": "keys",
-        "signature": "async (ns) → string[]"
+        "signature": "async (ns) \u2192 string[]"
       },
       {
         "name": "profiles",
-        "signature": "async () → ProfileSummary[]"
+        "signature": "async () \u2192 ProfileSummary[]"
       },
       {
         "name": "put",
-        "signature": "async (ns, key, data, tags?) → void"
+        "signature": "async (ns, key, data, tags?) \u2192 void"
       },
       {
         "name": "putNow",
-        "signature": "async (ns, prefix, data) → {ns,key}"
+        "signature": "async (ns, prefix, data) \u2192 {ns,key}"
       },
       {
         "name": "query",
-        "signature": "async (ns, filter?) → results[]"
+        "signature": "async (ns, filter?) \u2192 results[]"
       },
       {
         "name": "removeProfile",
-        "signature": "async (name) → { removed, collections }"
+        "signature": "async (name) \u2192 { removed, collections }"
       },
       {
         "name": "search",
-        "signature": "async (text, nsGlob?) → SearchHit[]"
+        "signature": "async (text, nsGlob?) \u2192 SearchHit[]"
       },
       {
         "name": "store",
-        "signature": "async (ns, key, data, tags?) → void"
+        "signature": "async (ns, key, data, tags?) \u2192 void"
       },
       {
         "name": "vars",
-        "signature": "async () → VarInfo[]"
+        "signature": "async () \u2192 VarInfo[]"
       }
     ],
     "fluent-builders": [
       {
         "name": "from",
-        "signature": "(ns) → QueryBuilder"
+        "signature": "(ns) \u2192 QueryBuilder"
       },
       {
         "name": "into",
-        "signature": "(ns) → PutBuilder"
+        "signature": "(ns) \u2192 PutBuilder"
       }
     ],
     "overlay-management": [
       {
         "name": "hasOverlay",
-        "signature": "(id) → boolean"
+        "signature": "(id) \u2192 boolean"
       },
       {
         "name": "loadOverlay",
-        "signature": "async (overlay) → void"
+        "signature": "async (overlay) \u2192 void"
       },
       {
         "name": "overlays",
-        "signature": "() → [{id, name, version?}]"
+        "signature": "() \u2192 [{id, name, version?}]"
       },
       {
         "name": "switchOverlay",
-        "signature": "async (overlay) → void"
+        "signature": "async (overlay) \u2192 void"
       },
       {
         "name": "unloadOverlay",
-        "signature": "async (id) → void"
+        "signature": "async (id) \u2192 void"
       }
     ],
     "context-history": [
       {
         "name": "history",
-        "signature": "(n?) → HistoryEntry[]"
+        "signature": "(n?) \u2192 HistoryEntry[]"
       }
     ],
     "eval-discipline": [
       {
         "name": "read",
-        "signature": "async (path) → string"
+        "signature": "async (path) \u2192 string"
       },
       {
         "name": "sh",
-        "signature": "async (cmd) → string"
+        "signature": "async (cmd) \u2192 string"
       },
       {
         "name": "write",
-        "signature": "async (path, content) → void"
+        "signature": "async (path, content) \u2192 void"
       }
     ],
     "tasker-capability": [
       {
         "name": "tasker.status",
-        "signature": "() → {mode, snapshotHash, counts, truncated}"
+        "signature": "() \u2192 {mode, snapshotHash, counts, truncated}"
       },
       {
         "name": "tasker.list",
-        "signature": "(options?) → Task[]"
+        "signature": "(options?) \u2192 Task[]"
       },
       {
         "name": "tasker.ready",
-        "signature": "(limit?) → Task[]"
+        "signature": "(limit?) \u2192 Task[]"
       },
       {
         "name": "tasker.features",
-        "signature": "(options?) → Feature[]"
+        "signature": "(options?) \u2192 Feature[]"
       },
       {
         "name": "tasker.batch",
-        "signature": "async (operations) → ReconciliationReceipt"
+        "signature": "async (operations) \u2192 ReconciliationReceipt"
       },
       {
         "name": "tasker.plan",
-        "signature": "async (tasks) → ReconciliationReceipt"
+        "signature": "async (tasks) \u2192 ReconciliationReceipt"
       },
       {
         "name": "tasker.featurePlan",
-        "signature": "async (feature) → ReconciliationReceipt"
+        "signature": "async (feature) \u2192 ReconciliationReceipt"
       },
       {
         "name": "tasker.reconcile",
-        "signature": "async ({kind, payload}) → ReconciliationReceipt"
+        "signature": "async ({kind, payload}) \u2192 ReconciliationReceipt"
+      }
+    ],
+    "artifacts-capability": [
+      {
+        "name": "artifacts.status",
+        "signature": "() \u2192 {mode, counts, limit}"
+      },
+      {
+        "name": "artifacts.catalog",
+        "signature": "(limit?) \u2192 {artifacts, candidates, limit}"
+      },
+      {
+        "name": "artifacts.candidates",
+        "signature": "(limit?) \u2192 Candidate[]"
+      },
+      {
+        "name": "artifacts.admitBundle",
+        "signature": "async ({key,title,source,rendered,annotation?,templateKey?}) \u2192 AdmissionQueueReceipt"
       }
     ]
   }
