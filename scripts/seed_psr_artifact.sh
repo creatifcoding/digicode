@@ -67,39 +67,32 @@ python -m json.tool "$PACKET_DIR/candidate.manifest.json" > /dev/null
 
 write_request() {
   mkdir -p "$(dirname "$REQUEST_FILE")"
-  python - "$REQUEST_FILE" <<'PY'
-import json, sys
-request_file = sys.argv[1]
-files = ["psr.md", "artifact.manifest.json", "candidate.manifest.json", "revisions.md", "rendered.html", "mt-admission.request.json"]
+  python - "$REQUEST_FILE" "$PACKET_DIR" <<'PY'
+import json, pathlib, sys
+request_file = pathlib.Path(sys.argv[1])
+packet_dir = pathlib.Path(sys.argv[2])
+source = (packet_dir / "psr.md").read_text(encoding="utf-8")
+rendered = (packet_dir / "rendered.html").read_text(encoding="utf-8")
+annotation = (packet_dir / "revisions.md").read_text(encoding="utf-8")
 payload = {
   "tool": "mt",
   "action": "evaluate",
   "profile": "pure",
   "tasker_mode": "off",
-  "code": "const packet = inputs.packet;\nawait mt.put('artifact-library', packet.artifact.key, {\n  _meta: { summary: packet.artifact.summary },\n  type: packet.artifact.type,\n  templateKey: packet.artifact.templateKey,\n  candidateInstance: packet.artifact.candidateInstance,\n  files: packet.files,\n  claims: packet.claims\n});\nreturn { admitted: true, artifactKey: packet.artifact.key, templateKey: packet.artifact.templateKey, candidateInstance: packet.artifact.candidateInstance };",
+  "artifact_mode": "apply",
+  "code": "return await mt.artifacts.admitBundle(inputs.bundle);",
   "inputs": {
-    "packet": {
-      "artifact": {
-        "key": "psr-candidate-type-001",
-        "templateKey": "psr",
-        "candidateInstance": "001",
-        "type": "PSR candidate instance",
-        "summary": "First PSR candidate instance admitted through MetaTool-owned artifact-library API request."
-      },
-      "files": files,
-      "claims": {
-        "observed": [
-          "Repository packet files exist under the owned docs/examples paths.",
-          "The admission request payload is represented as JSON and can be handed to mt evaluate."
-        ],
-        "blocked": [
-          "This request file is not proof of execution. A receipt is required before claiming admission occurred."
-        ]
-      }
+    "bundle": {
+      "key": "psr.artifact-library.candidate-type-001",
+      "title": "Artifact Library PSR Candidate Type 001",
+      "source": source,
+      "rendered": rendered,
+      "annotation": annotation,
+      "templateKey": "psr"
     }
   }
 }
-with open(request_file, "w", encoding="utf-8") as handle:
+with request_file.open("w", encoding="utf-8") as handle:
     json.dump(payload, handle, indent=2)
     handle.write("\n")
 PY

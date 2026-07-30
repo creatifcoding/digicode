@@ -3324,6 +3324,7 @@ dependencies = [
  "global-hotkey",
  "jcode-agent-runtime",
  "jcode-ambient-types",
+ "jcode-artifact-store",
  "jcode-base",
  "jcode-build-meta",
  "jcode-build-support",
@@ -3365,6 +3366,32 @@ dependencies = [
  "urlencoding",
  "uuid",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "jcode-artifact-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jcode-artifact-store",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "jcode-artifact-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
