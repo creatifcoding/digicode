@@ -1,0 +1,23 @@
+[package]
+name = "jcode-artifact-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "jcode_artifact_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jcode-artifact-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+jcode-artifact-store = { path = "../jcode-artifact-store" }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+tempfile = "3"
