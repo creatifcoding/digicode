@@ -25,19 +25,19 @@
   <header>
     <p class="tier">Artifact Library / PSR / MetaTool admission</p>
     <h1>Candidate Instance 001</h1>
-    <p>First candidate instance for reusable template key <code>psr</code>. MetaTool owns admission. The compatibility script keeps its old filename, but the operation is not seed doctrine.</p>
+    <p>First candidate instance for reusable template key <code>psr</code>. MetaTool owns artifact operations, the store owns persistence, and Datastar owns presentation.</p>
   </header>
   <section class="grid">
-    <article class="card"><h2>Observed</h2><p>The packet contains source prose, manifests, rendered HTML, revision notes, and an exact <code>mt-admission.request.json</code>.</p></article>
-    <article class="card"><h2>Proposed</h2><p>MetaTool admits the packet into the <code>artifact-library</code> namespace through <code>mt evaluate</code>.</p></article>
-    <article class="card"><h2>Blocked</h2><p>No receipt is present. Admission remains unclaimed until execution is observed.</p></article>
+    <article class="card"><h2>Measured</h2><p>Jcode revision <code>9e97fb980</code> admitted revision 1 through <code>mt.artifacts.admitBundle</code> and returned a durable receipt.</p></article>
+    <article class="card"><h2>Persisted</h2><p>A fresh server process reopened <code>JCODE_HOME/artifacts</code> and rendered the admitted revision.</p></article>
+    <article class="card"><h2>Candidate</h2><p>Template key <code>psr</code> is proposed, not ratified. One successful specimen is evidence, not doctrine.</p></article>
   </section>
   <section>
     <h2>Runbook</h2>
     <pre><code>./scripts/seed_psr_artifact.sh --dry-run
 ./scripts/seed_psr_artifact.sh --write-request
 ./scripts/seed_psr_artifact.sh --admit</code></pre>
-    <p>If no supported non-interactive MetaTool CLI path is available, <code>--admit</code> writes the request JSON and exits blocked rather than hallucinating success. A small mercy for future archaeology.</p>
+    <p>The compatibility script emits the exact native capability request. Jcode has now executed that request directly; any future CLI remains an adapter, not the owning API.</p>
   </section>
   <section>
     <h2>Acceptance</h2>
@@ -45,7 +45,8 @@
       <li>Candidate Type 001 means first candidate instance.</li>
       <li>Reusable template key is <code>psr</code>.</li>
       <li>Invented separate-ingestion doctrine is absent.</li>
-      <li>Observed, proposed, and blocked claims remain visibly separated.</li>
+      <li>MetaTool admission, durable restart, revision rendering, and Datastar SSE are measured.</li>
+      <li>Candidate ratification remains pending repeated evidence.</li>
     </ul>
   </section>
 </main>
