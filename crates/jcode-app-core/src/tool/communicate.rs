@@ -160,6 +160,29 @@ async fn fetch_plan_status(session_id: &str) -> Result<PlanGraphStatus> {
     }
 }
 
+async fn fetch_graph_read(
+    session_id: &str,
+    action: &str,
+    node_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Value> {
+    let request = Request::CommGraphRead {
+        id: REQUEST_ID,
+        session_id: session_id.to_string(),
+        action: action.to_string(),
+        node_id,
+        limit,
+    };
+    match send_request(request).await {
+        Ok(ServerEvent::CommGraphReadResponse { payload, .. }) => Ok(payload),
+        Ok(response) => {
+            ensure_success(&response)?;
+            Err(anyhow::anyhow!("No graph read payload returned."))
+        }
+        Err(error) => Err(anyhow::anyhow!("Failed to read swarm graph: {error}")),
+    }
+}
+
 fn format_plan_followup(summary: &PlanGraphStatus) -> String {
     format_comm_plan_followup(summary)
 }
@@ -1078,6 +1101,16 @@ fn format_run_plan_terminal_summary(
     output
 }
 
+fn plan_finished_cleanly(summary: &PlanGraphStatus) -> bool {
+    summary.completed_ids.len() == summary.item_count
+        && summary.failed_ids.is_empty()
+        && summary.blocked_ids.is_empty()
+        && summary.cycle_ids.is_empty()
+        && summary.unresolved_dependency_ids.is_empty()
+        && summary.active_ids.is_empty()
+        && summary.ready_ids.is_empty()
+}
+
 /// Minimum number of credential-failed workers that count as a wave rather
 /// than an isolated bad worker.
 const CREDENTIAL_FAILURE_WAVE_MIN_WORKERS: usize = 2;
@@ -1352,7 +1385,10 @@ async fn run_swarm_plan_loop(
                 let cleanup = cleanup_swarm_workers(ctx, &cleanup_params).await?;
                 output.push_str(&format!("\n{}", cleanup));
             }
-            return Ok(ToolOutput::new(output));
+            if plan_finished_cleanly(&summary) {
+                return Ok(ToolOutput::new(output));
+            }
+            return Err(anyhow::anyhow!(output));
         }
 
         let active_count = summary.active_ids.len().max(in_flight_sessions.len());
@@ -1928,6 +1964,11 @@ fn canonical_swarm_action(action: &str) -> &str {
         "agents" | "members" | "list_agents" | "list_members" | "roster" => "list",
         "models" | "model_list" | "list_model" | "list_providers" | "list_routes" => "list_models",
         "plan" | "status_plan" => "plan_status",
+        "graph" | "show_graph" => "graph_show",
+        "node" | "show_node" => "node_show",
+        "artifact" | "get_artifact" => "artifact_get",
+        "artifacts" | "list_artifacts" => "artifact_list",
+        "preview_hydration" | "preview_context" => "hydration_preview",
         "assign" => "assign_task",
         "kill" | "terminate" => "stop",
         _ => action,
@@ -1955,6 +1996,7 @@ impl Tool for CommunicateTool {
                     "enum": ["share", "share_append", "read", "message", "broadcast", "dm", "channel", "list", "list_channels", "channel_members",
                              "propose_plan", "approve_plan", "reject_plan", "spawn", "stop", "assign_role",
                              "status", "report", "plan_status", "summary", "read_context", "resync_plan", "assign_task", "assign_next", "fill_slots", "run_plan", "cleanup",
+                             "graph_show", "node_show", "artifact_get", "artifact_list", "hydration_preview",
                              "task_graph", "expand_node", "complete_node", "inject_gap",
                              "start", "start_task", "wake", "resume", "retry", "reassign", "replace", "salvage",
                              "subscribe_channel", "unsubscribe_channel", "await_members", "list_models"],
@@ -2025,7 +2067,7 @@ impl Tool for CommunicateTool {
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional max items for summary-style reads."
+                    "description": "Optional max items for summary-style reads, including graph_show and artifact_list (server-capped at 500)."
                 },
                 "task_id": {
                     "type": "string",
@@ -2122,7 +2164,7 @@ impl Tool for CommunicateTool {
                 "node_id".to_string(),
                 json!({
                     "type": "string",
-                    "description": "Task-DAG node id for expand_node/complete_node."
+                    "description": "Task-DAG node id for expand_node/complete_node and node_show/artifact_get/hydration_preview reads."
                 }),
             );
             props.insert(
@@ -2881,6 +2923,17 @@ impl Tool for CommunicateTool {
             "plan_status" => {
                 let summary = fetch_plan_status(&ctx.session_id).await?;
                 Ok(format_plan_status(&summary))
+            }
+
+            "graph_show" | "node_show" | "artifact_get" | "artifact_list" | "hydration_preview" => {
+                let payload = fetch_graph_read(
+                    &ctx.session_id,
+                    params.action.as_str(),
+                    params.node_id.clone(),
+                    params.limit,
+                )
+                .await?;
+                Ok(ToolOutput::new(serde_json::to_string_pretty(&payload)?))
             }
 
             "summary" => {

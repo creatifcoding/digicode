@@ -6,9 +6,12 @@ use crate::agent::Agent;
 use crate::protocol::{
     AgentStatusSnapshot, NotificationType, PlanGraphStatus, ServerEvent, SessionActivitySnapshot,
 };
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+
+const MAX_GRAPH_ARTIFACT_BYTES: usize = 128 * 1024;
 
 type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 
@@ -417,6 +420,290 @@ pub(super) async fn handle_comm_plan_status(
     let _ = client_event_tx.send(ServerEvent::CommPlanStatusResponse { id, summary });
 }
 
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated: String = value.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
+}
+
+fn graph_node_payload(
+    plan: &VersionedPlan,
+    node_id: &str,
+    include_artifact: bool,
+) -> Option<Value> {
+    let item = plan.items.iter().find(|item| item.id == node_id)?;
+    let dependents: Vec<&str> = plan
+        .items
+        .iter()
+        .filter(|candidate| candidate.blocked_by.iter().any(|dep| dep == node_id))
+        .map(|candidate| candidate.id.as_str())
+        .collect();
+    let meta = plan.node_meta.get(node_id);
+    let artifact_raw = meta.and_then(|meta| meta.artifact_json.as_deref());
+    let artifact_too_large = artifact_raw.is_some_and(|raw| raw.len() > MAX_GRAPH_ARTIFACT_BYTES);
+    let artifact = artifact_raw
+        .filter(|raw| raw.len() <= MAX_GRAPH_ARTIFACT_BYTES)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let artifact_invalid = artifact_raw.is_some() && !artifact_too_large && artifact.is_none();
+    let item = json!({
+        "id": item.id,
+        "content": truncate_chars(&item.content, if include_artifact { 8_000 } else { 1_000 }),
+        "status": item.status,
+        "priority": item.priority,
+        "subsystem": item.subsystem,
+        "file_scope": item.file_scope.iter().take(50).collect::<Vec<_>>(),
+        "blocked_by": item.blocked_by,
+        "assigned_to": item.assigned_to,
+    });
+    Some(json!({
+        "item": item,
+        "kind": meta.and_then(|meta| meta.kind.as_deref()),
+        "parent": meta.and_then(|meta| meta.parent.as_deref()),
+        "origin": meta.and_then(|meta| meta.origin.as_deref()),
+        "expanded": meta.is_some_and(|meta| meta.expanded),
+        "is_gate": meta.is_some_and(|meta| meta.is_gate),
+        "planner": meta.and_then(|meta| meta.planner.as_deref()),
+        "dependents": dependents,
+        "progress": plan.task_progress.get(node_id),
+        "artifact_present": artifact_raw.is_some(),
+        "artifact_invalid": artifact_invalid,
+        "artifact_too_large": artifact_too_large,
+        "artifact_confidence": artifact.as_ref().and_then(|value| value.get("confidence")),
+        "artifact": include_artifact.then_some(artifact).flatten(),
+    }))
+}
+
+pub(super) fn graph_read_payload(
+    swarm_id: &str,
+    plan: &VersionedPlan,
+    action: &str,
+    node_id: Option<&str>,
+    requested_limit: Option<usize>,
+) -> Result<Value, String> {
+    let limit = requested_limit.unwrap_or(100).clamp(1, 500);
+    match action {
+        "graph_show" => {
+            let summary = PlanGraphStatus::from_versioned_plan(
+                swarm_id.to_string(),
+                plan,
+                Some(8),
+                Vec::new(),
+            );
+            let terminal = summary.active_ids.is_empty()
+                && summary.ready_ids.is_empty()
+                && summary.blocked_ids.is_empty();
+            let success = summary.item_count > 0
+                && terminal
+                && summary.failed_ids.is_empty()
+                && summary.cycle_ids.is_empty()
+                && summary.unresolved_dependency_ids.is_empty()
+                && summary.completed_ids.len() == summary.item_count;
+            let nodes: Vec<Value> = plan
+                .items
+                .iter()
+                .take(limit)
+                .filter_map(|item| graph_node_payload(plan, &item.id, false))
+                .collect();
+            let returned_nodes = nodes.len();
+            Ok(json!({
+                "summary": summary,
+                "terminal": terminal,
+                "success": success,
+                "nodes": nodes,
+                "returned_nodes": returned_nodes,
+                "truncated": plan.items.len() > limit,
+            }))
+        }
+        "node_show" => {
+            let node_id = node_id.ok_or_else(|| "node_show requires node_id".to_string())?;
+            graph_node_payload(plan, node_id, true)
+                .ok_or_else(|| format!("Unknown graph node '{node_id}'"))
+        }
+        "artifact_get" => {
+            let node_id = node_id.ok_or_else(|| "artifact_get requires node_id".to_string())?;
+            let item = plan
+                .items
+                .iter()
+                .find(|item| item.id == node_id)
+                .ok_or_else(|| format!("Unknown graph node '{node_id}'"))?;
+            let meta = plan.node_meta.get(node_id);
+            let raw = meta
+                .and_then(|meta| meta.artifact_json.as_deref())
+                .ok_or_else(|| format!("Node '{node_id}' has no artifact"))?;
+            if raw.len() > MAX_GRAPH_ARTIFACT_BYTES {
+                return Err(format!(
+                    "Node '{node_id}' artifact is too large to return ({} bytes; max {})",
+                    raw.len(),
+                    MAX_GRAPH_ARTIFACT_BYTES
+                ));
+            }
+            let artifact = serde_json::from_str::<Value>(raw)
+                .map_err(|error| format!("Node '{node_id}' has invalid artifact JSON: {error}"))?;
+            Ok(json!({
+                "node_id": node_id,
+                "status": item.status,
+                "kind": meta.and_then(|meta| meta.kind.as_deref()),
+                "artifact": artifact,
+            }))
+        }
+        "artifact_list" => {
+            let mut invalid_count = 0usize;
+            let all_artifacts: Vec<Value> = plan
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let meta = plan.node_meta.get(&item.id)?;
+                    let raw = meta.artifact_json.as_deref()?;
+                    if raw.len() > MAX_GRAPH_ARTIFACT_BYTES {
+                        invalid_count += 1;
+                        return None;
+                    }
+                    let artifact = match serde_json::from_str::<Value>(raw) {
+                        Ok(artifact) => artifact,
+                        Err(_) => {
+                            invalid_count += 1;
+                            return None;
+                        }
+                    };
+                    Some(json!({
+                        "node_id": item.id,
+                        "status": item.status,
+                        "kind": meta.kind.as_deref(),
+                        "confidence": artifact.get("confidence"),
+                        "findings": artifact.get("findings").and_then(Value::as_str).map(|value| truncate_chars(value, 240)),
+                        "validation": artifact.get("validation").and_then(Value::as_str).map(|value| truncate_chars(value, 240)),
+                    }))
+                })
+                .collect();
+            let total = all_artifacts.len();
+            let artifacts: Vec<Value> = all_artifacts.into_iter().take(limit).collect();
+            let returned = artifacts.len();
+            Ok(json!({
+                "artifacts": artifacts,
+                "returned": returned,
+                "total": total,
+                "invalid_count": invalid_count,
+                "truncated": total > limit,
+            }))
+        }
+        "hydration_preview" => {
+            let node_id =
+                node_id.ok_or_else(|| "hydration_preview requires node_id".to_string())?;
+            let item = plan
+                .items
+                .iter()
+                .find(|item| item.id == node_id)
+                .ok_or_else(|| format!("Unknown graph node '{node_id}'"))?;
+            let mut included = Vec::new();
+            let mut missing = Vec::new();
+            for dependency in &item.blocked_by {
+                let Some(dep) = plan
+                    .items
+                    .iter()
+                    .find(|candidate| &candidate.id == dependency)
+                else {
+                    missing.push(json!({"node_id": dependency, "reason": "unknown_dependency"}));
+                    continue;
+                };
+                if !jcode_plan::is_completed_status(&dep.status) {
+                    missing.push(json!({"node_id": dependency, "reason": "not_completed", "status": dep.status}));
+                    continue;
+                }
+                let Some(raw) = plan
+                    .node_meta
+                    .get(dependency)
+                    .and_then(|meta| meta.artifact_json.as_deref())
+                else {
+                    missing.push(json!({"node_id": dependency, "reason": "artifact_missing"}));
+                    continue;
+                };
+                if raw.len() > MAX_GRAPH_ARTIFACT_BYTES
+                    || serde_json::from_str::<jcode_plan::dag::HandoffArtifact>(raw).is_err()
+                {
+                    missing.push(json!({"node_id": dependency, "reason": "artifact_invalid"}));
+                } else {
+                    included.push(dependency.clone());
+                }
+            }
+            let context = jcode_plan::bridge::upstream_context(plan, node_id);
+            let context_truncated = context
+                .as_deref()
+                .is_some_and(|value| value.chars().count() > 32_000);
+            let context = context.map(|value| truncate_chars(&value, 32_000));
+            let ready = missing.is_empty();
+            Ok(json!({
+                "node_id": node_id,
+                "dependency_ids": item.blocked_by,
+                "included_artifact_ids": included,
+                "missing_inputs": missing,
+                "ready": ready,
+                "context": context,
+                "context_truncated": context_truncated,
+            }))
+        }
+        _ => Err(format!("Unknown graph read action '{action}'")),
+    }
+}
+
+pub(super) async fn handle_comm_graph_read(
+    id: u64,
+    req_session_id: String,
+    action: String,
+    node_id: Option<String>,
+    limit: Option<usize>,
+    swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
+    client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    let swarm_id = {
+        let members = swarm_members.read().await;
+        members
+            .get(&req_session_id)
+            .and_then(|member| member.swarm_id.clone())
+    };
+    let Some(swarm_id) = swarm_id else {
+        let _ = client_event_tx.send(ServerEvent::Error {
+            id,
+            message: "Not in a swarm.".to_string(),
+            retry_after_secs: None,
+        });
+        return;
+    };
+    let result = {
+        let plans = swarm_plans.read().await;
+        match plans.get(&swarm_id) {
+            Some(plan) => graph_read_payload(&swarm_id, plan, &action, node_id.as_deref(), limit),
+            None if action == "graph_show" || action == "artifact_list" => graph_read_payload(
+                &swarm_id,
+                &VersionedPlan::new(),
+                &action,
+                node_id.as_deref(),
+                limit,
+            ),
+            None => Err("No swarm plan exists for this swarm.".to_string()),
+        }
+    };
+    match result {
+        Ok(payload) => {
+            let _ = client_event_tx.send(ServerEvent::CommGraphReadResponse {
+                id,
+                action,
+                payload,
+            });
+        }
+        Err(message) => {
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message,
+                retry_after_secs: None,
+            });
+        }
+    }
+}
+
 pub(super) async fn handle_comm_resync_plan(
     id: u64,
     req_session_id: String,
@@ -495,5 +782,151 @@ pub(super) async fn handle_comm_resync_plan(
             message: "Not in a swarm.".to_string(),
             retry_after_secs: None,
         });
+    }
+}
+
+#[cfg(test)]
+mod graph_read_tests {
+    use super::*;
+    use jcode_plan::{NodeMeta, PlanItem, SwarmTaskProgress};
+
+    fn test_plan() -> VersionedPlan {
+        let mut plan = VersionedPlan::new();
+        plan.version = 55;
+        plan.mode = "deep".to_string();
+        plan.items = vec![
+            PlanItem {
+                content: "audit the store".to_string(),
+                status: "completed".to_string(),
+                priority: "high".to_string(),
+                id: "audit.store".to_string(),
+                subsystem: None,
+                file_scope: vec!["store.rs".to_string()],
+                blocked_by: Vec::new(),
+                assigned_to: Some("worker-a".to_string()),
+            },
+            PlanItem {
+                content: "audit tool context".to_string(),
+                status: "failed".to_string(),
+                priority: "high".to_string(),
+                id: "audit.toolctx".to_string(),
+                subsystem: None,
+                file_scope: Vec::new(),
+                blocked_by: Vec::new(),
+                assigned_to: Some("worker-b".to_string()),
+            },
+            PlanItem {
+                content: "implement canonical store".to_string(),
+                status: "todo".to_string(),
+                priority: "high".to_string(),
+                id: "implement.store".to_string(),
+                subsystem: None,
+                file_scope: vec!["store.rs".to_string()],
+                blocked_by: vec!["audit.store".to_string(), "audit.toolctx".to_string()],
+                assigned_to: None,
+            },
+        ];
+        plan.node_meta.insert(
+            "audit.store".to_string(),
+            NodeMeta {
+                kind: Some("explore".to_string()),
+                artifact_json: Some(
+                    json!({
+                        "findings": "SQLite is canonical.",
+                        "evidence": ["store.rs:10"],
+                        "validation": "read-only audit",
+                        "confidence": "high",
+                        "what_i_did_not_check": []
+                    })
+                    .to_string(),
+                ),
+                ..NodeMeta::default()
+            },
+        );
+        plan.task_progress.insert(
+            "audit.toolctx".to_string(),
+            SwarmTaskProgress {
+                checkpoint_summary: Some("ENOSPC".to_string()),
+                ..SwarmTaskProgress::default()
+            },
+        );
+        plan
+    }
+
+    #[test]
+    fn graph_show_exposes_false_success_and_bounded_nodes() {
+        let payload = graph_read_payload("swarm-1", &test_plan(), "graph_show", None, Some(2))
+            .expect("graph payload");
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["terminal"], false);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["returned_nodes"], 2);
+        assert_eq!(payload["summary"]["failed_ids"], json!(["audit.toolctx"]));
+        assert!(payload["nodes"][0]["artifact"].is_null());
+    }
+
+    #[test]
+    fn node_and_artifact_reads_preserve_relations_and_typed_payload() {
+        let plan = test_plan();
+        let node = graph_read_payload(&"swarm-1", &plan, "node_show", Some("audit.store"), None)
+            .expect("node payload");
+        assert_eq!(node["dependents"], json!(["implement.store"]));
+        assert_eq!(node["artifact_present"], true);
+        assert_eq!(node["artifact"]["confidence"], "high");
+
+        let artifact =
+            graph_read_payload("swarm-1", &plan, "artifact_get", Some("audit.store"), None)
+                .expect("artifact payload");
+        assert_eq!(artifact["artifact"]["findings"], "SQLite is canonical.");
+    }
+
+    #[test]
+    fn hydration_preview_matches_forward_dataflow_and_names_missing_inputs() {
+        let plan = test_plan();
+        let payload = graph_read_payload(
+            "swarm-1",
+            &plan,
+            "hydration_preview",
+            Some("implement.store"),
+            None,
+        )
+        .expect("hydration payload");
+        assert_eq!(payload["ready"], false);
+        assert_eq!(payload["included_artifact_ids"], json!(["audit.store"]));
+        assert_eq!(payload["missing_inputs"][0]["node_id"], "audit.toolctx");
+        assert_eq!(payload["missing_inputs"][0]["reason"], "not_completed");
+        let expected = jcode_plan::bridge::upstream_context(&plan, "implement.store")
+            .expect("upstream context");
+        assert_eq!(payload["context"], expected);
+    }
+
+    #[test]
+    fn artifact_list_is_summary_only_and_bounded() {
+        let payload = graph_read_payload("swarm-1", &test_plan(), "artifact_list", None, Some(1))
+            .expect("artifact list");
+        assert_eq!(payload["returned"], 1);
+        assert_eq!(payload["total"], 1);
+        assert_eq!(payload["artifacts"][0]["findings"], "SQLite is canonical.");
+        assert!(payload["artifacts"][0].get("artifact").is_none());
+    }
+
+    #[test]
+    fn hydration_preview_rejects_invalid_artifacts_that_runtime_hydration_skips() {
+        let mut plan = test_plan();
+        plan.node_meta
+            .get_mut("audit.store")
+            .expect("meta")
+            .artifact_json = Some("not-json".to_string());
+        let payload = graph_read_payload(
+            "swarm-1",
+            &plan,
+            "hydration_preview",
+            Some("implement.store"),
+            None,
+        )
+        .expect("hydration payload");
+        assert_eq!(payload["ready"], false);
+        assert_eq!(payload["missing_inputs"][0]["reason"], "artifact_invalid");
+        assert!(payload["context"].is_null());
     }
 }

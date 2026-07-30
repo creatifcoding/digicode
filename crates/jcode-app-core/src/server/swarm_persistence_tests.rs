@@ -663,6 +663,37 @@ fn gate_debt_and_artifact_hydration_survive_reload() {
     let loaded = load_runtime_state();
     let loaded_plan = loaded.plans.get("swarm-debt").expect("loaded plan");
 
+    // Public semantic graph reads are derived exclusively from the reloaded
+    // VersionedPlan, so artifacts and hydration remain inspectable after restart.
+    let graph_payload = crate::server::comm_sync::graph_read_payload(
+        "swarm-debt",
+        loaded_plan,
+        "graph_show",
+        None,
+        Some(10),
+    )
+    .expect("graph read after reload");
+    assert_eq!(graph_payload["summary"]["version"], 4);
+    let hydration_payload = crate::server::comm_sync::graph_read_payload(
+        "swarm-debt",
+        loaded_plan,
+        "hydration_preview",
+        Some("root.gate"),
+        None,
+    )
+    .expect("hydration read after reload");
+    assert_eq!(hydration_payload["ready"], true);
+    assert_eq!(
+        hydration_payload["included_artifact_ids"],
+        serde_json::json!(["root.solid", "root.shaky"])
+    );
+    assert!(
+        hydration_payload["context"]
+            .as_str()
+            .expect("hydration context")
+            .contains("solid scope fully mapped")
+    );
+
     // 1. Confidence-debt tracking: the reloaded plan still flags the shaky node.
     assert_eq!(
         crate::plan::bridge::low_confidence_completed_ids(loaded_plan),

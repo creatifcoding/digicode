@@ -612,6 +612,18 @@ pub enum Request {
     #[serde(rename = "comm_plan_status")]
     CommPlanStatus { id: u64, session_id: String },
 
+    /// Read structured state from the current swarm semantic graph.
+    #[serde(rename = "comm_graph_read")]
+    CommGraphRead {
+        id: u64,
+        session_id: String,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+
     /// Assign a task from the plan to a specific agent (coordinator only)
     #[serde(rename = "comm_assign_task")]
     CommAssignTask {
@@ -1330,6 +1342,14 @@ pub enum ServerEvent {
     /// Response to comm_plan_status request
     #[serde(rename = "comm_plan_status_response")]
     CommPlanStatusResponse { id: u64, summary: PlanGraphStatus },
+
+    /// Response to a structured semantic graph read.
+    #[serde(rename = "comm_graph_read_response")]
+    CommGraphReadResponse {
+        id: u64,
+        action: String,
+        payload: serde_json::Value,
+    },
 
     /// Response to comm_assign_task request
     #[serde(rename = "comm_assign_task_response")]

@@ -656,6 +656,7 @@ impl Request {
             Request::CommReadContext { id, .. } => *id,
             Request::CommResyncPlan { id, .. } => *id,
             Request::CommPlanStatus { id, .. } => *id,
+            Request::CommGraphRead { id, .. } => *id,
             Request::CommAssignTask { id, .. } => *id,
             Request::CommAssignNext { id, .. } => *id,
             Request::CommTaskControl { id, .. } => *id,
@@ -691,6 +692,7 @@ impl Request {
                 | Request::CommStatus { .. }
                 | Request::CommReport { .. }
                 | Request::CommPlanStatus { .. }
+                | Request::CommGraphRead { .. }
                 | Request::CommReadContext { .. }
                 | Request::CommResyncPlan { .. }
                 | Request::CommAssignTask { .. }

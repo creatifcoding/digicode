@@ -155,6 +155,47 @@ fn test_comm_plan_status_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn test_comm_graph_read_roundtrip() -> Result<()> {
+    let req = Request::CommGraphRead {
+        id: 42,
+        session_id: "session-root".to_string(),
+        action: "artifact_get".to_string(),
+        node_id: Some("audit.store".to_string()),
+        limit: Some(25),
+    };
+    assert_eq!(req.id(), 42);
+    assert!(req.is_lightweight_control_request());
+    let encoded = serde_json::to_string(&req)?;
+    assert!(encoded.contains("\"type\":\"comm_graph_read\""));
+    let decoded: Request = serde_json::from_str(&encoded)?;
+    let Request::CommGraphRead {
+        action,
+        node_id,
+        limit,
+        ..
+    } = decoded
+    else {
+        return Err(anyhow!("expected CommGraphRead"));
+    };
+    assert_eq!(action, "artifact_get");
+    assert_eq!(node_id.as_deref(), Some("audit.store"));
+    assert_eq!(limit, Some(25));
+
+    let event = ServerEvent::CommGraphReadResponse {
+        id: 42,
+        action: "artifact_get".to_string(),
+        payload: serde_json::json!({"node_id": "audit.store"}),
+    };
+    let encoded = serde_json::to_string(&event)?;
+    let decoded: ServerEvent = serde_json::from_str(&encoded)?;
+    let ServerEvent::CommGraphReadResponse { payload, .. } = decoded else {
+        return Err(anyhow!("expected CommGraphReadResponse"));
+    };
+    assert_eq!(payload["node_id"], "audit.store");
+    Ok(())
+}
+
+#[test]
 fn test_comm_members_roundtrip_includes_status() -> Result<()> {
     let event = ServerEvent::CommMembers {
         id: 9,
