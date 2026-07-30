@@ -381,15 +381,19 @@ fn reconcile_tasker_effects(
         return Err(anyhow!("Tasker capability snapshot identity mismatch"));
     }
 
-    let planned = json!({
-        "mode": requested_mode,
-        "status": if requested_mode == TaskerMode::Plan { "planned" } else { "admitted" },
-        "kind": input.kind,
-        "snapshot_hash": initial_snapshot_hash,
-        "payload": input.payload,
-    });
     if requested_mode == TaskerMode::Plan {
-        return Ok(planned);
+        let mut simulation = store.fork_in_memory()?;
+        let simulated = execute_tasker_reconciliation(&mut simulation, &input)?;
+        let simulated = normalize_tasker_simulation(&input, &simulated);
+        return Ok(json!({
+            "mode": requested_mode,
+            "status": "simulated",
+            "validated": true,
+            "kind": input.kind,
+            "snapshot_hash": initial_snapshot_hash,
+            "change_set": input.payload,
+            "simulation": simulated,
+        }));
     }
     if requested_mode != TaskerMode::Apply {
         return Err(anyhow!("Tasker effects require tasker_mode plan or apply"));
@@ -402,30 +406,7 @@ fn reconcile_tasker_effects(
         ));
     }
 
-    let applied = match input.kind.as_str() {
-        "batch" => {
-            let operations: Vec<BatchOperation> =
-                serde_json::from_value(input.payload.get("operations").cloned().ok_or_else(
-                    || anyhow!("Tasker batch reconciliation requires payload.operations"),
-                )?)?;
-            serde_json::to_value(store.batch_execute(operations)?)?
-        }
-        "plan" => {
-            let tasks: Vec<PlanTask> =
-                serde_json::from_value(input.payload.get("tasks").cloned().ok_or_else(|| {
-                    anyhow!("Tasker plan reconciliation requires payload.tasks")
-                })?)?;
-            serde_json::to_value(store.plan_import(tasks)?)?
-        }
-        "feature_plan" => {
-            let feature: FeaturePlanFeature =
-                serde_json::from_value(input.payload.get("feature").cloned().ok_or_else(
-                    || anyhow!("Tasker feature-plan reconciliation requires payload.feature"),
-                )?)?;
-            serde_json::to_value(store.feature_plan_import(FeaturePlanInput { feature })?)?
-        }
-        other => return Err(anyhow!("unsupported Tasker reconciliation kind: {other}")),
-    };
+    let applied = execute_tasker_reconciliation(store, &input)?;
     Ok(json!({
         "mode": requested_mode,
         "status": "applied",
@@ -433,6 +414,92 @@ fn reconcile_tasker_effects(
         "snapshot_hash": initial_snapshot_hash,
         "result": applied,
     }))
+}
+
+fn execute_tasker_reconciliation(
+    store: &mut PiTaskerStore,
+    input: &TaskerEffectInput,
+) -> Result<Value> {
+    match input.kind.as_str() {
+        "batch" => {
+            let operations: Vec<BatchOperation> =
+                serde_json::from_value(input.payload.get("operations").cloned().ok_or_else(
+                    || anyhow!("Tasker batch reconciliation requires payload.operations"),
+                )?)?;
+            Ok(serde_json::to_value(store.batch_execute(operations)?)?)
+        }
+        "plan" => {
+            let tasks: Vec<PlanTask> =
+                serde_json::from_value(input.payload.get("tasks").cloned().ok_or_else(|| {
+                    anyhow!("Tasker plan reconciliation requires payload.tasks")
+                })?)?;
+            Ok(serde_json::to_value(store.plan_import(tasks)?)?)
+        }
+        "feature_plan" => {
+            let feature: FeaturePlanFeature =
+                serde_json::from_value(input.payload.get("feature").cloned().ok_or_else(
+                    || anyhow!("Tasker feature-plan reconciliation requires payload.feature"),
+                )?)?;
+            Ok(serde_json::to_value(
+                store.feature_plan_import(FeaturePlanInput { feature })?,
+            )?)
+        }
+        other => Err(anyhow!("unsupported Tasker reconciliation kind: {other}")),
+    }
+}
+
+fn normalize_tasker_simulation(input: &TaskerEffectInput, result: &Value) -> Value {
+    match input.kind.as_str() {
+        "batch" => json!({
+            "created": result["created"],
+            "updated": result["updated"],
+            "operations": result["operations"].as_array().map(|operations| {
+                operations.iter().map(|operation| json!({
+                    "op": operation["op"],
+                    "key": operation["key"],
+                    "title": operation["task"]["title"],
+                    "state": operation["task"]["state"],
+                })).collect::<Vec<_>>()
+            }).unwrap_or_default(),
+        }),
+        "plan" => json!({
+            "task_count": result["taskCount"],
+            "dependency_count": result["dependencyCount"],
+            "tasks": input.payload["tasks"].as_array().map(|tasks| {
+                tasks.iter().map(|task| json!({
+                    "key": task["key"],
+                    "title": task["title"],
+                    "state": task.get("state").cloned().unwrap_or(Value::Null),
+                    "after": task.get("after").cloned().unwrap_or_else(|| json!([])),
+                })).collect::<Vec<_>>()
+            }).unwrap_or_default(),
+        }),
+        "feature_plan" => json!({
+            "feature_count": result["featureCount"],
+            "task_count": result["taskCount"],
+            "dependency_count": result["dependencyCount"],
+            "feature": summarize_feature_plan(&input.payload["feature"]),
+        }),
+        _ => Value::Null,
+    }
+}
+
+fn summarize_feature_plan(feature: &Value) -> Value {
+    json!({
+        "key": feature["key"],
+        "title": feature["title"],
+        "tasks": feature["tasks"].as_array().map(|tasks| {
+            tasks.iter().map(|task| json!({
+                "key": task["key"],
+                "title": task["title"],
+                "state": task.get("state").cloned().unwrap_or(Value::Null),
+                "after": task.get("after").cloned().unwrap_or_else(|| json!([])),
+            })).collect::<Vec<_>>()
+        }).unwrap_or_default(),
+        "children": feature["children"].as_array().map(|children| {
+            children.iter().map(summarize_feature_plan).collect::<Vec<_>>()
+        }).unwrap_or_default(),
+    })
 }
 
 fn output(title: impl Into<String>, metadata: Value) -> Result<ToolOutput> {
@@ -696,7 +763,19 @@ mod tests {
             &snapshot_hash,
         )
         .expect("plan reconciliation");
-        assert_eq!(planned["status"], "planned");
+        assert_eq!(planned["status"], "simulated");
+        assert_eq!(planned["validated"], true);
+        assert_eq!(planned["simulation"]["created"], 1);
+        assert_eq!(planned["simulation"]["operations"][0]["key"], "first");
+        assert_eq!(planned["simulation"]["operations"][0]["state"], "todo");
+        let repeated = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&effect),
+            TaskerMode::Plan,
+            &snapshot_hash,
+        )
+        .expect("repeat plan reconciliation");
+        assert_eq!(repeated, planned);
         assert!(store.list_tasks(None).expect("list after plan").is_empty());
 
         let mut apply_effect = effect;
@@ -738,6 +817,43 @@ mod tests {
         let error = reconcile_tasker_effects(&mut store, &[effect], TaskerMode::Apply, "current")
             .expect_err("stale snapshot must fail");
         assert!(error.to_string().contains("snapshot identity mismatch"));
+    }
+
+    #[test]
+    fn tasker_plan_simulation_rejects_invalid_operations_without_writing() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let database = workspace.path().join("tasks.db");
+        super::super::tasker::tests::install_pi_schema(&database);
+        let partition = ProjectPartition::with_db_path(
+            &database,
+            workspace.path().to_string_lossy().into_owned(),
+        );
+        let mut store = PiTaskerStore::open(partition).expect("open Pi-compatible Tasker store");
+        let (_, snapshot_hash) = tasker_snapshot(&store).expect("initial Tasker snapshot");
+        let effect = ExecutionEffect {
+            capability: "tasker".into(),
+            operation: "reconcile".into(),
+            input: json!({
+                "kind": "batch",
+                "mode": "plan",
+                "expected_snapshot_hash": snapshot_hash,
+                "payload": {
+                    "operations": [{
+                        "op": "create",
+                        "key": "invalid",
+                        "title": "Invalid simulated task",
+                        "dependsOn": ["missing"],
+                        "notes": []
+                    }]
+                }
+            }),
+        };
+
+        let error =
+            reconcile_tasker_effects(&mut store, &[effect], TaskerMode::Plan, &snapshot_hash)
+                .expect_err("canonical validation should reject missing dependency");
+        assert!(error.to_string().contains("invalid reference"));
+        assert!(store.list_tasks(None).expect("source list").is_empty());
     }
 
     #[tokio::test]
@@ -811,7 +927,9 @@ mod tests {
             .metadata
             .expect("plan metadata");
         assert_eq!(planned["outcome"], "succeeded");
-        assert_eq!(planned["reconciliation"]["status"], "planned");
+        assert_eq!(planned["reconciliation"]["status"], "simulated");
+        assert_eq!(planned["reconciliation"]["validated"], true);
+        assert_eq!(planned["reconciliation"]["simulation"]["created"], 1);
 
         let partition = ProjectPartition::with_db_path(
             &tasker_database,

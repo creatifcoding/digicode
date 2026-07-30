@@ -5,7 +5,7 @@
     "read/write/sh/exec operate on the GUEST filesystem (cwd /data, the durable workspace store mount), not the host repo.",
     "Store data should include _meta: { summary } for catalog discipline.",
     "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot and may emit one atomic reconciliation effect; guest code never receives the database handle.",
-    "Use tasker_mode plan before apply when inspecting a new reconciliation. The host verifies the snapshot hash again before any apply."
+    "Use tasker_mode plan before apply when inspecting a new reconciliation. Plan executes the same canonical mutation semantics against an in-memory SQLite fork and returns a normalized stable simulation without changing the source database. Apply verifies the snapshot hash again before mutating canonical state."
   ],
   "undeclared": [
     "exec",

@@ -751,6 +751,24 @@ impl PiTaskerStore {
         Ok(store)
     }
 
+    /// Create a transactionally consistent in-memory copy of the canonical
+    /// database. Mutations against the returned store execute the exact same
+    /// Tasker code paths while remaining incapable of writing to the source.
+    pub fn fork_in_memory(&self) -> Result<Self> {
+        let mut conn = Connection::open_in_memory()?;
+        {
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut conn)?;
+            backup.run_to_completion(128, std::time::Duration::from_millis(1), None)?;
+        }
+        conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+        let store = Self {
+            conn,
+            partition: self.partition.clone(),
+        };
+        store.preflight()?;
+        Ok(store)
+    }
+
     pub fn partition(&self) -> &ProjectPartition {
         &self.partition
     }
@@ -3956,6 +3974,29 @@ mod tests {
     fn preflight_fingerprints_required_schema() {
         let store = temp_store();
         assert_eq!(store.schema_fingerprint().unwrap().len(), 40);
+    }
+
+    #[test]
+    fn in_memory_fork_executes_mutations_without_changing_source() {
+        let store = temp_store();
+        let before = store.snapshot().unwrap();
+        let mut fork = store.fork_in_memory().unwrap();
+        let result = fork
+            .batch_execute(vec![BatchOperation::Create {
+                key: Some("simulated".into()),
+                title: "Simulation only".into(),
+                description: None,
+                state: None,
+                depends_on: Vec::new(),
+                notes: Vec::new(),
+                indexes: None,
+            }])
+            .unwrap();
+
+        assert_eq!(result.created, 1);
+        assert_eq!(fork.list_tasks(None).unwrap().len(), 1);
+        assert_eq!(store.snapshot().unwrap(), before);
+        assert!(store.list_tasks(None).unwrap().is_empty());
     }
 
     #[test]
