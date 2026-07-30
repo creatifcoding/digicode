@@ -10,6 +10,7 @@ members = [
     ".",
     "crates/jcode-agent-runtime",
     "crates/jcode-app-core",
+    "crates/jcode-artifact-server",
     "crates/jcode-artifact-store",
     "crates/jcode-base",
     "crates/jcode-tui",
