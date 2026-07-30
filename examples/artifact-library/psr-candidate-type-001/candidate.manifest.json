@@ -1,48 +1,52 @@
 {
-  "schema": "https://digimasons.dev/schemas/artifact-library/candidate-manifest.proposed.v1.json",
-  "candidateType": "001",
-  "candidateName": "PSR dogfood packet",
-  "artifactId": "psr.artifact-library.candidate-type-001",
-  "dogfoodStage": "source-packet",
-  "reviewStatus": "ready-for-local-review",
-  "acceptanceChecks": [
+  "schemaVersion": "1.0.0",
+  "candidate": {
+    "type": "001",
+    "meaning": "first candidate instance",
+    "templateKey": "psr",
+    "artifactKey": "psr-candidate-type-001"
+  },
+  "owningApi": "MetaTool mt evaluate",
+  "admission": {
+    "requestFile": "mt-admission.request.json",
+    "receiptRequired": true,
+    "executionClaim": "blocked until observed mt result exists"
+  },
+  "checks": [
     {
-      "id": "source-present",
-      "description": "PSR Markdown source exists.",
+      "description": "Packet files exist and JSON manifests parse.",
       "tier": "observed",
-      "status": "passed"
+      "status": "ready"
     },
     {
-      "id": "json-parse",
-      "description": "Both manifests parse as JSON.",
+      "description": "Reusable template key is psr while Candidate Type 001 means first candidate instance.",
       "tier": "observed",
-      "status": "passed"
+      "status": "ready"
     },
     {
-      "id": "html-standalone",
-      "description": "Rendered HTML is self-contained and requires no network assets.",
+      "description": "MetaTool admission request file is present and machine-readable.",
       "tier": "observed",
-      "status": "passed"
+      "status": "ready"
     },
     {
-      "id": "cli-ingestion",
-      "description": "The packet can be ingested by artifact-store seed and returns a receipt.",
+      "description": "Admission has executed through mt and returned a receipt/result.",
       "tier": "blocked",
       "status": "blocked",
-      "blocker": "The planned CLI is not implemented in this change."
+      "requires": "supported non-interactive mt evaluate CLI path or manual tool execution"
     }
   ],
-  "operations": {
-    "localDryRun": "./scripts/seed_psr_artifact.sh --dry-run",
-    "localStoreDryRun": "./scripts/seed_psr_artifact.sh --store ./var/artifact-store --dry-run",
-    "dockerDryRun": "docker run --rm -v \"$PWD:/workspace\" -w /workspace artifact-store:proposed ./scripts/seed_psr_artifact.sh --store /workspace/var/artifact-store --dry-run"
+  "commands": {
+    "compatibilityAdmissionDryRun": "./scripts/seed_psr_artifact.sh --dry-run",
+    "writeRequest": "./scripts/seed_psr_artifact.sh --write-request",
+    "attemptAdmission": "./scripts/seed_psr_artifact.sh --admit"
   },
-  "pathOwnership": {
-    "allowed": [
-      "docs/artifacts/**",
-      "examples/artifact-library/**",
-      "scripts/seed_psr_artifact.sh"
-    ],
-    "rustCratesModified": false
-  }
+  "relatedFiles": [
+    "psr.md",
+    "artifact.manifest.json",
+    "candidate.manifest.json",
+    "revisions.md",
+    "rendered.html",
+    "mt-admission.request.json",
+    "scripts/seed_psr_artifact.sh"
+  ]
 }

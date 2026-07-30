@@ -1,0 +1,35 @@
+{
+  "tool": "mt",
+  "action": "evaluate",
+  "profile": "pure",
+  "tasker_mode": "off",
+  "code": "const packet = inputs.packet;\nawait mt.put('artifact-library', packet.artifact.key, {\n  _meta: { summary: packet.artifact.summary },\n  type: packet.artifact.type,\n  templateKey: packet.artifact.templateKey,\n  candidateInstance: packet.artifact.candidateInstance,\n  files: packet.files,\n  claims: packet.claims\n});\nreturn { admitted: true, artifactKey: packet.artifact.key, templateKey: packet.artifact.templateKey, candidateInstance: packet.artifact.candidateInstance };",
+  "inputs": {
+    "packet": {
+      "artifact": {
+        "key": "psr-candidate-type-001",
+        "templateKey": "psr",
+        "candidateInstance": "001",
+        "type": "PSR candidate instance",
+        "summary": "First PSR candidate instance admitted through MetaTool-owned artifact-library API request."
+      },
+      "files": [
+        "psr.md",
+        "artifact.manifest.json",
+        "candidate.manifest.json",
+        "revisions.md",
+        "rendered.html",
+        "mt-admission.request.json"
+      ],
+      "claims": {
+        "observed": [
+          "Repository packet files exist under the owned docs/examples paths.",
+          "The admission request payload is represented as JSON and can be handed to mt evaluate."
+        ],
+        "blocked": [
+          "This request file is not proof of execution. A receipt is required before claiming admission occurred."
+        ]
+      }
+    }
+  }
+}

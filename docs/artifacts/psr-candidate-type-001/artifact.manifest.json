@@ -1,40 +1,62 @@
 {
-  "schema": "https://digimasons.dev/schemas/artifact-library/artifact-manifest.proposed.v1.json",
-  "artifactId": "psr.artifact-library.candidate-type-001",
-  "artifactType": "psr",
-  "candidateType": "001",
-  "status": "dogfood-candidate",
-  "title": "Artifact Library PSR Candidate Type 001",
-  "summary": "A portable Product-Semantic Record bundle for dogfooding the planned Artifact Library store.",
-  "claimTiers": {
+  "schemaVersion": "1.0.0",
+  "artifactKey": "psr-candidate-type-001",
+  "templateKey": "psr",
+  "candidateInstance": "001",
+  "title": "Artifact Library PSR Candidate Instance 001",
+  "artifactType": "psr-candidate-instance",
+  "owningApi": {
+    "name": "MetaTool",
+    "tool": "mt",
+    "operation": "evaluate",
+    "namespace": "artifact-library",
+    "status": "observed tool surface, admission request pending receipt"
+  },
+  "claims": {
     "observed": [
-      "The packet contains Markdown, manifests, revision notes, rendered HTML, and a seed script reference.",
-      "The packet is repository-local and reviewable without a live server."
+      "The packet contains Markdown, manifests, revision notes, rendered HTML, the compatibility admission script, and a MetaTool admission request JSON file.",
+      "Candidate Type 001 denotes the first candidate instance for the reusable PSR template key psr."
     ],
     "proposed": [
-      "The future artifact-store CLI should ingest this packet atomically.",
-      "The artifact server/store should emit a durable receipt after successful ingestion."
+      "MetaTool should be the owning API for admitting this packet into the artifact-library namespace."
     ],
     "blocked": [
-      "Live ingestion is blocked until the planned artifact-store CLI exists."
+      "Admission is not complete until an mt evaluate invocation returns a receipt/result for this packet."
     ]
   },
   "files": [
-    { "path": "psr.md", "role": "source", "mediaType": "text/markdown" },
-    { "path": "artifact.manifest.json", "role": "artifact-manifest", "mediaType": "application/json" },
-    { "path": "candidate.manifest.json", "role": "candidate-manifest", "mediaType": "application/json" },
-    { "path": "revisions.md", "role": "revision-annotation", "mediaType": "text/markdown" },
-    { "path": "rendered.html", "role": "rendered-preview", "mediaType": "text/html" }
+    {
+      "path": "psr.md",
+      "role": "packet-file"
+    },
+    {
+      "path": "artifact.manifest.json",
+      "role": "packet-file"
+    },
+    {
+      "path": "candidate.manifest.json",
+      "role": "packet-file"
+    },
+    {
+      "path": "revisions.md",
+      "role": "packet-file"
+    },
+    {
+      "path": "rendered.html",
+      "role": "packet-file"
+    },
+    {
+      "path": "mt-admission.request.json",
+      "role": "metatool-admission-request"
+    }
   ],
-  "rendering": {
-    "language": "rojo-brutalist",
-    "entry": "rendered.html",
-    "standalone": true,
-    "externalNetworkRequired": false
-  },
   "provenance": {
-    "authoredAt": "2026-07-30T16:55:22Z",
-    "authoredFor": "Candidate Type 001 dogfood material",
-    "sourcePath": "examples/artifact-library/psr-candidate-type-001"
+    "authoredFor": "PSR reusable template psr, candidate instance 001",
+    "sourceTier": "observed repository material",
+    "updated": "2026-07-30"
+  },
+  "compatibility": {
+    "scriptPath": "scripts/seed_psr_artifact.sh",
+    "scriptNameNote": "Filename retained for compatibility; operation language is admission, not seed."
   }
 }

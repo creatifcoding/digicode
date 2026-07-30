@@ -1,69 +1,69 @@
-# Artifact Library PSR: Candidate Type 001
+# Artifact Library PSR: Candidate Instance 001
 
-**PSR id:** `psr.artifact-library.candidate-type-001`  
-**Candidate type:** `001`  
-**Status:** Dogfood candidate  
-**Owner boundary:** Artifact Library source packet  
-**Revision:** `2026-07-30.initial-dogfood`
+**Reusable template key:** `psr`  
+**Candidate instance:** `001`  
+**Owning API:** MetaTool `mt evaluate`  
+**Operational concept:** admission  
+**Compatibility script:** `scripts/seed_psr_artifact.sh`
 
 ## Claim ledger
 
 | Tier | Claim |
 | --- | --- |
-| **OBSERVED** | This PSR packet exists in `examples/artifact-library/psr-candidate-type-001/`. |
-| **OBSERVED** | The packet includes `psr.md`, `artifact.manifest.json`, `candidate.manifest.json`, `revisions.md`, and `rendered.html`. |
-| **PROPOSED** | Candidate Type 001 is the minimum viable PSR bundle for Artifact Library dogfooding. |
-| **PROPOSED** | A future artifact server/store CLI should ingest this bundle with one command and return a durable receipt. |
-| **BLOCKED** | Server ingestion and receipt generation are not observed because the planned CLI is outside this change. |
+| **OBSERVED** | This repository packet contains PSR Markdown, manifests, revision notes, standalone HTML, a compatibility script reference, and a machine-readable MetaTool admission request. |
+| **OBSERVED** | Candidate Type 001 means the first candidate instance. The reusable template key is `psr`. |
+| **OBSERVED** | The script can validate packet files and JSON manifests locally. |
+| **PROPOSED** | MetaTool is the owning API for Artifact Library admission through an `mt evaluate` payload against the `artifact-library` namespace. |
+| **BLOCKED** | Admission is not claimed complete until a supported non-interactive `mt` CLI path executes the payload or an operator runs the same payload through the Jcode `mt` tool and records the result. |
 
 ## Intent
 
-Create a small but complete PSR artifact that can be read by humans, validated by scripts, rendered in a browser, and later seeded into the Artifact Library store.
+Create a small, reviewable PSR artifact packet that can be read by humans, parsed by tools, rendered offline, and admitted through MetaTool without inventing a separate store-ingestion command.
 
-## Boundary
+Prime, the noun is `admission`. `seed` is a filename scar kept for compatibility, not a doctrine. Tiny taxonomy, large consequences.
 
-The boundary is the packet. The packet owns source prose, manifests, revision annotation, and rendered preview. The future server/store owns ingestion, persistence, receipts, indexing, and retrieval.
+## Boundary and owner
+
+MetaTool owns the API boundary. The packet does not define a downstream persistence adapter, server CLI, Docker image, or external runtime vocabulary. Those may exist later, but this PSR only asserts the MetaTool admission request shape and the source files it carries.
 
 ## Source inputs
 
-- Operator request on 2026-07-30 to author Candidate Type 001 dogfood material.
+- Operator request on 2026-07-30 to rewrite the PSR packet so MetaTool is the owning API.
 - Repository path ownership constraint: only `docs/artifacts/**`, `examples/artifact-library/**`, and `scripts/seed_psr_artifact.sh`.
-- Project instruction to avoid unsupported absolutes and mark observed/proposed/blocked claims.
+- Project instruction to separate observed, proposed, and blocked claims.
 
-## Proposed artifact semantics
+## Packet shape
 
-A PSR artifact is a reviewable semantic record with stable identity, explicit claim tiers, file inventory, rendering contract, revision annotation, local and Docker-minded operation notes, and a future ingestion path.
+A PSR candidate instance includes:
 
-## Local operation
+1. `psr.md` as durable source prose.
+2. `artifact.manifest.json` as artifact identity and owning API metadata.
+3. `candidate.manifest.json` as candidate-instance checks and admission state.
+4. `mt-admission.request.json` as the exact machine-readable MetaTool request payload.
+5. `revisions.md` as the packet changelog.
+6. `rendered.html` as an offline review artifact.
+7. `scripts/seed_psr_artifact.sh` as a compatibility entrypoint whose operation is admission.
 
-Run:
+## Admission operation
+
+The compatibility script validates the packet. If a supported non-interactive MetaTool CLI command is configured, it may invoke it. If not, it writes the exact `mt evaluate` request JSON and exits without claiming execution.
 
 ```bash
 ./scripts/seed_psr_artifact.sh --dry-run
+./scripts/seed_psr_artifact.sh --write-request
+./scripts/seed_psr_artifact.sh --admit
 ```
 
-Expected local effect:
+Expected honest outcomes:
 
-- JSON manifests are parsed.
-- Required files are checked.
-- The proposed `artifact-store seed` command is printed.
-- No live mutation occurs.
-
-## Docker-minded operation
-
-Mount the repository at `/workspace`, use `/workspace/var/artifact-store` for local persistence, and run the same script with `--dry-run` until the CLI exists.
-
-```bash
-docker run --rm -v "$PWD:/workspace" -w /workspace artifact-store:proposed \
-  ./scripts/seed_psr_artifact.sh --store /workspace/var/artifact-store --dry-run
-```
-
-**BLOCKED:** `artifact-store:proposed` names a future runtime image, not an observed published image.
+- **Dry run:** validates files and prints the request location. No mutation attempted.
+- **Write request:** validates files and writes `mt-admission.request.json`.
+- **Admit:** executes only when a supported `mt` CLI command is configured. Otherwise it writes the request and reports the admission as blocked.
 
 ## Acceptance
 
-This candidate is acceptable as dogfood material if a reviewer can read the PSR source, parse both JSON manifests, open the standalone HTML without network access, inspect a revision annotation, run the seed script in dry-run mode, and identify which claims are observed, proposed, and blocked.
+This candidate is acceptable as dogfood material if a reviewer can read the PSR source, parse both manifests and the request JSON, open the standalone HTML offline, inspect revision notes, run the compatibility script without false execution claims, and verify the distinction between candidate instance `001` and template key `psr`.
 
 ## Follow-up
 
-The next implementation should make `artifact-store seed` real, then run this candidate through the live local store path and record the emitted receipt.
+Record an observed MetaTool result or receipt after admission actually runs. Do not promote this packet from request-ready to admitted on prose alone.

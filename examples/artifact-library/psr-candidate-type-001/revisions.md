@@ -1,20 +1,19 @@
-# Revisions: Artifact Library PSR Candidate Type 001
+# Revisions: Artifact Library PSR Candidate Instance 001
 
-## 2026-07-30.initial-dogfood
+## 2026-07-30 - MetaTool admission rewrite
 
-**Tier:** OBSERVED  
-**Change:** Created the initial Candidate Type 001 packet with PSR source, manifests, revision annotation, and standalone HTML rendering.
+**Change:** Rewrote the PSR packet so MetaTool is the owning API and admission is the operational concept.
 
-### Annotation
+**Observed:** The packet now includes a machine-readable `mt-admission.request.json`, updated manifests, source PSR, rendered HTML, and compatibility script language. Candidate Type 001 is explicitly the first candidate instance, while the reusable template key is `psr`.
 
-This revision intentionally separates source artifact material from future server/store implementation. The artifact packet is real repository material. The ingestion interface is proposed. Live ingestion is blocked until an artifact-store CLI or equivalent adapter exists.
+**Removed:** Invented ingestion doctrine, downstream persistence vocabulary, placeholder Docker image claims, and wording that let external runtime terms define the core boundary.
 
-### Changelog
+**Blocked:** Admission is not claimed complete. A receipt or observed `mt evaluate` result is still required.
 
-- Added PSR source for Candidate Type 001.
-- Added artifact manifest JSON.
-- Added candidate manifest JSON.
-- Added revision annotation/changelog.
-- Added standalone Rojo-brutalist rendered HTML.
-- Documented local and Docker-minded dry-run operation.
-- Marked live ingestion as blocked rather than pretending infrastructure exists. A tiny miracle of restraint.
+**Compatibility note:** `scripts/seed_psr_artifact.sh` keeps its historical filename to avoid breaking callers. Its behavior and prose now describe admission, not seeding.
+
+## 2026-07-30 - Initial packet
+
+**Change:** Created the initial PSR candidate packet with source, manifests, revision notes, and standalone HTML rendering.
+
+**Superseded claim:** The initial packet proposed a separate future ingestion path. That claim is intentionally replaced by the MetaTool-owned admission request.
