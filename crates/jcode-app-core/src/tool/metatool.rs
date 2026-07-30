@@ -434,7 +434,7 @@ mod tests {
             .execute(
                 json!({
                     "action": "evaluate",
-                    "code": "const got = await mt.get('probe', 'first'); const hits = await mt.search('codemode'); return { persisted: got?.n ?? null, hits: hits.length };",
+                    "code": "const got = await mt.get('probe', 'first'); const hits = await mt.search('codemode'); return { persisted: got?.n ?? null, hits: hits.filter((hit) => hit.collection === 'probe').length };",
                     "profile": "pure"
                 }),
                 context(workspace.path()),

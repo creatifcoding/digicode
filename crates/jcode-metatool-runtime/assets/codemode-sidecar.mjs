@@ -129,31 +129,32 @@ export async function run(request) {
 
   let metatool;
   try {
-    metatool = await createMetatool({
+	    metatool = await createMetatool({
       sqlLayer: sqliteNodeLayer({ filename: "/data/store.db" }),
       fsLayer: NodeFileSystemLayer,
       overlays: [],
-      cwd: "/data",
-    });
+	      cwd: "/data",
+	    });
+	    const api = metatool.getApi();
 
 	    let metatoolOverlayLoaded = false;
 	    const bounded = (n, fallback = 10) => Math.max(0, Math.min(Number.isFinite(Number(n)) ? Number(n) : fallback, HISTORY_LIMIT));
 	    async function readHistory(n) {
-	      const record = await metatool.get(HISTORY_COLLECTION, HISTORY_KEY).catch(() => undefined);
+	      const record = await api.get(HISTORY_COLLECTION, HISTORY_KEY).catch(() => undefined);
 	      const entries = Array.isArray(record?.entries) ? record.entries : [];
 	      return entries.slice(-bounded(n));
 	    }
 	    async function writeHistory(entry) {
-	      const record = await metatool.get(HISTORY_COLLECTION, HISTORY_KEY).catch(() => undefined);
+	      const record = await api.get(HISTORY_COLLECTION, HISTORY_KEY).catch(() => undefined);
 	      const entries = Array.isArray(record?.entries) ? record.entries : [];
 	      entries.push(entry);
-	      await metatool.put(HISTORY_COLLECTION, HISTORY_KEY, {
+	      await api.put(HISTORY_COLLECTION, HISTORY_KEY, {
 	        _meta: { summary: "Bounded native MetaTool codemode evaluation history" },
 	        entries: entries.slice(-HISTORY_LIMIT),
 	      });
 	    }
 	    async function contextSnapshot() {
-	      const collections = await metatool.collections().catch(() => []);
+	      const collections = await api.collections().catch(() => []);
 	      const overlayIds = metatool.overlays?.() ?? [];
 	      return {
 	        cwd: "/data",
