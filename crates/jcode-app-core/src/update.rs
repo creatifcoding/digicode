@@ -309,9 +309,21 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
             channel_version, error
         ));
     }
+    // Same pin protection for the launcher-facing `current` channel: a
+    // deliberately-published self-dev build must not be silently replaced by a
+    // channel update (it carries tools the release binary does not have).
+    match build::advance_current_if_tracking_stable(&channel_version) {
+        Ok(true) => {}
+        Ok(false) => crate::logging::info(&format!(
+            "update: current channel is pinned to a self-dev build; stable advanced to {} but current/launcher were left untouched",
+            channel_version
+        )),
+        Err(error) => crate::logging::warn(&format!(
+            "update: failed to advance current channel to {}: {}",
+            channel_version, error
+        )),
+    }
     build::update_stable_symlink(&channel_version)?;
-    build::update_current_symlink(&channel_version)?;
-    build::update_launcher_symlink_to_current()?;
 
     metadata.installed_version = Some(channel_version.clone());
     metadata.installed_from = Some("source".to_string());
@@ -1081,9 +1093,21 @@ pub fn download_and_install_blocking_with_progress(
             version, error
         ));
     }
+    // Same pin protection for the launcher-facing `current` channel: a
+    // deliberately-published self-dev build must not be silently replaced by a
+    // channel update (it carries tools the release binary does not have).
+    match build::advance_current_if_tracking_stable(version) {
+        Ok(true) => {}
+        Ok(false) => crate::logging::info(&format!(
+            "update: current channel is pinned to a self-dev build; stable advanced to {} but current/launcher were left untouched",
+            version
+        )),
+        Err(error) => crate::logging::warn(&format!(
+            "update: failed to advance current channel to {}: {}",
+            version, error
+        )),
+    }
     build::update_stable_symlink(version)?;
-    build::update_current_symlink(version)?;
-    build::update_launcher_symlink_to_current()?;
 
     metadata.installed_version = Some(release.tag_name.clone());
     metadata.installed_from = Some(asset.browser_download_url.clone());

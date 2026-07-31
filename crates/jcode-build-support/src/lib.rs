@@ -753,6 +753,48 @@ pub fn shared_server_tracks_stable() -> Result<bool> {
     Ok(stable == Some(shared))
 }
 
+/// Returns true when the `current` channel is merely tracking the `stable`
+/// channel rather than pinned to a deliberately-published local build.
+///
+/// This is the launcher-facing counterpart to [`shared_server_tracks_stable`].
+/// `publish_local_current_build_for_source` points `current` (and the user's
+/// launcher symlink) at a self-dev version label such as
+/// `<hash>-dirty-<digest>`; a stable-channel auto-update that then
+/// unconditionally rewrites `current` silently deletes that build out from
+/// under the user, taking every not-yet-upstreamed tool with it. When
+/// `current` matches `stable` it is just following updates and should keep
+/// doing so; when it differs it was deliberately pinned and must be left
+/// alone.
+///
+/// A missing/empty `current` marker counts as "tracking": there is no
+/// deliberate build to protect.
+pub fn current_tracks_stable() -> Result<bool> {
+    let current = read_current_version()?;
+    let current = current.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let Some(current) = current else {
+        return Ok(true);
+    };
+    let stable = read_stable_version()?;
+    let stable = stable.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    Ok(stable == Some(current))
+}
+
+/// Advance the `current` channel (and launcher symlink) to `version`, but only
+/// when it is currently tracking `stable` (see [`current_tracks_stable`]).
+/// Returns `Ok(true)` when the channel was advanced.
+///
+/// Callers in the update path MUST invoke this *before* moving the `stable`
+/// marker, otherwise the pre-update comparison would always disagree.
+pub fn advance_current_if_tracking_stable(version: &str) -> Result<bool> {
+    if current_tracks_stable()? {
+        update_current_symlink(version)?;
+        update_launcher_symlink_to_current()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Advance the `shared-server` channel to `version`, but only when it is
 /// currently tracking `stable` (see [`shared_server_tracks_stable`]). Returns
 /// `Ok(true)` when the channel was advanced.
