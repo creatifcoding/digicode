@@ -219,6 +219,26 @@ impl ConcurrencyStore {
         Ok(Self { conn, partition })
     }
 
+    /// Create a transactionally consistent in-memory copy of the concurrency
+    /// database. Plan-mode Tasker reconciliation uses this to exercise the
+    /// same lifecycle code paths without writing candidate or promotion
+    /// metadata to the canonical database.
+    pub fn fork_in_memory(&self) -> ConcurrencyResult<Self> {
+        let mut conn = Connection::open_in_memory()?;
+        {
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut conn)?;
+            backup.run_to_completion(128, std::time::Duration::from_millis(1), None)?;
+        }
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        Ok(Self {
+            conn,
+            partition: ProjectPartition::with_db_path(
+                ":memory:",
+                self.partition.project_root.clone(),
+            ),
+        })
+    }
+
     pub fn open_for(store: &PiTaskerStore) -> ConcurrencyResult<Self> {
         Self::open(store.partition().clone())
     }

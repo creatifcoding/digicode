@@ -544,15 +544,15 @@ impl Tool for TaskerTool {
                 "category": {"type": "string"},
                 "content": {"type": "string"},
                 "summary": {"type": "string"},
-                "tags": {"type": ["array", "object"]},
+                "tags": {"type": ["array", "object"], "items": {}},
                 "brief": {"type": "string"},
-                "acceptance": {"type": ["array", "object"]},
+                "acceptance": {"type": ["array", "object"], "items": {}},
                 "owner": {"type": "string"},
-                "gates": {"type": ["array", "object"]},
-                "indexes": {"type": ["array", "object"]},
-                "index_add": {"type": ["array", "object"], "description": "task_index add entries. Appended after remove when index_set is omitted."},
+                "gates": {"type": ["array", "object"], "items": {}},
+                "indexes": {"type": ["array", "object"], "items": {}},
+                "index_add": {"type": ["array", "object"], "items": {}, "description": "task_index add entries. Appended after remove when index_set is omitted."},
                 "index_remove": {"type": "array", "items": {"type": "string"}, "description": "task_index remove paths. Removes entries whose path exactly matches."},
-                "index_set": {"type": ["array", "object"], "description": "task_index replacement entries. When present, add/remove are ignored to match Pi set semantics."},
+                "index_set": {"type": ["array", "object"], "items": {}, "description": "task_index replacement entries. When present, add/remove are ignored to match Pi set semantics."},
                 "operations": {
                     "type": "array",
                     "description": "Atomic Pi-compatible create/update operations. Create keys may be referenced by later dependencies and updates.",
@@ -569,7 +569,7 @@ impl Tool for TaskerTool {
                             "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done"]},
                             "dependsOn": {"type": "array", "items": {"type": "string"}},
                             "notes": {"type": "array", "items": {"type": "object", "required": ["content"], "additionalProperties": false, "properties": {"content": {"type": "string"}, "category": {"type": "string"}}}},
-                            "indexes": {"type": ["array", "object"]},
+                            "indexes": {"type": ["array", "object"], "items": {}},
                             "clearDependencies": {"type": "boolean"},
                             "active": {"type": "boolean"}
                         }
@@ -589,7 +589,7 @@ impl Tool for TaskerTool {
                             "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done"]},
                             "after": {"type": "array", "items": {"type": "string"}},
                             "notes": {"type": "array", "items": {"type": "object", "required": ["content"], "additionalProperties": false, "properties": {"content": {"type": "string"}, "category": {"type": "string"}}}},
-                            "indexes": {"type": ["array", "object"]}
+                            "indexes": {"type": ["array", "object"], "items": {}}
                         }
                     }
                 },
@@ -658,7 +658,7 @@ impl Tool for TaskerTool {
                         "state": {"type": "string", "enum": ["todo", "in_progress", "blocked", "done"]},
                         "after": {"type": "array", "items": {"type": "string"}},
                         "notes": {"type": "array", "items": {"type": "object", "required": ["content"], "additionalProperties": false, "properties": {"content": {"type": "string"}, "category": {"type": "string"}}}},
-                        "indexes": {"type": ["array", "object"]}
+                        "indexes": {"type": ["array", "object"], "items": {}}
                     }
                 },
                 "featurePlanChild": {

@@ -185,15 +185,210 @@ try {
 	  const expectedSnapshotHash = typeof config.snapshot_hash === "string"
 	    ? config.snapshot_hash
 	    : null;
+	  const projectId = typeof config.project_id === "string" ? config.project_id : null;
 	  let reconciled = false;
 
-	  const limited = (items, limit) => Array.isArray(items)
-	    ? items.slice(0, Math.max(0, Math.min(Number(limit ?? 100), 500)))
+	  const bounded = (value, fallback = 100) => Math.max(
+	    0,
+	    Math.min(Number.isFinite(Number(value)) ? Number(value) : fallback, 500),
+	  );
+	  const limited = (items, limit = 100) => Array.isArray(items)
+	    ? items.slice(0, bounded(limit))
 	    : [];
 	  const clone = (value) => JSON.parse(JSON.stringify(value));
+	  const tasks = Array.isArray(snapshot.tasks) ? snapshot.tasks : [];
+	  const features = Array.isArray(snapshot.features) ? snapshot.features : [];
+	  const dependencies = Array.isArray(snapshot.dependencies) ? snapshot.dependencies : [];
+	  const featureDependencies = Array.isArray(snapshot.featureDependencies)
+	    ? snapshot.featureDependencies
+	    : [];
+	  const taskNotes = Array.isArray(snapshot.taskNotes) ? snapshot.taskNotes : [];
+	  const featureNotes = Array.isArray(snapshot.featureNotes) ? snapshot.featureNotes : [];
+	  const ready = Array.isArray(snapshot.ready) ? snapshot.ready : [];
+	  const projections = snapshot.projections && typeof snapshot.projections === "object"
+	    ? snapshot.projections
+	    : {};
+	  const concurrencySnapshot = snapshot.concurrency && typeof snapshot.concurrency === "object"
+	    ? snapshot.concurrency
+	    : {};
+	  const concurrencyProjection = concurrencySnapshot.projection && typeof concurrencySnapshot.projection === "object"
+	    ? concurrencySnapshot.projection
+	    : {};
+
+	  const resolveTask = (reference) => {
+	    if (reference == null) return undefined;
+	    const value = String(reference);
+	    return tasks.find((task) => task?.id === value
+	      || String(task?.displayId ?? "") === value
+	      || ("#" + String(task?.displayId ?? "")) === value);
+	  };
+	  const resolveFeature = (reference) => {
+	    if (reference == null) return undefined;
+	    const value = String(reference);
+	    return features.find((feature) => feature?.id === value
+	      || String(feature?.displayId ?? "") === value
+	      || ("F" + String(feature?.displayId ?? "")) === value
+	      || ("#F" + String(feature?.displayId ?? "")) === value);
+	  };
+	  const taskProjection = (name, limit) => {
+	    const value = projections[name];
+	    if (!value || typeof value !== "object") return { limit: bounded(limit), truncated: false };
+	    const result = clone(value);
+	    result.limit = bounded(limit);
+	    for (const key of ["nodes", "edges", "tasks", "features", "dependencies", "featureDependencies", "roots", "branches"]) {
+	      if (Array.isArray(result[key])) result[key] = limited(result[key], limit);
+	    }
+	    return result;
+	  };
+
+	  const show = (reference) => {
+	    const task = resolveTask(reference);
+	    if (!task) return null;
+	    const taskId = task.id;
+	    return {
+	      task: clone(task),
+	      readiness: { ready: ready.some((candidate) => candidate?.id === taskId) },
+	      dependencies: limited(dependencies.filter((dependency) => dependency?.taskId === taskId), 500),
+	      notes: limited(taskNotes.filter((note) => note?.taskId === taskId), 500),
+	    };
+	  };
+
+	  const search = (query, options = {}) => {
+	    const needle = String(query ?? "").toLowerCase();
+	    const matches = tasks.filter((task) => {
+	      const text = (String(task?.title ?? "") + "\n" + String(task?.description ?? "")).toLowerCase();
+	      return text.includes(needle) && (!options.state || task?.state === options.state);
+	    });
+	    return limited(matches, options.limit);
+	  };
+
+	  const featureStatus = (reference) => {
+	    const feature = resolveFeature(reference);
+	    if (!feature) return null;
+	    const children = features.filter((candidate) => candidate?.parentFeatureId === feature.id);
+	    const ownedTasks = tasks.filter((task) => task?.featureId === feature.id);
+	    const subtree = new Set([feature.id]);
+	    let changed = true;
+	    while (changed) {
+	      changed = false;
+	      for (const candidate of features) {
+	        if (candidate?.parentFeatureId && subtree.has(candidate.parentFeatureId) && !subtree.has(candidate.id)) {
+	          subtree.add(candidate.id);
+	          changed = true;
+	        }
+	      }
+	    }
+	    const subtreeTasks = tasks.filter((task) => subtree.has(task?.featureId));
+	    const done = ownedTasks.filter((task) => task?.state === "done").length;
+	    const subtreeDone = subtreeTasks.filter((task) => task?.state === "done").length;
+	    const gates = Array.isArray(feature.gates) ? feature.gates : [];
+	    return {
+	      feature: clone(feature),
+	      tasks: limited(ownedTasks, 500),
+	      childFeatures: limited(children, 500),
+	      subtree: { featureIds: Array.from(subtree).slice(0, 500), tasks: limited(subtreeTasks, 500) },
+	      progress: { doneTasks: done, totalTasks: ownedTasks.length, ratio: ownedTasks.length ? done / ownedTasks.length : 0 },
+	      rollupProgress: { doneTasks: subtreeDone, totalTasks: subtreeTasks.length, ratio: subtreeTasks.length ? subtreeDone / subtreeTasks.length : 0 },
+	      gateProgress: { passed: gates.filter((gate) => gate?.status === "passed").length, total: gates.length },
+	      dependencies: limited(featureDependencies.filter((dependency) => dependency?.featureId === feature.id), 500),
+	      notes: limited(featureNotes.filter((note) => note?.featureId === feature.id), 500),
+	    };
+	  };
+
+	  const topologyPaths = (options = {}) => {
+	    const domain = options.domain === "feature" ? "feature" : "task";
+	    const from = domain === "feature" ? resolveFeature(options.from) : resolveTask(options.from);
+	    const to = domain === "feature" ? resolveFeature(options.to) : resolveTask(options.to);
+	    if (!from || !to) throw new Error("topologyPaths requires resolvable from and to references");
+	    const edges = domain === "feature" ? featureDependencies : dependencies;
+	    const adjacency = new Map();
+	    for (const edge of edges) {
+	      const source = domain === "feature" ? edge?.featureId : edge?.taskId;
+	      const target = domain === "feature" ? edge?.dependsOnId : edge?.dependsOnId;
+	      if (!adjacency.has(source)) adjacency.set(source, []);
+	      adjacency.get(source).push(target);
+	    }
+	    const maxDepth = Math.max(1, Math.min(Number(options.maxDepth ?? 8), 64));
+	    const maxPaths = Math.max(1, Math.min(Number(options.maxPaths ?? 5), 100));
+	    const paths = [];
+	    const mode = options.mode === "all_up_to_depth" ? "all_up_to_depth" : "shortest";
+	    const walk = (current, path, seen) => {
+	      if (paths.length >= maxPaths || path.length > maxDepth + 1) return;
+	      if (current === to.id) {
+	        paths.push(path.slice());
+	        return;
+	      }
+	      for (const next of adjacency.get(current) ?? []) {
+	        if (seen.has(next)) continue;
+	        seen.add(next);
+	        path.push(next);
+	        walk(next, path, seen);
+	        path.pop();
+	        seen.delete(next);
+	        if (mode === "shortest" && paths.length > 0) return;
+	      }
+	    };
+	    walk(from.id, [from.id], new Set([from.id]));
+	    return { domain, mode, from: { id: from.id }, to: { id: to.id }, maxDepth, maxPaths, foundPaths: paths.length, truncated: mode === "all_up_to_depth" && paths.length >= maxPaths, paths };
+	  };
+
+	  const featureChildren = (options = {}) => {
+	    const root = resolveFeature(options.featureId ?? options.feature);
+	    if (!root) throw new Error("featureChildren requires a resolvable feature reference");
+	    const depth = Math.max(0, Math.min(Number(options.depth ?? 1), 64));
+	    const limit = bounded(options.limit);
+	    const entries = [];
+	    const queue = [[root.id, 0]];
+	    while (queue.length > 0 && entries.length < limit) {
+	      const [id, currentDepth] = queue.shift();
+	      const children = features.filter((feature) => feature?.parentFeatureId === id);
+	      if (currentDepth < depth) for (const child of children) queue.push([child.id, currentDepth + 1]);
+	      entries.push({ parentFeatureId: id, depth: currentDepth, featureChildren: limited(children, limit), taskChildren: options.includeTasks ? limited(tasks.filter((task) => task?.featureId === id), limit) : [], expanded: currentDepth < depth });
+	    }
+	    return { root: { id: root.id }, depthLimit: depth, includeTasks: options.includeTasks === true, entries, returnedEntries: entries.length, limit, truncated: entries.length >= limit };
+	  };
+
+	  const taskNeighbors = (options = {}) => {
+	    const origin = resolveTask(options.taskId ?? options.task);
+	    if (!origin) throw new Error("taskNeighbors requires a resolvable task reference");
+	    const direction = ["upstream", "downstream", "both"].includes(options.direction) ? options.direction : "both";
+	    const depth = Math.max(0, Math.min(Number(options.depth ?? 1), 64));
+	    const limit = bounded(options.limit);
+	    const nodes = new Set([origin.id]);
+	    const edges = [];
+	    const queue = [[origin.id, 0]];
+	    while (queue.length > 0 && nodes.size < limit) {
+	      const [id, currentDepth] = queue.shift();
+	      if (currentDepth >= depth) continue;
+	      for (const dependency of dependencies) {
+	        let candidate;
+	        let kind;
+	        if ((direction === "upstream" || direction === "both") && dependency?.taskId === id) {
+	          candidate = dependency.dependsOnId; kind = "upstream";
+	        } else if ((direction === "downstream" || direction === "both") && dependency?.dependsOnId === id) {
+	          candidate = dependency.taskId; kind = "downstream";
+	        }
+	        const task = resolveTask(candidate);
+	        if (!task || (options.includeDone !== true && task.state === "done")) continue;
+	        edges.push({ kind, from: { id }, to: { id: task.id } });
+	        if (!nodes.has(task.id)) { nodes.add(task.id); queue.push([task.id, currentDepth + 1]); }
+	        if (nodes.size >= limit) break;
+	      }
+	    }
+	    return { origin: { id: origin.id }, direction, depthLimit: depth, includeDone: options.includeDone === true, nodes: limited(tasks.filter((task) => nodes.has(task.id)), limit), edges: limited(edges, limit), nodeCount: Math.min(nodes.size, limit), limit, truncated: nodes.size > limit };
+	  };
+
+	  const reconciliationKinds = [
+	    "batch", "plan", "feature_plan", "create", "update", "set_state", "add_dependency", "add_note",
+	    "task_index", "create_feature", "feature_update", "resolve_feature_gate", "set_dependencies",
+	    "set_feature_dependencies", "link", "unlink", "create_candidate_set", "register_candidate",
+	    "submit_candidate", "set_candidate_set_state", "record_round", "record_ballot", "prepare_promotion",
+	    "mark_promotion_ref_updated", "finalize_promotion", "abort_promotion", "rollback_promotion",
+	    "recover_promotion", "resume_promotion",
+	  ];
 	  const reconcile = async (kind, payload) => {
 	    if (reconciled) throw new Error("mt.tasker permits one atomic reconciliation per evaluation");
-	    if (!["batch", "plan", "feature_plan"].includes(kind)) {
+	    if (!reconciliationKinds.includes(kind)) {
 	      throw new Error("unsupported Tasker reconciliation kind: " + kind);
 	    }
 	    if (!payload || typeof payload !== "object") {
@@ -207,6 +402,7 @@ try {
 	        payload: clone(payload),
 	        mode,
 	        expected_snapshot_hash: expectedSnapshotHash,
+	        project_id: projectId,
 	      },
 	    };
 	    effects.push(effect);
@@ -223,31 +419,100 @@ try {
 	  return Object.freeze({
 	    mode,
 	    snapshotHash: expectedSnapshotHash,
+	    projectId,
+	    snapshot: () => clone(snapshot),
 	    status: () => ({
 	      mode,
 	      snapshotHash: expectedSnapshotHash,
 	      counts: snapshot.counts ?? {},
 	      truncated: snapshot.truncated === true,
+	      projectId,
+	      lifecycle: clone(snapshot.lifecycle ?? {}),
 	    }),
 	    list: (options = {}) => {
 	      const state = options.state;
-	      const tasks = state
-	        ? limited(snapshot.tasks, 500).filter((task) => task?.state === state)
-	        : limited(snapshot.tasks, 500);
-	      return limited(tasks, options.limit);
+	      const filtered = state ? tasks.filter((task) => task?.state === state) : tasks;
+	      return limited(filtered, options.limit);
 	    },
-	    ready: (limit = 100) => limited(snapshot.ready, limit),
+	    show,
+	    search,
+	    ready: (limit = 100) => limited(ready, limit),
 	    features: (options = {}) => {
 	      const state = options.state;
-	      const features = state
-	        ? limited(snapshot.features, 500).filter((feature) => feature?.state === state)
-	        : limited(snapshot.features, 500);
-	      return limited(features, options.limit);
+	      const filtered = state ? features.filter((feature) => feature?.state === state) : features;
+	      return limited(filtered, options.limit);
 	    },
+	    feature: featureStatus,
+	    dependencies: (options = {}) => limited(dependencies.filter((dependency) => !options.taskId || dependency?.taskId === resolveTask(options.taskId)?.id), options.limit),
+	    featureDependencies: (options = {}) => limited(featureDependencies.filter((dependency) => !options.featureId || dependency?.featureId === resolveFeature(options.featureId)?.id), options.limit),
+	    notes: (options = {}) => limited([...taskNotes, ...featureNotes].filter((note) => (!options.taskId || note?.taskId === resolveTask(options.taskId)?.id) && (!options.featureId || note?.featureId === resolveFeature(options.featureId)?.id)), options.limit),
+	    taskGraph: (limit = 100) => taskProjection("taskGraph", limit),
+	    taskStructure: (limit = 100) => taskProjection("taskStructure", limit),
+	    topologySummary: (limit = 100) => taskProjection("topologySummary", limit),
+	    topologyAnomalies: (limit = 100) => taskProjection("topologyAnomalies", limit),
+	    topologyPaths,
+	    topologyFrontier: (limit = 100) => taskProjection("topologyFrontier", limit),
+	    featureChildren,
+	    taskNeighbors,
+	    featureTree: (options = {}) => taskProjection("featureTree", options.limit),
+	    resolveTask: (reference) => clone(resolveTask(reference) ?? null),
+	    resolveFeature: (reference) => clone(resolveFeature(reference) ?? null),
+	    featureGates: (reference) => clone(resolveFeature(reference)?.gates ?? []),
+	    featureGate: (reference, index) => clone((resolveFeature(reference)?.gates ?? [])[Number(index)] ?? null),
+	    lifecycle: () => clone(snapshot.lifecycle ?? {}),
+	    policy: () => clone(concurrencySnapshot.policy ?? null),
+	    concurrency: (limit = 100) => ({
+	      projectId: concurrencySnapshot.projectId ?? projectId,
+	      schemaVersion: concurrencySnapshot.schemaVersion ?? null,
+	      revision: concurrencySnapshot.revision ?? 0,
+	      candidateSets: limited(concurrencyProjection.candidateSets, limit),
+	      candidates: limited(concurrencyProjection.candidates, limit),
+	      rounds: limited(concurrencyProjection.adjudicationRounds, limit),
+	      ballots: limited(concurrencyProjection.adjudicationBallots, limit),
+	      promotions: limited(concurrencyProjection.promotionIntents, limit),
+	      counts: clone(concurrencyProjection.counts ?? {}),
+	      limit: bounded(limit),
+	      truncated: concurrencyProjection.truncated === true,
+	    }),
+	    candidateSets: (limit = 100) => limited(concurrencyProjection.candidateSets, limit),
+	    candidates: (limit = 100) => limited(concurrencyProjection.candidates, limit),
+	    rounds: (limit = 100) => limited(concurrencyProjection.adjudicationRounds, limit),
+	    promotions: (limit = 100) => limited(concurrencyProjection.promotionIntents, limit),
+	    candidateSet: (id) => clone((concurrencyProjection.candidateSets ?? []).find((value) => value?.id === id) ?? null),
+	    candidate: (id) => clone((concurrencyProjection.candidates ?? []).find((value) => value?.id === id) ?? null),
+	    round: (id) => clone((concurrencyProjection.adjudicationRounds ?? []).find((value) => value?.id === id) ?? null),
+	    promotion: (id) => clone((concurrencyProjection.promotionIntents ?? []).find((value) => value?.id === id) ?? null),
 	    reconcile: async (program) => reconcile(program?.kind, program?.payload),
 	    batch: async (operations) => reconcile("batch", { operations }),
 	    plan: async (tasks) => reconcile("plan", { tasks }),
 	    featurePlan: async (feature) => reconcile("feature_plan", { feature }),
+	    create: async (task) => reconcile("create", task),
+	    update: async (task) => reconcile("update", task),
+	    setState: async (taskId, state, options = {}) => reconcile("set_state", { ...options, taskId, state }),
+	    addDependency: async (taskId, dependsOnTaskId) => reconcile("add_dependency", { taskId, dependsOnTaskId }),
+	    addNote: async (note) => reconcile("add_note", note),
+	    taskIndex: async (input) => reconcile("task_index", input),
+	    createFeature: async (feature) => reconcile("create_feature", feature),
+	    updateFeature: async (feature) => reconcile("feature_update", feature),
+	    resolveFeatureGate: async (input) => reconcile("resolve_feature_gate", input),
+	    setDependencies: async (input) => reconcile("set_dependencies", input),
+	    setFeatureDependencies: async (input) => reconcile("set_feature_dependencies", input),
+	    link: async (taskId, featureId) => reconcile("link", { taskId, featureId }),
+	    unlink: async (taskId) => reconcile("unlink", { taskId }),
+	    reconcileConcurrency: async (kind, payload) => reconcile(kind, payload),
+	    createCandidateSet: async (candidateSet, expectedRevision) => reconcile("create_candidate_set", { candidateSet, expectedRevision }),
+	    registerCandidate: async (candidate, expectedRevision) => reconcile("register_candidate", { candidate, expectedRevision }),
+	    submitCandidate: async (candidate, evidence, expectedRevision) => reconcile("submit_candidate", { candidate, evidence, expectedRevision }),
+	    setCandidateSetState: async (candidateSetId, state, expectedRevision) => reconcile("set_candidate_set_state", { candidateSetId, state, expectedRevision }),
+	    recordRound: async (round, expectedRevision) => reconcile("record_round", { round, expectedRevision }),
+	    recordBallot: async (ballot, expectedRevision) => reconcile("record_ballot", { ballot, expectedRevision }),
+	    preparePromotion: async (intent, expectedRevision) => reconcile("prepare_promotion", { intent, expectedRevision }),
+	    markPromotionRefUpdated: async (intentId, observedCommit, expectedRevision) => reconcile("mark_promotion_ref_updated", { intentId, observedCommit, expectedRevision }),
+	    finalizePromotion: async (intentId, expectedRevision) => reconcile("finalize_promotion", { intentId, expectedRevision }),
+	    abortPromotion: async (intentId, reason, expectedRevision) => reconcile("abort_promotion", { intentId, reason, expectedRevision }),
+	    rollbackPromotion: async (intentId, reason, expectedRevision) => reconcile("rollback_promotion", { intentId, reason, expectedRevision }),
+	    recoverPromotion: async (intentId, observedCommit, expectedRevision) => reconcile("recover_promotion", { intentId, observedCommit, expectedRevision }),
+	    resumePromotion: async (intentId, observedCommit, expectedRevision) => reconcile("resume_promotion", { intentId, observedCommit, expectedRevision }),
 	  });
 	}
 

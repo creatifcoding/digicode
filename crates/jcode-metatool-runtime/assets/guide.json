@@ -1,11 +1,12 @@
 {
-  "generated_from": "src/api-surface.ts intersected with the measured live guest surface (41 methods, 2026-07-29)",
+  "generated_from": "src/api-surface.ts intersected with the measured live guest surface (updated 2026-07-31)",
   "notes": [
     "inputs is the JSON object passed to the call; history(n) returns recent call history entries.",
     "read/write/sh/exec operate on the GUEST filesystem (cwd /data, the durable workspace store mount), not the host repo.",
     "Store data should include _meta: { summary } for catalog discipline.",
-    "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot and may emit one atomic reconciliation effect; guest code never receives the database handle.",
-    "Use tasker_mode plan before apply when inspecting a new reconciliation. Plan executes the same canonical mutation semantics against an in-memory SQLite fork, returns a normalized stable simulation, and issues a time-bounded host receipt without changing the source database. Apply requires tasker_receipt and verifies its project, snapshot, exact change-set digest, and expiry before mutating canonical state.",
+    "The checked-in Tasker parity manifest is docs/TASKER_PARITY_MANIFEST.json; it records the measured Pi method/action counts and the codemode, public-tool-only, and internal-only boundary.",
+    "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot, including ordinary Tasker topology and concurrency projections, and may emit one atomic reconciliation effect; guest code never receives a database or agent-spawning handle.",
+    "Use tasker_mode plan before apply when inspecting a new reconciliation. Plan executes the same ordinary or concurrency mutation semantics against isolated in-memory SQLite forks, returns a normalized stable simulation, and issues a time-bounded host receipt without changing canonical state. Apply requires tasker_receipt and verifies its project, selected concurrency project, snapshot, exact change-set digest, and expiry before mutating canonical state.",
     "mt.artifacts is present only when the host grants artifact_mode apply. It exposes a bounded read-only catalog and candidates list, and admitBundle(bundle) emits exactly one host-admitted artifacts.admit_bundle effect; guest code never receives artifact-store filesystem or database authority."
   ],
   "undeclared": [
@@ -184,35 +185,267 @@
     "tasker-capability": [
       {
         "name": "tasker.status",
-        "signature": "() \u2192 {mode, snapshotHash, counts, truncated}"
+        "signature": "() -> {mode, snapshotHash, projectId, counts, truncated, lifecycle}"
+      },
+      {
+        "name": "tasker.snapshot",
+        "signature": "() -> bounded Tasker snapshot"
       },
       {
         "name": "tasker.list",
-        "signature": "(options?) \u2192 Task[]"
+        "signature": "(options?) -> Task[]"
+      },
+      {
+        "name": "tasker.show",
+        "signature": "(taskRef) -> {task, readiness, dependencies, notes} | null"
+      },
+      {
+        "name": "tasker.search",
+        "signature": "(query, options?) -> Task[]"
       },
       {
         "name": "tasker.ready",
-        "signature": "(limit?) \u2192 Task[]"
+        "signature": "(limit?) -> Task[]"
       },
       {
         "name": "tasker.features",
-        "signature": "(options?) \u2192 Feature[]"
+        "signature": "(options?) -> Feature[]"
       },
       {
-        "name": "tasker.batch",
-        "signature": "async (operations) \u2192 ReconciliationReceipt"
+        "name": "tasker.feature",
+        "signature": "(featureRef) -> FeatureStatus | null"
       },
       {
-        "name": "tasker.plan",
-        "signature": "async (tasks) \u2192 ReconciliationReceipt"
+        "name": "tasker.dependencies",
+        "signature": "(options?) -> TaskDependency[]"
       },
       {
-        "name": "tasker.featurePlan",
-        "signature": "async (feature) \u2192 ReconciliationReceipt"
+        "name": "tasker.featureDependencies",
+        "signature": "(options?) -> FeatureDependency[]"
+      },
+      {
+        "name": "tasker.notes",
+        "signature": "(options?) -> Note[]"
+      },
+      {
+        "name": "tasker.taskGraph",
+        "signature": "(limit?) -> bounded projection"
+      },
+      {
+        "name": "tasker.taskStructure",
+        "signature": "(limit?) -> bounded projection"
+      },
+      {
+        "name": "tasker.topologySummary",
+        "signature": "(limit?) -> bounded projection"
+      },
+      {
+        "name": "tasker.topologyAnomalies",
+        "signature": "(limit?) -> bounded projection"
+      },
+      {
+        "name": "tasker.topologyPaths",
+        "signature": "(options) -> bounded path projection"
+      },
+      {
+        "name": "tasker.topologyFrontier",
+        "signature": "(limit?) -> bounded projection"
+      },
+      {
+        "name": "tasker.featureChildren",
+        "signature": "(options) -> bounded feature projection"
+      },
+      {
+        "name": "tasker.taskNeighbors",
+        "signature": "(options) -> bounded dependency projection"
+      },
+      {
+        "name": "tasker.featureTree",
+        "signature": "(options?) -> bounded projection"
+      },
+      {
+        "name": "tasker.resolveTask",
+        "signature": "(taskRef) -> Task | null"
+      },
+      {
+        "name": "tasker.resolveFeature",
+        "signature": "(featureRef) -> Feature | null"
+      },
+      {
+        "name": "tasker.featureGates",
+        "signature": "(featureRef) -> FeatureGate[]"
+      },
+      {
+        "name": "tasker.featureGate",
+        "signature": "(featureRef, index) -> FeatureGate | null"
+      },
+      {
+        "name": "tasker.lifecycle",
+        "signature": "() -> {policies, agentSpawning, candidateAuthorship, promotion}"
+      },
+      {
+        "name": "tasker.policy",
+        "signature": "() -> supported concurrency policy metadata"
+      },
+      {
+        "name": "tasker.concurrency",
+        "signature": "(limit?) -> bounded candidate/round/promotion projection"
+      },
+      {
+        "name": "tasker.candidateSets",
+        "signature": "(limit?) -> CandidateSet[]"
+      },
+      {
+        "name": "tasker.candidates",
+        "signature": "(limit?) -> Candidate[]"
+      },
+      {
+        "name": "tasker.rounds",
+        "signature": "(limit?) -> AdjudicationRound[]"
+      },
+      {
+        "name": "tasker.promotions",
+        "signature": "(limit?) -> PromotionIntent[]"
+      },
+      {
+        "name": "tasker.candidateSet",
+        "signature": "(id) -> CandidateSet | null"
+      },
+      {
+        "name": "tasker.candidate",
+        "signature": "(id) -> Candidate | null"
+      },
+      {
+        "name": "tasker.round",
+        "signature": "(id) -> AdjudicationRound | null"
+      },
+      {
+        "name": "tasker.promotion",
+        "signature": "(id) -> PromotionIntent | null"
       },
       {
         "name": "tasker.reconcile",
-        "signature": "async ({kind, payload}) \u2192 ReconciliationReceipt"
+        "signature": "async ({kind, payload}) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.batch",
+        "signature": "async (operations) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.plan",
+        "signature": "async (tasks) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.featurePlan",
+        "signature": "async (feature) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.create",
+        "signature": "async (task) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.update",
+        "signature": "async (task) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.setState",
+        "signature": "async (taskId, state, options?) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.addDependency",
+        "signature": "async (taskId, dependsOnTaskId) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.addNote",
+        "signature": "async (note) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.taskIndex",
+        "signature": "async (input) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.createFeature",
+        "signature": "async (feature) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.updateFeature",
+        "signature": "async (feature) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.resolveFeatureGate",
+        "signature": "async (input) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.setDependencies",
+        "signature": "async (input) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.setFeatureDependencies",
+        "signature": "async (input) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.link",
+        "signature": "async (taskId, featureId) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.unlink",
+        "signature": "async (taskId) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.reconcileConcurrency",
+        "signature": "async (kind, payload) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.createCandidateSet",
+        "signature": "async (candidateSet, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.registerCandidate",
+        "signature": "async (candidate, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.submitCandidate",
+        "signature": "async (candidate, evidence, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.setCandidateSetState",
+        "signature": "async (candidateSetId, state, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.recordRound",
+        "signature": "async (round, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.recordBallot",
+        "signature": "async (ballot, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.preparePromotion",
+        "signature": "async (intent, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.markPromotionRefUpdated",
+        "signature": "async (intentId, observedCommit, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.finalizePromotion",
+        "signature": "async (intentId, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.abortPromotion",
+        "signature": "async (intentId, reason, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.rollbackPromotion",
+        "signature": "async (intentId, reason, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.recoverPromotion",
+        "signature": "async (intentId, observedCommit, expectedRevision) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.resumePromotion",
+        "signature": "async (intentId, observedCommit, expectedRevision) -> ReconciliationReceipt"
       }
     ],
     "artifacts-capability": [

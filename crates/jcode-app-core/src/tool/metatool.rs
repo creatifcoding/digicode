@@ -16,7 +16,9 @@ use jcode_metatool_types::{
     MetaToolError,
 };
 use jcode_tasker_pi::{
-    BatchOperation, FeaturePlanFeature, FeaturePlanInput, PiTaskerStore, PlanTask, ProjectPartition,
+    BatchOperation, ConcurrencyStore, CreateFeature, CreateTask, FeaturePlanFeature,
+    FeaturePlanInput, NoteInput, PiTaskerStore, PlanTask, ProjectPartition, ResolveFeatureGate,
+    UpdateFeature, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +36,11 @@ const GUEST_ENGINE_SOURCE: &str = include_str!(concat!(
 const GUIDE_SOURCE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../jcode-metatool-runtime/assets/guide.json"
+));
+#[cfg(test)]
+const TASKER_PARITY_MANIFEST_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/TASKER_PARITY_MANIFEST.json"
 ));
 const MAX_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -302,6 +309,8 @@ struct MetaToolInput {
     #[serde(default)]
     tasker_receipt: Option<String>,
     #[serde(default)]
+    tasker_project_id: Option<String>,
+    #[serde(default)]
     artifact_mode: ArtifactMode,
 }
 
@@ -328,6 +337,157 @@ struct TaskerEffectInput {
     payload: Value,
     mode: TaskerMode,
     expected_snapshot_hash: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeCreateTaskInput {
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    feature_id: Option<String>,
+    #[serde(default)]
+    indexes: Option<Value>,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    notes: Vec<NoteInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeUpdateTaskInput {
+    task_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<Option<String>>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    feature_id: Option<Option<String>>,
+    #[serde(default)]
+    indexes: Option<Value>,
+    #[serde(default)]
+    depends_on: Option<Vec<String>>,
+    #[serde(default)]
+    clear_dependencies: bool,
+    #[serde(default)]
+    active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeCreateFeatureInput {
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    parent_feature_id: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    tags: Option<Value>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    acceptance: Option<Value>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    gates: Option<Value>,
+    #[serde(default)]
+    indexes: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeUpdateFeatureInput {
+    feature_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<Option<String>>,
+    #[serde(default)]
+    parent_feature_id: Option<Option<String>>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
+    tags: Option<Value>,
+    #[serde(default)]
+    brief: Option<Option<String>>,
+    #[serde(default)]
+    acceptance: Option<Value>,
+    #[serde(default)]
+    owner: Option<Option<String>>,
+    #[serde(default)]
+    gates: Option<Value>,
+    #[serde(default)]
+    indexes: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeTaskIndexInput {
+    task_id: String,
+    #[serde(default)]
+    index_set: Option<Value>,
+    #[serde(default)]
+    index_add: Option<Value>,
+    #[serde(default)]
+    index_remove: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeAddDependencyInput {
+    task_id: String,
+    depends_on_task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeAddNoteInput {
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    feature_id: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeDependenciesInput {
+    task_id: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeFeatureDependenciesInput {
+    feature_id: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodemodeLinkInput {
+    task_id: String,
+    #[serde(default)]
+    feature_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -351,6 +511,8 @@ struct TaskerPlanReceipt {
     list_id: String,
     snapshot_hash: String,
     change_digest: String,
+    #[serde(default)]
+    concurrency_project_id: Option<String>,
     issued_at: u64,
     expires_at: u64,
 }
@@ -381,6 +543,7 @@ fn tasker_change_digest(input: &TaskerEffectInput) -> Result<String> {
     let canonical = canonical_json(&json!({
         "kind": input.kind,
         "payload": input.payload,
+        "project_id": input.project_id,
     }));
     Ok(format!(
         "{:x}",
@@ -421,6 +584,7 @@ fn issue_tasker_receipt(
         list_id: partition.list_id.clone(),
         snapshot_hash: snapshot_hash.to_owned(),
         change_digest: tasker_change_digest(input)?,
+        concurrency_project_id: input.project_id.clone(),
         issued_at,
         expires_at: issued_at + TASKER_RECEIPT_TTL_SECONDS,
     };
@@ -460,6 +624,9 @@ fn verify_tasker_receipt(
     if receipt.snapshot_hash != snapshot_hash {
         return Err(anyhow!("Tasker plan receipt snapshot mismatch"));
     }
+    if receipt.concurrency_project_id != input.project_id {
+        return Err(anyhow!("Tasker plan receipt concurrency project mismatch"));
+    }
     if receipt.change_digest != tasker_change_digest(input)? {
         return Err(anyhow!("Tasker plan receipt change-set mismatch"));
     }
@@ -483,9 +650,23 @@ fn default_profile() -> ExecutionProfile {
     ExecutionProfile::Pure
 }
 
+#[cfg(test)]
 fn tasker_snapshot(store: &PiTaskerStore) -> Result<(Value, String)> {
+    let project_id = store.partition().list_id.clone();
+    tasker_snapshot_for_project(store, &project_id)
+}
+
+fn tasker_snapshot_for_project(
+    store: &PiTaskerStore,
+    concurrency_project_id: &str,
+) -> Result<(Value, String)> {
     let snapshot = store.snapshot()?;
     let ready = store.ready_tasks()?;
+    let concurrency = store.open_concurrency_store()?;
+    let concurrency_projection =
+        concurrency.project(concurrency_project_id, TASKER_SNAPSHOT_LIMIT)?;
+    let concurrency_revision = concurrency.current_revision(concurrency_project_id)?;
+    let concurrency_schema_version = concurrency.schema_version()?;
     let canonical = json!({
         "list_meta": snapshot.list_meta,
         "tasks": snapshot.tasks,
@@ -494,6 +675,12 @@ fn tasker_snapshot(store: &PiTaskerStore) -> Result<(Value, String)> {
         "feature_dependencies": snapshot.feature_dependencies,
         "task_notes": snapshot.task_notes,
         "feature_notes": snapshot.feature_notes,
+        "concurrency": {
+            "project_id": concurrency_project_id,
+            "schema_version": concurrency_schema_version,
+            "revision": concurrency_revision,
+            "projection": concurrency_projection.clone(),
+        },
     });
     let hash = format!(
         "{:x}",
@@ -504,6 +691,46 @@ fn tasker_snapshot(store: &PiTaskerStore) -> Result<(Value, String)> {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let dependencies = canonical["dependencies"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let feature_dependencies = canonical["feature_dependencies"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let task_notes = canonical["task_notes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let feature_notes = canonical["feature_notes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let task_count = tasks.len();
+    let feature_count = features.len();
+    let dependency_count = dependencies.len();
+    let feature_dependency_count = feature_dependencies.len();
+    let task_note_count = task_notes.len();
+    let feature_note_count = feature_notes.len();
+    let concurrency_truncated = concurrency_projection["truncated"] == true;
+    let projection_limit = TASKER_SNAPSHOT_LIMIT;
+    let projections = json!({
+        "taskGraph": store.task_graph_projection(projection_limit)?,
+        "taskStructure": store.task_structure_projection(projection_limit)?,
+        "topologySummary": store.topology_summary_projection(projection_limit)?,
+        "topologyAnomalies": store.topology_anomalies_projection(projection_limit)?,
+        "topologyFrontier": store.topology_frontier_projection(projection_limit)?,
+        "featureTree": store.feature_tree_projection(2, projection_limit, false)?,
+    });
+    let candidate_sets = concurrency_projection["candidateSets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let supported_policies = ["exclusive", "speculative", "ensemble"]
+        .into_iter()
+        .map(Value::from)
+        .collect::<Vec<_>>();
     let partition = store.partition();
     let bounded = json!({
         "partition": {
@@ -513,16 +740,52 @@ fn tasker_snapshot(store: &PiTaskerStore) -> Result<(Value, String)> {
         },
         "schema_fingerprint": store.schema_fingerprint()?,
         "counts": {
-            "tasks": tasks.len(),
-            "features": features.len(),
-            "dependencies": canonical["dependencies"].as_array().map_or(0, Vec::len),
+            "tasks": task_count,
+            "features": feature_count,
+            "dependencies": dependency_count,
+            "feature_dependencies": feature_dependency_count,
+            "task_notes": task_note_count,
+            "feature_notes": feature_note_count,
             "ready": ready.len(),
+            "candidate_sets": concurrency_projection["counts"]["candidateSets"],
+            "candidates": concurrency_projection["counts"]["candidates"],
+            "rounds": concurrency_projection["counts"]["adjudicationRounds"],
+            "ballots": concurrency_projection["counts"]["adjudicationBallots"],
+            "promotions": concurrency_projection["counts"]["promotionIntents"],
         },
         "tasks": tasks.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
         "features": features.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
+        "dependencies": dependencies.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
+        "featureDependencies": feature_dependencies.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
+        "taskNotes": task_notes.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
+        "featureNotes": feature_notes.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
         "ready": ready.into_iter().take(TASKER_SNAPSHOT_LIMIT).collect::<Vec<_>>(),
-        "truncated": canonical["tasks"].as_array().is_some_and(|items| items.len() > TASKER_SNAPSHOT_LIMIT)
-            || canonical["features"].as_array().is_some_and(|items| items.len() > TASKER_SNAPSHOT_LIMIT),
+        "projections": projections,
+        "concurrency": {
+            "projectId": concurrency_project_id,
+            "schemaVersion": concurrency_schema_version,
+            "revision": concurrency_revision,
+            "projection": concurrency_projection,
+            "candidateSets": candidate_sets,
+            "policy": {
+                "supported": supported_policies,
+                "agentSpawning": "disabled",
+                "promotion": "single_writer"
+            }
+        },
+        "lifecycle": {
+            "policies": ["exclusive", "speculative", "ensemble"],
+            "agentSpawning": "disabled",
+            "candidateAuthorship": "metadata_only",
+            "promotion": "single_writer"
+        },
+        "truncated": task_count > TASKER_SNAPSHOT_LIMIT
+            || feature_count > TASKER_SNAPSHOT_LIMIT
+            || dependency_count > TASKER_SNAPSHOT_LIMIT
+            || feature_dependency_count > TASKER_SNAPSHOT_LIMIT
+            || task_note_count > TASKER_SNAPSHOT_LIMIT
+            || feature_note_count > TASKER_SNAPSHOT_LIMIT
+            || concurrency_truncated,
     });
     Ok((bounded, hash))
 }
@@ -557,7 +820,13 @@ fn reconcile_tasker_effects(
             effect.operation
         ));
     }
-    let input: TaskerEffectInput = serde_json::from_value(effect.input.clone())?;
+    let mut input: TaskerEffectInput = serde_json::from_value(effect.input.clone())?;
+    input.project_id = Some(
+        input
+            .project_id
+            .clone()
+            .unwrap_or_else(|| store.partition().list_id.clone()),
+    );
     if input.mode != requested_mode {
         return Err(anyhow!(
             "Tasker capability mode {:?} does not match requested mode {:?}",
@@ -574,7 +843,16 @@ fn reconcile_tasker_effects(
             return Err(anyhow!("tasker_receipt is valid only for apply mode"));
         }
         let mut simulation = store.fork_in_memory()?;
-        let simulated = execute_tasker_reconciliation(&mut simulation, &input)?;
+        let mut concurrency_simulation = if is_concurrency_kind(&input.kind) {
+            Some(store.open_concurrency_store()?.fork_in_memory()?)
+        } else {
+            None
+        };
+        let simulated = execute_tasker_reconciliation(
+            &mut simulation,
+            &input,
+            concurrency_simulation.as_mut(),
+        )?;
         let simulated = normalize_tasker_simulation(&input, &simulated);
         let receipt = issue_tasker_receipt(receipt_root, store, initial_snapshot_hash, &input)?;
         return Ok(json!({
@@ -602,14 +880,23 @@ fn reconcile_tasker_effects(
         &input,
     )?;
 
-    let (_, current_hash) = tasker_snapshot(store)?;
+    let project_id = input
+        .project_id
+        .as_deref()
+        .unwrap_or(&store.partition().list_id);
+    let (_, current_hash) = tasker_snapshot_for_project(store, project_id)?;
     if current_hash != initial_snapshot_hash {
         return Err(anyhow!(
             "Tasker state changed during codemode evaluation; rerun to reconcile against the current snapshot"
         ));
     }
 
-    let applied = execute_tasker_reconciliation(store, &input)?;
+    let mut concurrency_store = if is_concurrency_kind(&input.kind) {
+        Some(store.open_concurrency_store()?)
+    } else {
+        None
+    };
+    let applied = execute_tasker_reconciliation(store, &input, concurrency_store.as_mut())?;
     Ok(json!({
         "mode": requested_mode,
         "status": "applied",
@@ -623,9 +910,73 @@ fn reconcile_tasker_effects(
     }))
 }
 
+fn resolve_task_reference(store: &PiTaskerStore, reference: &str) -> Result<String> {
+    store
+        .resolve_task_id(reference)?
+        .ok_or_else(|| anyhow!("Task reference not found: {reference}"))
+}
+
+fn resolve_feature_reference(store: &PiTaskerStore, reference: &str) -> Result<String> {
+    store
+        .resolve_feature_id(reference)?
+        .ok_or_else(|| anyhow!("Feature reference not found: {reference}"))
+}
+
+fn payload_field<'a>(payload: &'a Value, name: &str) -> Result<&'a Value> {
+    payload
+        .get(name)
+        .ok_or_else(|| anyhow!("Tasker reconciliation payload requires {name}"))
+}
+
+fn payload_string(payload: &Value, name: &str) -> Result<String> {
+    payload_field(payload, name)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("Tasker reconciliation payload field {name} must be a string"))
+}
+
+fn payload_usize(payload: &Value, name: &str) -> Result<usize> {
+    let value = payload_field(payload, name)?
+        .as_u64()
+        .ok_or_else(|| anyhow!("Tasker reconciliation payload field {name} must be an integer"))?;
+    usize::try_from(value).map_err(|_| anyhow!("Tasker reconciliation field {name} is too large"))
+}
+
+fn payload_revision(payload: &Value) -> Result<u64> {
+    payload_field(payload, "expectedRevision")?
+        .as_u64()
+        .ok_or_else(|| anyhow!("Tasker concurrency mutations require expectedRevision"))
+}
+
+fn concurrency_store_mut(
+    concurrency: Option<&mut ConcurrencyStore>,
+) -> Result<&mut ConcurrencyStore> {
+    concurrency.ok_or_else(|| anyhow!("Tasker concurrency operation is unavailable"))
+}
+
+fn is_concurrency_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "create_candidate_set"
+            | "register_candidate"
+            | "submit_candidate"
+            | "set_candidate_set_state"
+            | "record_round"
+            | "record_ballot"
+            | "prepare_promotion"
+            | "mark_promotion_ref_updated"
+            | "finalize_promotion"
+            | "abort_promotion"
+            | "rollback_promotion"
+            | "recover_promotion"
+            | "resume_promotion"
+    )
+}
+
 fn execute_tasker_reconciliation(
     store: &mut PiTaskerStore,
     input: &TaskerEffectInput,
+    concurrency: Option<&mut ConcurrencyStore>,
 ) -> Result<Value> {
     match input.kind.as_str() {
         "batch" => {
@@ -650,6 +1001,328 @@ fn execute_tasker_reconciliation(
             Ok(serde_json::to_value(
                 store.feature_plan_import(FeaturePlanInput { feature })?,
             )?)
+        }
+        "create" => {
+            let input: CodemodeCreateTaskInput = serde_json::from_value(input.payload.clone())?;
+            let feature_id = input
+                .feature_id
+                .as_deref()
+                .map(|reference| resolve_feature_reference(store, reference))
+                .transpose()?;
+            let depends_on = input
+                .depends_on
+                .iter()
+                .map(|reference| resolve_task_reference(store, reference))
+                .collect::<Result<Vec<_>>>()?;
+            let task = store.create_task(CreateTask {
+                title: input.title,
+                description: input.description,
+                state: input.state,
+                feature_id,
+                indexes: input.indexes,
+                depends_on,
+                notes: input.notes,
+            })?;
+            Ok(json!({"task": task}))
+        }
+        "update" | "set_state" => {
+            let is_set_state = input.kind == "set_state";
+            let input: CodemodeUpdateTaskInput = serde_json::from_value(input.payload.clone())?;
+            if is_set_state && input.state.is_none() {
+                return Err(anyhow!("set_state reconciliation requires state"));
+            }
+            let task_id = resolve_task_reference(store, &input.task_id)?;
+            let feature_id = input
+                .feature_id
+                .map(|value| {
+                    value
+                        .as_deref()
+                        .map(|reference| resolve_feature_reference(store, reference))
+                        .transpose()
+                })
+                .transpose()?;
+            let depends_on = input
+                .depends_on
+                .map(|references| {
+                    references
+                        .iter()
+                        .map(|reference| resolve_task_reference(store, reference))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?;
+            let task = store.update_task(
+                &task_id,
+                UpdateTask {
+                    title: input.title,
+                    description: input.description,
+                    state: input.state,
+                    feature_id,
+                    indexes: input.indexes,
+                    depends_on,
+                    clear_dependencies: input.clear_dependencies,
+                    active: input.active,
+                },
+            )?;
+            Ok(json!({"task": task}))
+        }
+        "add_dependency" => {
+            let input: CodemodeAddDependencyInput = serde_json::from_value(input.payload.clone())?;
+            let task_id = resolve_task_reference(store, &input.task_id)?;
+            let depends_on = resolve_task_reference(store, &input.depends_on_task_id)?;
+            let dependencies = store
+                .list_dependencies()?
+                .into_iter()
+                .filter(|dependency| dependency.task_id == task_id)
+                .map(|dependency| dependency.depends_on_id)
+                .chain(std::iter::once(depends_on))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            Ok(json!({"dependencies": store.set_dependencies(&task_id, &dependencies)?}))
+        }
+        "add_note" => {
+            let input: CodemodeAddNoteInput = serde_json::from_value(input.payload.clone())?;
+            match (input.task_id, input.feature_id) {
+                (Some(task_id), None) => {
+                    let task_id = resolve_task_reference(store, &task_id)?;
+                    let note = store.append_task_note(
+                        &task_id,
+                        input.category.as_deref(),
+                        &input.content,
+                    )?;
+                    Ok(json!({"note": note}))
+                }
+                (None, Some(feature_id)) => {
+                    let feature_id = resolve_feature_reference(store, &feature_id)?;
+                    let note = store.append_feature_note(
+                        &feature_id,
+                        input.category.as_deref(),
+                        &input.content,
+                    )?;
+                    Ok(json!({"note": note}))
+                }
+                _ => Err(anyhow!(
+                    "add_note requires exactly one of taskId or featureId"
+                )),
+            }
+        }
+        "task_index" => {
+            let input: CodemodeTaskIndexInput = serde_json::from_value(input.payload.clone())?;
+            let task_id = resolve_task_reference(store, &input.task_id)?;
+            let task = if let Some(indexes) = input.index_set {
+                store.set_task_indexes(&task_id, indexes)?
+            } else {
+                if !input.index_remove.is_empty() {
+                    store.remove_task_indexes(&task_id, &input.index_remove)?;
+                }
+                if let Some(add) = input.index_add {
+                    store.add_task_indexes(&task_id, add)?
+                } else {
+                    store
+                        .list_tasks(None)?
+                        .into_iter()
+                        .find(|task| task.id == task_id)
+                        .ok_or_else(|| anyhow!("task disappeared while updating indexes"))?
+                }
+            };
+            let indexes = task.indexes.clone();
+            Ok(json!({"task": task, "indexes": indexes}))
+        }
+        "create_feature" => {
+            let input: CodemodeCreateFeatureInput = serde_json::from_value(input.payload.clone())?;
+            let parent_feature_id = input
+                .parent_feature_id
+                .as_deref()
+                .map(|reference| resolve_feature_reference(store, reference))
+                .transpose()?;
+            let feature = store.create_feature(CreateFeature {
+                title: input.title,
+                description: input.description,
+                parent_feature_id,
+                state: input.state,
+                priority: input.priority,
+                tags: input.tags.unwrap_or_else(|| json!([])),
+                brief: input.brief,
+                acceptance: input.acceptance.unwrap_or_else(|| json!([])),
+                owner: input.owner,
+                gates: input.gates.unwrap_or_else(|| json!([])),
+                indexes: input.indexes.unwrap_or_else(|| json!([])),
+            })?;
+            Ok(json!({"feature": feature}))
+        }
+        "feature_update" => {
+            let input: CodemodeUpdateFeatureInput = serde_json::from_value(input.payload.clone())?;
+            let feature_id = resolve_feature_reference(store, &input.feature_id)?;
+            let parent_feature_id = input
+                .parent_feature_id
+                .map(|value| {
+                    value
+                        .as_deref()
+                        .map(|reference| resolve_feature_reference(store, reference))
+                        .transpose()
+                })
+                .transpose()?;
+            let feature = store.update_feature(
+                &feature_id,
+                UpdateFeature {
+                    title: input.title,
+                    description: input.description,
+                    parent_feature_id,
+                    state: input.state,
+                    priority: input.priority,
+                    tags: input.tags,
+                    brief: input.brief,
+                    acceptance: input.acceptance,
+                    owner: input.owner,
+                    gates: input.gates,
+                    indexes: input.indexes,
+                },
+            )?;
+            Ok(json!({"feature": feature}))
+        }
+        "resolve_feature_gate" => {
+            let feature_id =
+                resolve_feature_reference(store, &payload_string(&input.payload, "featureId")?)?;
+            let gate_index = payload_usize(&input.payload, "gateIndex")?;
+            let resolution: ResolveFeatureGate = serde_json::from_value(input.payload.clone())?;
+            Ok(json!({
+                "featureId": feature_id,
+                "gates": store.resolve_feature_gate(&feature_id, gate_index, resolution)?
+            }))
+        }
+        "set_dependencies" => {
+            let input: CodemodeDependenciesInput = serde_json::from_value(input.payload.clone())?;
+            let task_id = resolve_task_reference(store, &input.task_id)?;
+            let dependencies = input
+                .depends_on
+                .iter()
+                .map(|reference| resolve_task_reference(store, reference))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(json!({"dependencies": store.set_dependencies(&task_id, &dependencies)?}))
+        }
+        "set_feature_dependencies" => {
+            let input: CodemodeFeatureDependenciesInput =
+                serde_json::from_value(input.payload.clone())?;
+            let feature_id = resolve_feature_reference(store, &input.feature_id)?;
+            let dependencies = input
+                .depends_on
+                .iter()
+                .map(|reference| resolve_feature_reference(store, reference))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(json!({
+                "dependencies": store.set_feature_dependencies(&feature_id, &dependencies)?
+            }))
+        }
+        "link" => {
+            let input: CodemodeLinkInput = serde_json::from_value(input.payload.clone())?;
+            let task_id = resolve_task_reference(store, &input.task_id)?;
+            let feature_id = input
+                .feature_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("link reconciliation requires featureId"))
+                .and_then(|reference| resolve_feature_reference(store, reference))?;
+            store.link_task(&task_id, &feature_id)?;
+            Ok(json!({"task": store.list_tasks(None)?.into_iter().find(|task| task.id == task_id)}))
+        }
+        "unlink" => {
+            let task_id =
+                resolve_task_reference(store, &payload_string(&input.payload, "taskId")?)?;
+            store.unlink_task(&task_id)?;
+            Ok(json!({"task": store.list_tasks(None)?.into_iter().find(|task| task.id == task_id)}))
+        }
+        "create_candidate_set" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            let candidate_set = payload_field(&input.payload, "candidateSet")?;
+            Ok(serde_json::to_value(concurrency.create_candidate_set(
+                candidate_set,
+                payload_revision(&input.payload)?,
+            )?)?)
+        }
+        "register_candidate" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            let candidate = payload_field(&input.payload, "candidate")?;
+            Ok(serde_json::to_value(concurrency.register_candidate(
+                candidate,
+                payload_revision(&input.payload)?,
+            )?)?)
+        }
+        "submit_candidate" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            let candidate = payload_field(&input.payload, "candidate")?;
+            let evidence = payload_field(&input.payload, "evidence")?
+                .as_array()
+                .ok_or_else(|| anyhow!("submit_candidate evidence must be an array"))?;
+            Ok(serde_json::to_value(concurrency.submit_candidate(
+                candidate,
+                evidence,
+                payload_revision(&input.payload)?,
+            )?)?)
+        }
+        "set_candidate_set_state" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            Ok(serde_json::to_value(concurrency.set_candidate_set_state(
+                &payload_string(&input.payload, "candidateSetId")?,
+                &payload_string(&input.payload, "state")?,
+                payload_revision(&input.payload)?,
+            )?)?)
+        }
+        "record_round" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            Ok(serde_json::to_value(
+                concurrency.record_adjudication_round(
+                    payload_field(&input.payload, "round")?,
+                    payload_revision(&input.payload)?,
+                )?,
+            )?)
+        }
+        "record_ballot" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            Ok(serde_json::to_value(
+                concurrency.record_adjudication_ballot(
+                    payload_field(&input.payload, "ballot")?,
+                    payload_revision(&input.payload)?,
+                )?,
+            )?)
+        }
+        "prepare_promotion" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            Ok(serde_json::to_value(concurrency.prepare_promotion(
+                payload_field(&input.payload, "intent")?,
+                payload_revision(&input.payload)?,
+            )?)?)
+        }
+        "mark_promotion_ref_updated" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            Ok(serde_json::to_value(
+                concurrency.mark_promotion_ref_updated(
+                    &payload_string(&input.payload, "intentId")?,
+                    &payload_string(&input.payload, "observedCommit")?,
+                    payload_revision(&input.payload)?,
+                )?,
+            )?)
+        }
+        "finalize_promotion" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            Ok(serde_json::to_value(concurrency.finalize_promotion(
+                &payload_string(&input.payload, "intentId")?,
+                payload_revision(&input.payload)?,
+            )?)?)
+        }
+        "abort_promotion" | "rollback_promotion" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            Ok(serde_json::to_value(concurrency.rollback_promotion(
+                &payload_string(&input.payload, "intentId")?,
+                &payload_string(&input.payload, "reason")?,
+                payload_revision(&input.payload)?,
+            )?)?)
+        }
+        "recover_promotion" | "resume_promotion" => {
+            let concurrency = concurrency_store_mut(concurrency)?;
+            Ok(serde_json::to_value(concurrency.recover_promotion(
+                &payload_string(&input.payload, "intentId")?,
+                &payload_string(&input.payload, "observedCommit")?,
+                payload_revision(&input.payload)?,
+            )?)?)
         }
         other => Err(anyhow!("unsupported Tasker reconciliation kind: {other}")),
     }
@@ -687,8 +1360,74 @@ fn normalize_tasker_simulation(input: &TaskerEffectInput, result: &Value) -> Val
             "dependency_count": result["dependencyCount"],
             "feature": summarize_feature_plan(&input.payload["feature"]),
         }),
+        "create" => json!({
+            "task": stable_task(&result["task"], false),
+        }),
+        "update" | "set_state" | "link" | "unlink" => json!({
+            "task": stable_task(&result["task"], true),
+        }),
+        "add_dependency" | "set_dependencies" | "set_feature_dependencies" => json!({
+            "dependencies": result["dependencies"].clone(),
+        }),
+        "add_note" => json!({
+            "note": {
+                "taskId": result["note"]["taskId"],
+                "featureId": result["note"]["featureId"],
+                "category": result["note"]["category"],
+                "content": result["note"]["content"],
+            },
+        }),
+        "task_index" => json!({
+            "indexes": result["indexes"].clone(),
+        }),
+        "create_feature" => json!({
+            "feature": stable_feature(&result["feature"], false),
+        }),
+        "feature_update" => json!({
+            "feature": stable_feature(&result["feature"], true),
+        }),
+        "resolve_feature_gate" => json!({
+            "featureId": result["featureId"],
+            "gates": result["gates"].clone(),
+        }),
+        kind if is_concurrency_kind(kind) => json!({
+            "id": result["id"],
+            "revision": result["revision"],
+            "action": kind,
+        }),
         _ => Value::Null,
     }
+}
+
+fn stable_task(task: &Value, include_id: bool) -> Value {
+    let mut value = json!({
+        "title": task["title"],
+        "description": task["description"],
+        "state": task["state"],
+        "featureId": task["featureId"],
+        "indexes": task["indexes"],
+    });
+    if include_id {
+        value["id"] = task["id"].clone();
+    }
+    value
+}
+
+fn stable_feature(feature: &Value, include_id: bool) -> Value {
+    let mut value = json!({
+        "title": feature["title"],
+        "description": feature["description"],
+        "state": feature["state"],
+        "priority": feature["priority"],
+        "parentFeatureId": feature["parentFeatureId"],
+        "tags": feature["tags"],
+        "acceptance": feature["acceptance"],
+        "gates": feature["gates"],
+    });
+    if include_id {
+        value["id"] = feature["id"].clone();
+    }
+    value
 }
 
 fn summarize_feature_plan(feature: &Value) -> Value {
@@ -869,6 +1608,10 @@ impl Tool for MetaTool {
                     "type": "string",
                     "description": "Receipt id returned by a successful tasker_mode=plan call. Required for apply and bound to the project, canonical snapshot, exact change set, and expiry."
                 },
+                "tasker_project_id": {
+                    "type": "string",
+                    "description": "Optional native concurrency project id for bounded candidate, round, and promotion projections. Defaults to the Pi list id."
+                },
                 "artifact_mode": {
                     "type": "string",
                     "enum": ["off", "apply"],
@@ -912,8 +1655,13 @@ impl Tool for MetaTool {
                     None
                 } else {
                     let store = self.tasker_store(&ctx)?;
-                    let (snapshot, snapshot_hash) = tasker_snapshot(&store)?;
-                    Some((snapshot, snapshot_hash))
+                    let project_id = params
+                        .tasker_project_id
+                        .clone()
+                        .unwrap_or_else(|| store.partition().list_id.clone());
+                    let (snapshot, snapshot_hash) =
+                        tasker_snapshot_for_project(&store, &project_id)?;
+                    Some((snapshot, snapshot_hash, project_id))
                 };
                 let artifact_context = if params.artifact_mode == ArtifactMode::Off {
                     None
@@ -923,13 +1671,14 @@ impl Tool for MetaTool {
                 };
                 let capabilities = if tasker_context.is_some() || artifact_context.is_some() {
                     let mut capabilities = serde_json::Map::new();
-                    if let Some((snapshot, snapshot_hash)) = tasker_context.as_ref() {
+                    if let Some((snapshot, snapshot_hash, project_id)) = tasker_context.as_ref() {
                         capabilities.insert(
                             "tasker".into(),
                             json!({
                                 "mode": params.tasker_mode,
                                 "snapshot": snapshot,
                                 "snapshot_hash": snapshot_hash,
+                                "project_id": project_id,
                             }),
                         );
                     }
@@ -982,7 +1731,7 @@ impl Tool for MetaTool {
                     ));
                 }
                 let reconciliation = match tasker_context {
-                    Some((_, snapshot_hash)) => {
+                    Some((_, snapshot_hash, _)) => {
                         let database_path = self.tasker_database_path();
                         let receipt_root = self.tasker_receipt_root()?;
                         let project_root = ctx.working_dir.clone().ok_or_else(|| {
@@ -1083,6 +1832,10 @@ mod tests {
             json!(["off", "plan", "apply"])
         );
         assert_eq!(
+            definition.input_schema["properties"]["tasker_project_id"]["type"],
+            "string"
+        );
+        assert_eq!(
             definition.input_schema["properties"]["artifact_mode"]["enum"],
             json!(["off", "apply"])
         );
@@ -1126,6 +1879,65 @@ mod tests {
         assert!(guide["notes"].is_array());
         assert!(sections["tasker-capability"].is_array());
         assert!(sections["artifacts-capability"].is_array());
+        assert_eq!(sections["tasker-capability"].as_array().unwrap().len(), 66);
+    }
+
+    #[test]
+    fn parity_manifest_covers_the_measured_tasker_surface() {
+        let manifest: Value = serde_json::from_str(TASKER_PARITY_MANIFEST_SOURCE)
+            .expect("checked-in Tasker parity manifest JSON");
+        assert_eq!(manifest["audit"]["pi_tasker_store_methods"], 57);
+        assert_eq!(manifest["audit"]["public_tasker_actions"], 37);
+        assert_eq!(manifest["audit"]["live_mt_tasker_methods_before_slice"], 8);
+        assert_eq!(manifest["audit"]["live_mt_tasker_methods_after_slice"], 66);
+
+        let store_methods = manifest["pi_tasker_store_methods"]
+            .as_array()
+            .expect("manifest Pi method array");
+        let actions = manifest["public_tasker_actions"]
+            .as_array()
+            .expect("manifest action array");
+        let store_names = store_methods
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let action_names = actions
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(store_methods.len(), 57);
+        assert_eq!(store_names.len(), 57);
+        assert_eq!(actions.len(), 37);
+        assert_eq!(action_names.len(), 37);
+
+        let store_counts = store_methods.iter().fold(
+            std::collections::BTreeMap::<&str, usize>::new(),
+            |mut counts, entry| {
+                if let Some(classification) = entry["classification"].as_str() {
+                    *counts.entry(classification).or_default() += 1;
+                }
+                counts
+            },
+        );
+        assert_eq!(store_counts.get("codemode_exposed"), Some(&40));
+        assert_eq!(store_counts.get("public_tool_only"), Some(&8));
+        assert_eq!(store_counts.get("internal_only"), Some(&9));
+
+        let action_counts = actions.iter().fold(
+            std::collections::BTreeMap::<&str, usize>::new(),
+            |mut counts, entry| {
+                if let Some(classification) = entry["classification"].as_str() {
+                    *counts.entry(classification).or_default() += 1;
+                }
+                counts
+            },
+        );
+        assert_eq!(action_counts.get("codemode_exposed"), Some(&29));
+        assert_eq!(action_counts.get("public_tool_only"), Some(&8));
+        assert_eq!(
+            manifest["concurrency_surface"]["agent_spawning"],
+            "not_exposed"
+        );
     }
 
     #[test]
@@ -1279,6 +2091,154 @@ mod tests {
         let tasks = store.list_tasks(None).expect("list after apply");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Created through mt.tasker");
+    }
+
+    #[test]
+    fn tasker_reconciler_covers_ordinary_and_concurrency_mutations() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let database = workspace.path().join("tasks.db");
+        super::super::tasker::tests::install_pi_schema(&database);
+        let partition = ProjectPartition::with_db_path(
+            &database,
+            workspace.path().to_string_lossy().into_owned(),
+        );
+        let mut store = PiTaskerStore::open(partition).expect("open Pi-compatible Tasker store");
+        let receipts = workspace.path().join("receipts");
+
+        let (_, snapshot_hash) = tasker_snapshot(&store).expect("initial Tasker snapshot");
+        let create_effect = ExecutionEffect {
+            capability: "tasker".into(),
+            operation: "reconcile".into(),
+            input: json!({
+                "kind": "create",
+                "mode": "plan",
+                "expected_snapshot_hash": snapshot_hash,
+                "payload": {
+                    "title": "Ordinary codemode task",
+                    "description": "created through the ordinary Tasker API",
+                    "dependsOn": [],
+                    "notes": []
+                }
+            }),
+        };
+        let planned = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&create_effect),
+            TaskerMode::Plan,
+            &snapshot_hash,
+            &receipts,
+            None,
+        )
+        .expect("plan ordinary mutation");
+        assert_eq!(
+            planned["simulation"]["task"]["title"],
+            "Ordinary codemode task"
+        );
+        assert!(
+            store
+                .list_tasks(None)
+                .expect("list after ordinary plan")
+                .is_empty()
+        );
+
+        let receipt = planned["receipt"]["id"]
+            .as_str()
+            .expect("ordinary receipt id")
+            .to_owned();
+        let mut apply_create = create_effect;
+        apply_create.input["mode"] = json!("apply");
+        reconcile_tasker_effects(
+            &mut store,
+            &[apply_create],
+            TaskerMode::Apply,
+            &snapshot_hash,
+            &receipts,
+            Some(&receipt),
+        )
+        .expect("apply ordinary mutation");
+        let task = store
+            .list_tasks(None)
+            .expect("list after ordinary apply")
+            .into_iter()
+            .next()
+            .expect("created ordinary task");
+
+        let project_id = store.partition().list_id.clone();
+        let (_, concurrency_snapshot_hash) = tasker_snapshot(&store).expect("concurrency snapshot");
+        let candidate_set_effect = ExecutionEffect {
+            capability: "tasker".into(),
+            operation: "reconcile".into(),
+            input: json!({
+                "kind": "create_candidate_set",
+                "mode": "plan",
+                "project_id": project_id,
+                "expected_snapshot_hash": concurrency_snapshot_hash,
+                "payload": {
+                    "expectedRevision": 0,
+                    "candidateSet": {
+                        "id": "set-ordinary",
+                        "projectId": project_id,
+                        "taskId": task.id,
+                        "baseRevision": 0,
+                        "baseCommit": "base-commit",
+                        "acceptanceDigest": "acceptance-digest",
+                        "policy": {"kind": "exclusive"},
+                        "policyVersion": 1,
+                        "state": "open"
+                    }
+                }
+            }),
+        };
+        let concurrency_plan = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&candidate_set_effect),
+            TaskerMode::Plan,
+            &concurrency_snapshot_hash,
+            &receipts,
+            None,
+        )
+        .expect("plan concurrency mutation");
+        assert_eq!(concurrency_plan["simulation"]["id"], "set-ordinary");
+        assert_eq!(concurrency_plan["simulation"]["revision"], 1);
+        assert!(
+            store
+                .open_concurrency_store()
+                .expect("open concurrency store")
+                .candidate_set("set-ordinary")
+                .expect("read candidate set after plan")
+                .is_none()
+        );
+
+        let concurrency_receipt = concurrency_plan["receipt"]["id"]
+            .as_str()
+            .expect("concurrency receipt id")
+            .to_owned();
+        let mut apply_candidate_set = candidate_set_effect;
+        apply_candidate_set.input["mode"] = json!("apply");
+        reconcile_tasker_effects(
+            &mut store,
+            &[apply_candidate_set],
+            TaskerMode::Apply,
+            &concurrency_snapshot_hash,
+            &receipts,
+            Some(&concurrency_receipt),
+        )
+        .expect("apply concurrency mutation");
+        let concurrency = store
+            .open_concurrency_store()
+            .expect("open concurrency store after apply");
+        assert!(
+            concurrency
+                .candidate_set("set-ordinary")
+                .expect("read candidate set after apply")
+                .is_some()
+        );
+        assert_eq!(
+            concurrency
+                .current_revision(&project_id)
+                .expect("read concurrency revision"),
+            1
+        );
     }
 
     #[test]
