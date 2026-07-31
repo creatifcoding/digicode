@@ -2361,3 +2361,64 @@ fn test_rewind_targets_match_rendered_transcript_numbering() {
         "sanity: raw stored counting diverges, which is why rewind must not use it"
     );
 }
+
+/// Regression: a session whose in-memory transcript is empty must never
+/// checkpoint over an on-disk snapshot that already holds messages. This is
+/// exactly how `session_ram_*` was zeroed on 2026-07-31: a close/save cycle in
+/// a process that never loaded the transcript wrote `messages: []` over a
+/// 6.8 MB snapshot, leaving the `.bak` rotation as the only surviving copy.
+#[test]
+fn empty_session_save_refuses_to_overwrite_populated_snapshot() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-empty-overwrite-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_empty_overwrite_guard";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "durable transcript content".to_string(),
+            cache_control: None,
+        }],
+    );
+    session.save()?;
+
+    // Simulate a process that owns the same session id but never loaded the
+    // transcript (failed load, daemon swap, close racing a restore).
+    let mut amnesiac = Session::create_with_id(session_id.to_string(), None, None);
+    assert!(amnesiac.messages.is_empty());
+    let err = amnesiac
+        .save()
+        .expect_err("empty in-memory session must not clobber a populated snapshot");
+    assert!(
+        err.to_string().contains("refusing to overwrite"),
+        "unexpected error: {err:#}"
+    );
+
+    // The stored transcript must survive intact.
+    let reloaded = Session::load(session_id)?;
+    assert_eq!(reloaded.messages.len(), 1);
+    assert!(
+        reloaded.messages[0]
+            .content_preview()
+            .contains("durable transcript content")
+    );
+
+    // A session that actually has messages may still checkpoint normally.
+    let mut writer = Session::load(session_id)?;
+    writer.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Text {
+            text: "second message".to_string(),
+            cache_control: None,
+        }],
+    );
+    writer.save()?;
+    let reloaded = Session::load(session_id)?;
+    assert_eq!(reloaded.messages.len(), 2);
+    Ok(())
+}

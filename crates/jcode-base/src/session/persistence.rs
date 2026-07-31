@@ -17,6 +17,23 @@ struct JournalReplayStats {
     salvaged_entries: usize,
 }
 
+/// Cheap check that an existing snapshot's `messages` array is non-empty,
+/// without deserializing the whole (potentially multi-MB) session.
+///
+/// Serialized sessions place `"messages":[` in field order; an empty
+/// transcript serializes as exactly `"messages":[]`. Anything else after the
+/// opening bracket means at least one stored message.
+fn snapshot_holds_messages(snapshot_bytes: &[u8]) -> bool {
+    const KEY: &[u8] = b"\"messages\":[";
+    let Some(pos) = snapshot_bytes
+        .windows(KEY.len())
+        .position(|w| w == KEY)
+    else {
+        return false;
+    };
+    matches!(snapshot_bytes.get(pos + KEY.len()), Some(b) if *b != b']')
+}
+
 impl JournalReplayStats {
     fn is_corrupt(&self) -> bool {
         self.skipped_lines > 0
@@ -140,6 +157,30 @@ impl Session {
     }
 
     fn checkpoint_snapshot(&mut self, snapshot_path: &Path, journal_path: &Path) -> Result<()> {
+        // Never overwrite a substantial on-disk transcript with an empty
+        // in-memory one. An empty message vector on a session whose snapshot
+        // already holds messages means this process never loaded (or lost) the
+        // transcript - e.g. a daemon swapped out mid-flight, a failed load, or
+        // a close racing a restore. Writing it would zero the session (the
+        // `.bak` rotation would then hold the only surviving copy).
+        if self.messages.is_empty()
+            && let Ok(existing) = std::fs::read(snapshot_path)
+            && snapshot_holds_messages(&existing)
+        {
+            crate::logging::event_warn(
+                "SESSION_PERSISTENCE",
+                vec![
+                    ("phase", "empty_overwrite_refused".to_string()),
+                    ("session_id", self.id.clone()),
+                    ("path", snapshot_path.display().to_string()),
+                    ("snapshot_bytes", existing.len().to_string()),
+                ],
+            );
+            anyhow::bail!(
+                "refusing to overwrite non-empty session snapshot {} with an empty message list",
+                snapshot_path.display()
+            );
+        }
         storage::write_json_fast(snapshot_path, self)?;
         if journal_path.exists() {
             let _ = std::fs::remove_file(journal_path);
