@@ -248,6 +248,8 @@ pub struct SessionPicker {
     filter_mode: SessionFilterMode,
     /// Search query for filtering sessions
     search_query: String,
+    /// Optional read-only hit-set constraint seeded from session_search metadata.
+    search_result_session_ids: Option<HashSet<String>>,
     /// Whether we're in search input mode
     search_active: bool,
     /// Hidden test session count (debug + canary)
@@ -325,6 +327,7 @@ impl SessionPicker {
             show_test_sessions: false,
             filter_mode: SessionFilterMode::All,
             search_query: String::new(),
+            search_result_session_ids: None,
             search_active: false,
             hidden_test_count,
             focus: PaneFocus::Sessions,
@@ -370,6 +373,7 @@ impl SessionPicker {
             show_test_sessions: false,
             filter_mode: SessionFilterMode::All,
             search_query: String::new(),
+            search_result_session_ids: None,
             search_active: false,
             hidden_test_count: 0,
             focus: PaneFocus::Sessions,
@@ -447,6 +451,7 @@ impl SessionPicker {
             show_test_sessions: false,
             filter_mode: SessionFilterMode::All,
             search_query: String::new(),
+            search_result_session_ids: None,
             search_active: false,
             hidden_test_count,
             focus: PaneFocus::Sessions,
@@ -507,6 +512,14 @@ impl SessionPicker {
     pub fn activate_active_filter(&mut self) {
         self.filter_mode = SessionFilterMode::Active;
         self.refresh_live_presence();
+        self.rebuild_items();
+    }
+
+    pub fn activate_search_results(&mut self, query: String, session_ids: Vec<String>) {
+        self.search_query = query;
+        self.search_active = false;
+        self.search_result_session_ids = Some(session_ids.into_iter().collect());
+        self.filter_mode = SessionFilterMode::All;
         self.rebuild_items();
     }
 
@@ -1208,11 +1221,17 @@ impl SessionPicker {
 
         match code {
             KeyCode::Esc => {
+                if self.search_result_session_ids.is_some() {
+                    return Ok(OverlayAction::Close);
+                }
                 if !self.search_query.is_empty() {
                     self.search_query.clear();
                     self.rebuild_items();
                     return Ok(OverlayAction::Continue);
                 }
+                return Ok(OverlayAction::Close);
+            }
+            KeyCode::Backspace if self.search_result_session_ids.is_some() => {
                 return Ok(OverlayAction::Close);
             }
             KeyCode::Char('q') => return Ok(OverlayAction::Close),

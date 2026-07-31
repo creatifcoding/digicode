@@ -1696,6 +1696,11 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if trimmed == "/hits" || trimmed == "/search-hits" {
+        app.open_latest_session_search_hits();
+        return true;
+    }
+
     if trimmed == "/active" {
         app.open_active_sessions_picker();
         return true;

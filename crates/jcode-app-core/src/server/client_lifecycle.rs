@@ -35,8 +35,8 @@ use super::comm_plan::{
 };
 use super::comm_session::{handle_comm_spawn, handle_comm_stop};
 use super::comm_sync::{
-    CommResyncPlanContext, handle_comm_plan_status, handle_comm_read_context,
-    handle_comm_resync_plan, handle_comm_status, handle_comm_summary,
+    CommResyncPlanContext, handle_comm_graph_read, handle_comm_plan_status,
+    handle_comm_read_context, handle_comm_resync_plan, handle_comm_status, handle_comm_summary,
 };
 use super::provider_control::{
     handle_cycle_model, handle_notify_auth_changed, handle_refresh_models,
@@ -76,7 +76,6 @@ type SessionAgents = Arc<RwLock<HashMap<String, Arc<Mutex<Agent>>>>>;
 type ChannelSubscriptions = Arc<RwLock<HashMap<String, HashMap<String, HashSet<String>>>>>;
 const RELOAD_STARTING_GUARD_MAX_AGE: Duration = Duration::from_secs(30);
 const REQUEST_HANDLER_STALL_THRESHOLDS_MS: [u64; 3] = [2_000, 10_000, 60_000];
-
 fn required_subscribe_working_dir(working_dir: Option<&str>) -> std::result::Result<&str, String> {
     let working_dir = working_dir
         .map(str::trim)
@@ -87,7 +86,6 @@ fn required_subscribe_working_dir(working_dir: Option<&str>) -> std::result::Res
     }
     Ok(working_dir)
 }
-
 fn initial_subscribe_working_dir(request: &Request) -> std::result::Result<String, String> {
     match request {
         Request::Subscribe { working_dir, .. } => {
@@ -1330,7 +1328,6 @@ pub(super) async fn handle_client(
                     }
                 }
             }
-
             Request::Ping { id } => {
                 let json = encode_event(&ServerEvent::Pong { id });
                 let mut w = writer.lock().await;
@@ -1338,7 +1335,16 @@ pub(super) async fn handle_client(
                     break;
                 }
             }
-
+            Request::ListSessions { id } => {
+                super::session_discovery::handle_list_sessions_request(
+                    id,
+                    &client_event_tx,
+                    &sessions,
+                    &global_session_id,
+                    &swarm_members,
+                )
+                .await?;
+            }
             Request::GetState { id } => {
                 if handle_get_state(
                     id,
@@ -1353,7 +1359,6 @@ pub(super) async fn handle_client(
                     break;
                 }
             }
-
             Request::Subscribe {
                 id,
                 working_dir: subscribe_working_dir,
@@ -1529,7 +1534,6 @@ pub(super) async fn handle_client(
                 }
                 client_subscribed = true;
             }
-
             Request::GetHistory { id } => {
                 if handle_get_history(
                     id,
@@ -1560,7 +1564,6 @@ pub(super) async fn handle_client(
                     last_available_models_snapshot = Some(snapshot);
                 }
             }
-
             Request::GetModelCatalog { id } => {
                 if handle_get_model_catalog(id, &client_session_id, &agent, &provider, &writer)
                     .await
@@ -1572,7 +1575,6 @@ pub(super) async fn handle_client(
                     last_available_models_snapshot = Some(snapshot);
                 }
             }
-
             Request::GetCompactedHistory {
                 id,
                 visible_messages,
@@ -1598,7 +1600,6 @@ pub(super) async fn handle_client(
                     retry_after_secs: None,
                 });
             }
-
             Request::Reload { id, force } => {
                 handle_reload(
                     id,
@@ -1610,7 +1611,6 @@ pub(super) async fn handle_client(
                 )
                 .await;
             }
-
             Request::ResumeSession {
                 id,
                 session_id,
@@ -2479,6 +2479,26 @@ pub(super) async fn handle_client(
                 handle_comm_plan_status(
                     id,
                     req_session_id,
+                    &swarm_members,
+                    &swarm_plans,
+                    &client_event_tx,
+                )
+                .await;
+            }
+
+            Request::CommGraphRead {
+                id,
+                session_id: req_session_id,
+                action,
+                node_id,
+                limit,
+            } => {
+                handle_comm_graph_read(
+                    id,
+                    req_session_id,
+                    action,
+                    node_id,
+                    limit,
                     &swarm_members,
                     &swarm_plans,
                     &client_event_tx,

@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "Jcode",
+    "slug": "jcode-mobile",
+    "version": "0.1.0",
+    "scheme": "jcode-mobile",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "plugins": ["expo-router", "expo-secure-store"],
+    "experiments": { "typedRoutes": true }
+  }
+}

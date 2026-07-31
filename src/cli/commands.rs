@@ -2099,6 +2099,7 @@ pub async fn run_server_reload_command(force: bool, emit_json: bool) -> Result<(
     }
 
     let mut client = crate::server::Client::connect().await?;
+    let _subscribe_id = client.subscribe().await?;
 
     // Before asking the (possibly older) daemon to reload, repair a stale
     // `shared-server` channel from the client side. The running server resolves
@@ -3059,6 +3060,7 @@ fn emit_ndjson_event(
             name,
             output,
             error,
+            ..
         } => write_json_line(
             stdout,
             &serde_json::json!({

@@ -2196,6 +2196,91 @@ impl App {
         self.start_session_picker_load();
     }
 
+    pub(crate) fn record_session_search_metadata(&mut self, metadata: &serde_json::Value) -> bool {
+        if metadata.get("kind").and_then(|v| v.as_str()) != Some("session_search_results") {
+            return false;
+        }
+        let query = metadata
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let open_result = metadata
+            .get("open_result")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        let selected_session_id =
+            open_result
+                .and_then(|value| value.checked_sub(1))
+                .and_then(|selected| {
+                    metadata
+                        .get("report")
+                        .and_then(|value| value.get("results"))
+                        .and_then(|value| value.as_array())
+                        .and_then(|results| results.get(selected))
+                        .and_then(|result| result.get("session_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                });
+        let mut session_ids = metadata
+            .get("report")
+            .and_then(|v| v.get("results"))
+            .and_then(|v| v.as_array())
+            .map(|results| {
+                let mut ids = Vec::new();
+                for result in results {
+                    if let Some(id) = result.get("session_id").and_then(|v| v.as_str())
+                        && !ids.iter().any(|existing: &String| existing == id)
+                    {
+                        ids.push(id.to_string());
+                    }
+                }
+                ids
+            })
+            .unwrap_or_else(Vec::new);
+        if let Some(selected_session_id) = selected_session_id
+            && let Some(selected) = session_ids
+                .iter()
+                .position(|session_id| session_id == &selected_session_id)
+        {
+            session_ids.swap(0, selected);
+        }
+        if !query.is_empty() && !session_ids.is_empty() {
+            self.latest_session_search_hits =
+                Some(super::LatestSessionSearchHits { query, session_ids });
+            return open_result.is_some();
+        }
+        false
+    }
+
+    pub(super) fn open_latest_session_search_hits(&mut self) {
+        let Some(hits) = self.latest_session_search_hits.clone() else {
+            self.push_display_message(DisplayMessage::system(
+                "No session_search results captured yet. Run session_search first, then /hits.",
+            ));
+            return;
+        };
+        let current_dir = self.session.working_dir.clone();
+        let (mut picker, status) = if let Some((server_groups, orphan_sessions)) =
+            session_picker::load_cached_sessions_grouped()
+        {
+            (
+                SessionPicker::new_grouped(server_groups, orphan_sessions),
+                "Refreshing search results...",
+            )
+        } else {
+            (SessionPicker::loading(), "Loading search results...")
+        };
+        picker.set_current_dir(current_dir);
+        picker.set_current_session_id(Some(super::commands::active_session_id(self)));
+        picker.activate_search_results(hits.query.clone(), hits.session_ids.clone());
+        self.session_picker_overlay = Some(RefCell::new(picker));
+        self.session_picker_mode = SessionPickerMode::SearchResults;
+        self.set_status_notice(status);
+        self.start_session_picker_load();
+    }
+
     /// Open the active sessions manager: the session picker scoped to live
     /// (open) sessions, showing which are still working on a response and
     /// which are ready for input. Reached via Left arrow on an empty input
@@ -2300,6 +2385,16 @@ impl App {
                     }
                     "Active sessions loaded"
                 }
+                SessionPickerMode::SearchResults => {
+                    if let Some(existing) = self.session_picker_overlay.as_ref() {
+                        let mut picker = existing.borrow_mut();
+                        picker.reseed_grouped(server_groups, orphan_sessions);
+                        if let Some(hits) = self.latest_session_search_hits.clone() {
+                            picker.activate_search_results(hits.query, hits.session_ids);
+                        }
+                    }
+                    "Search results loaded"
+                }
                 SessionPickerMode::Onboarding => return false,
             };
             self.set_status_notice(notice);
@@ -2332,6 +2427,17 @@ impl App {
                 self.set_status_notice("Active sessions loaded");
                 true
             }
+            SessionPickerMode::SearchResults => {
+                let mut picker = SessionPicker::new_grouped(server_groups, orphan_sessions);
+                picker.set_current_dir(self.session.working_dir.clone());
+                picker.set_current_session_id(Some(super::commands::active_session_id(self)));
+                if let Some(hits) = self.latest_session_search_hits.clone() {
+                    picker.activate_search_results(hits.query, hits.session_ids);
+                }
+                self.session_picker_overlay = Some(RefCell::new(picker));
+                self.set_status_notice("Search results loaded");
+                true
+            }
             // Onboarding constructs its action-only picker synchronously, so it
             // never flows through this async path.
             SessionPickerMode::Onboarding => false,
@@ -2352,6 +2458,7 @@ impl App {
                 SessionPickerMode::Resume
                     | SessionPickerMode::CatchUp
                     | SessionPickerMode::ActiveSessions
+                    | SessionPickerMode::SearchResults
             );
 
         match recv_result {
@@ -2841,6 +2948,13 @@ impl App {
                     self.handle_session_picker_current_terminal_selection(&ids[..1]);
                     self.onboarding_finish();
                 }
+            }
+            OverlayAction::Selected(_)
+                if self.session_picker_mode == SessionPickerMode::SearchResults =>
+            {
+                self.set_status_notice(
+                    "Search results are read-only. Press Esc or Backspace to close.",
+                );
             }
             OverlayAction::Selected(PickerResult::Selected(ids))
             | OverlayAction::Selected(PickerResult::SelectedInNewTerminal(ids)) => {

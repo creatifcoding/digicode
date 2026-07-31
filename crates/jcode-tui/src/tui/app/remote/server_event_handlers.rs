@@ -6,8 +6,15 @@ pub(super) fn handle_tool_done(
     id: String,
     name: String,
     output: String,
+    metadata: Option<serde_json::Value>,
     error: Option<String>,
 ) -> bool {
+    let mut open_session_search_hits = false;
+    if name == "session_search" && error.is_none() {
+        if let Some(metadata) = metadata.as_ref() {
+            open_session_search_hits = app.record_session_search_metadata(metadata);
+        }
+    }
     let display_output = remote.handle_tool_done(&id, &name, &output);
     let display_output = if error.is_some()
         && !display_output.starts_with("Error:")
@@ -54,6 +61,9 @@ pub(super) fn handle_tool_done(
     // whole list here made their rows render with no intent or summary.
     app.streaming_tool_calls.retain(|tc| tc.id != id);
     app.status = ProcessingStatus::Streaming;
+    if open_session_search_hits {
+        app.open_latest_session_search_hits();
+    }
     true
 }
 

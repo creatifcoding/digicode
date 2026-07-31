@@ -17,7 +17,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use jcode_import_core::{
     ExternalMessageRecord, ExternalSessionRecord, ImportCoreResult, collect_recent_files_recursive,
     load_claude_external_messages, load_codex_external_session, load_cursor_external_session,
-    load_opencode_external_session, load_pi_external_session,
+    load_omp_external_session, load_opencode_external_session, load_pi_external_session,
 };
 use jcode_session_types::{
     SessionSearchContextLine as ResultContextLine, SessionSearchQueryProfile as QueryProfile,
@@ -60,6 +60,9 @@ const LEGACY_INDEX_FILE_NAME: &str = "session_search_recent_index_v1.json";
 #[derive(Debug, Deserialize)]
 struct SearchInput {
     query: String,
+    /// Open one returned result in the read-only transcript inspector. One-based.
+    #[serde(default)]
+    open_result: Option<i64>,
     #[serde(default)]
     working_dir: Option<String>,
     #[serde(default)]
@@ -102,7 +105,7 @@ struct SearchInput {
     /// Restrict Jcode sessions by canary flag.
     #[serde(default)]
     canary: Option<bool>,
-    /// Restrict source: jcode, claude, codex, pi, opencode, cursor, or all.
+    /// Restrict source: jcode, claude, codex, pi, omp, opencode, cursor, or all.
     #[serde(default)]
     source: Option<String>,
     /// Include external session sources discovered by the session picker. Defaults to true.
@@ -163,6 +166,7 @@ pub fn spawn_recent_index_warmup() {
         for (source, root_relative) in [
             ("codex", ".codex/sessions"),
             ("pi", ".pi/agent/sessions"),
+            ("omp", ".omp/profiles"),
             ("cursor", ".cursor/projects"),
         ] {
             let Ok(root) = crate::storage::user_home_path(root_relative) else {
@@ -306,6 +310,12 @@ impl Tool for SessionSearchTool {
                     "type": "string",
                     "description": "Search query. Use distinctive keywords; stop-word-only queries are rejected."
                 },
+                "open_result": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_LIMIT,
+                    "description": "After searching, open this one-based result in the read-only transcript inspector. The agent may set this after identifying the intended hit."
+                },
                 "working_dir": {
                     "type": "string",
                     "description": "Restrict results to sessions whose working directory matches this path or path prefix. Matching is normalized and case-insensitive."
@@ -369,7 +379,7 @@ impl Tool for SessionSearchTool {
                 },
                 "source": {
                     "type": "string",
-                    "enum": ["all", "jcode", "claude", "codex", "pi", "opencode", "cursor"],
+                    "enum": ["all", "jcode", "claude", "codex", "pi", "omp", "opencode", "cursor"],
                     "description": "Restrict session source. Defaults to all available sources."
                 },
                 "include_external": {
@@ -525,9 +535,29 @@ impl Tool for SessionSearchTool {
                 .with_title("session_search"));
         }
 
+        let open_result = match params.open_result {
+            Some(value) if value < 1 || value as usize > report.results.len() => {
+                return Ok(ToolOutput::new(format!(
+                    "open_result must be between 1 and {} for this search.",
+                    report.results.len()
+                ))
+                .with_title("session_search"));
+            }
+            Some(value) => Some(value as usize),
+            None => None,
+        };
+
+        let metadata = json!({
+            "kind": "session_search_results",
+            "query": params.query.trim(),
+            "report": report,
+            "open_result": open_result,
+        });
+
         Ok(
             ToolOutput::new(format_results(&params.query, &report, &options))
-                .with_title("session_search"),
+                .with_title("session_search")
+                .with_metadata(metadata),
         )
     }
 }
@@ -574,11 +604,11 @@ fn normalize_source_filter(raw: Option<&str>) -> std::result::Result<Option<Stri
     let normalized = source.to_ascii_lowercase();
     match normalized.as_str() {
         "all" => Ok(None),
-        "jcode" | "claude" | "claude-code" | "codex" | "pi" | "opencode" | "cursor" => {
+        "jcode" | "claude" | "claude-code" | "codex" | "pi" | "omp" | "opencode" | "cursor" => {
             Ok(Some(normalized.replace("claude-code", "claude")))
         }
         _ => Err(format!(
-            "source must be one of all, jcode, claude, codex, pi, opencode, or cursor; received {source}."
+            "source must be one of all, jcode, claude, codex, pi, omp, opencode, or cursor; received {source}."
         )),
     }
 }
@@ -981,7 +1011,7 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
         && let Ok(sessions) =
             crate::import::list_claude_code_sessions_lazy(options.max_scan_sessions)
     {
-        report.external_sources.push("claude");
+        report.external_sources.push("claude".to_string());
         let sessions: Vec<_> = sessions
             .into_iter()
             .take(options.max_scan_sessions)
@@ -1014,6 +1044,15 @@ fn search_external_sessions(query: &QueryProfile, options: &SearchOptions) -> Se
         query,
         options,
         load_pi_external_session,
+    );
+    collect_external_jsonl_source(
+        &mut records,
+        &mut report,
+        "omp",
+        ".omp/profiles",
+        query,
+        options,
+        load_omp_external_session,
     );
     collect_opencode_external_sessions(&mut records, &mut report, options);
     collect_external_jsonl_source(
@@ -1058,7 +1097,7 @@ fn collect_external_jsonl_source(
     if !root.exists() {
         return;
     }
-    report.external_sources.push(source);
+    report.external_sources.push(source.to_string());
     let paths = collect_recent_files_recursive(&root, "jsonl", options.max_scan_sessions);
     let mut candidates = external_index_candidate_paths(source, &paths, query);
     // Like the jcode path, cap how many candidate files get fully parsed.
@@ -1346,7 +1385,7 @@ fn collect_opencode_external_sessions(
     if !root.exists() {
         return;
     }
-    report.external_sources.push("opencode");
+    report.external_sources.push("opencode".to_string());
     let Ok(messages_base) = crate::storage::user_home_path(".local/share/opencode/storage/message")
     else {
         return;
@@ -1395,6 +1434,7 @@ fn append_external_session_results(
         results.push(SearchResult {
             source: session.source.to_string(),
             session_id: format!("{}:{}", session.source, session.session_id),
+            source_path: Some(session.path.display().to_string()),
             short_name: session.short_name.clone(),
             title: session.title.clone(),
             working_dir: session.working_dir.clone(),
@@ -1431,6 +1471,7 @@ fn append_external_session_results(
         results.push(SearchResult {
             source: session.source.to_string(),
             session_id: format!("{}:{}", session.source, session.session_id),
+            source_path: Some(session.path.display().to_string()),
             short_name: session.short_name.clone(),
             title: session.title.clone(),
             working_dir: session.working_dir.clone(),
@@ -1527,6 +1568,7 @@ fn append_session_results(
         results.push(SearchResult {
             source: "jcode".to_string(),
             session_id: session.id.clone(),
+            source_path: None,
             short_name: session.short_name.clone(),
             title: session.display_title().map(ToOwned::to_owned),
             working_dir: session.working_dir.clone(),
@@ -1581,6 +1623,7 @@ fn append_session_results(
         results.push(SearchResult {
             source: "jcode".to_string(),
             session_id: session.id.clone(),
+            source_path: None,
             short_name: session.short_name.clone(),
             title: session.display_title().map(ToOwned::to_owned),
             working_dir: session.working_dir.clone(),

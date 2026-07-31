@@ -2,14 +2,14 @@ use super::{
     CommunicateInput, CommunicateTool, canonical_swarm_action, cleanup_candidate_session_ids,
     coordination_in_flight_count, default_await_target_statuses, default_cleanup_target_statuses,
     format_awaited_members, format_awaited_members_with_reports, format_members,
-    format_plan_status, format_swarm_model_list, latest_assistant_report,
+    format_plan_status, format_swarm_model_list, latest_assistant_report, plan_finished_cleanly,
     resolve_optional_target_session, resolve_run_plan_concurrency, swarm_member_is_drivable_worker,
     swarm_member_is_in_flight,
 };
 use crate::message::{Message, StreamEvent, ToolDefinition};
 use crate::protocol::{
-    AgentInfo, AgentStatusSnapshot, AwaitedMemberStatus, HistoryMessage, NotificationType, Request,
-    ServerEvent, SessionActivitySnapshot, ToolCallSummary,
+    AgentInfo, AgentStatusSnapshot, AwaitedMemberStatus, HistoryMessage, NotificationType,
+    PlanGraphStatus, Request, ServerEvent, SessionActivitySnapshot, ToolCallSummary,
 };
 use crate::provider::{EventStream, Provider};
 use crate::server::Server;
@@ -28,6 +28,44 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[test]
 fn tool_is_named_swarm() {
     assert_eq!(CommunicateTool::new().name(), "swarm");
+}
+
+#[test]
+fn schema_advertises_semantic_graph_read_actions() {
+    let schema = CommunicateTool::new().parameters_schema();
+    let actions = schema["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action enum");
+    for action in [
+        "graph_show",
+        "node_show",
+        "artifact_get",
+        "artifact_list",
+        "hydration_preview",
+    ] {
+        assert!(
+            actions.iter().any(|value| value == action),
+            "missing {action}"
+        );
+    }
+    assert!(
+        schema["properties"]["node_id"]["description"]
+            .as_str()
+            .expect("node description")
+            .contains("artifact_get")
+    );
+}
+
+#[test]
+fn semantic_graph_read_aliases_are_canonical() {
+    assert_eq!(canonical_swarm_action("graph"), "graph_show");
+    assert_eq!(canonical_swarm_action("node"), "node_show");
+    assert_eq!(canonical_swarm_action("artifact"), "artifact_get");
+    assert_eq!(canonical_swarm_action("artifacts"), "artifact_list");
+    assert_eq!(
+        canonical_swarm_action("preview_context"),
+        "hydration_preview"
+    );
 }
 
 #[test]
@@ -663,6 +701,22 @@ fn run_plan_terminal_summary_reports_failed_nodes() {
     let clean_summary = super::format_run_plan_terminal_summary(5, &clean, 7);
     assert!(clean_summary.contains("failed=0"));
     assert!(!clean_summary.contains("Failed nodes"));
+}
+
+#[test]
+fn run_plan_clean_completion_requires_every_node_completed() {
+    let mut summary = PlanGraphStatus::empty_for_swarm("swarm-1");
+    summary.item_count = 2;
+    summary.completed_ids = vec!["a".to_string(), "b".to_string()];
+    assert!(plan_finished_cleanly(&summary));
+
+    summary.completed_ids.pop();
+    summary.failed_ids.push("b".to_string());
+    assert!(!plan_finished_cleanly(&summary));
+
+    summary.failed_ids.clear();
+    summary.blocked_ids.push("b".to_string());
+    assert!(!plan_finished_cleanly(&summary));
 }
 
 #[test]

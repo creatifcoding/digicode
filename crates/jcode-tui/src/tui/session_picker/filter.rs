@@ -74,6 +74,10 @@ impl SessionPicker {
                 self.session_by_ref(*session_ref).is_some_and(|session| {
                     (show_test || !session.is_debug)
                         && self.session_matches_filter_mode(session, filter_mode)
+                        && self
+                            .search_result_session_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.contains(&session.id))
                 })
             })
             .collect::<Vec<_>>();

@@ -497,3 +497,51 @@ fn test_message_end_carries_provider_stop_reason() -> Result<()> {
     assert!(!json.contains("stop_reason"), "unexpected field: {json}");
     Ok(())
 }
+
+#[test]
+fn test_list_sessions_request_has_stable_wire_shape() -> Result<()> {
+    let request = Request::ListSessions { id: 73 };
+    let json = serde_json::to_string(&request)?;
+    assert_eq!(json, r#"{"type":"list_sessions","id":73}"#);
+
+    let decoded = parse_request_json(&json)?;
+    let Request::ListSessions { id } = decoded else {
+        return Err(anyhow!("expected ListSessions"));
+    };
+    assert_eq!(id, 73);
+    assert!(request.is_lightweight_control_request());
+    Ok(())
+}
+
+#[test]
+fn test_session_list_event_has_stable_wire_shape() -> Result<()> {
+    let event = ServerEvent::SessionList {
+        id: 73,
+        sessions: vec![SessionListEntry {
+            session_id: "session_fox".to_string(),
+            title: Some("Fix remote resume".to_string()),
+            friendly_name: Some("fox".to_string()),
+            working_dir: Some("/work/jcode".to_string()),
+            updated_at: "2026-07-28T08:54:29.662Z".to_string(),
+            status: "active".to_string(),
+            is_current: true,
+            is_live: true,
+        }],
+    };
+    let json = serde_json::to_string(&event)?;
+    assert_eq!(
+        json,
+        r#"{"type":"session_list","id":73,"sessions":[{"session_id":"session_fox","title":"Fix remote resume","friendly_name":"fox","working_dir":"/work/jcode","updated_at":"2026-07-28T08:54:29.662Z","status":"active","is_current":true,"is_live":true}]}"#
+    );
+
+    let decoded = parse_event_json(&json)?;
+    let ServerEvent::SessionList { id, sessions } = decoded else {
+        return Err(anyhow!("expected SessionList"));
+    };
+    assert_eq!(id, 73);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "session_fox");
+    assert!(sessions[0].is_current);
+    assert!(sessions[0].is_live);
+    Ok(())
+}

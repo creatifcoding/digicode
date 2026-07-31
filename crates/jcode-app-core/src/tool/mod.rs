@@ -15,9 +15,12 @@ mod edit;
 mod gmail;
 mod goal;
 mod invalid;
+#[cfg(target_os = "linux")]
+mod linux_computer;
 mod ls;
 pub mod mcp;
 mod memory;
+mod metatool;
 mod multiedit;
 mod open;
 mod patch;
@@ -28,6 +31,7 @@ mod session_search;
 pub(crate) mod session_search_index;
 mod side_panel;
 mod skill;
+mod tasker;
 mod todo;
 mod webfetch;
 mod websearch;
@@ -195,6 +199,13 @@ impl Registry {
                 "macos_computer_use",
                 computer::ComputerTool::new,
             );
+            #[cfg(target_os = "linux")]
+            Self::insert_tool_timed(
+                &mut m,
+                &mut timings,
+                "linux_computer_use",
+                linux_computer::LinuxComputerTool::new,
+            );
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
@@ -209,6 +220,7 @@ impl Registry {
             );
             Self::insert_tool_timed(&mut m, &mut timings, "invalid", invalid::InvalidTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "todo", todo::TodoTool::new);
+            Self::insert_tool_timed(&mut m, &mut timings, "tasker", tasker::TaskerTool::new);
             Self::insert_tool_timed(&mut m, &mut timings, "bg", bg::BgTool::new);
             Self::insert_tool_timed(
                 &mut m,
@@ -223,6 +235,7 @@ impl Registry {
                 session_search::SessionSearchTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "memory", memory::MemoryTool::new);
+            Self::insert_tool_timed(&mut m, &mut timings, "mt", metatool::MetaTool::new);
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,

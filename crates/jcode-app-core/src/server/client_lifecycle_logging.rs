@@ -64,6 +64,7 @@ pub(super) fn request_type_is_read_only(kind: &str) -> bool {
             | "comm_summary"
             | "comm_status"
             | "comm_plan_status"
+            | "comm_graph_read"
             | "comm_read_context"
             | "comm_await_members"
     )

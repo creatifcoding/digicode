@@ -89,6 +89,8 @@ jcode-base = { path = "../jcode-base", default-features = false }
 jcode-command-risk = { path = "../jcode-command-risk" }
 jcode-core = { path = "../jcode-core" }
 jcode-message-types = { path = "../jcode-message-types" }
+jcode-metatool-runtime = { path = "../jcode-metatool-runtime" }
+jcode-metatool-types = { path = "../jcode-metatool-types" }
 jcode-overnight-core = { path = "../jcode-overnight-core" }
 jcode-plan = { path = "../jcode-plan" }
 jcode-swarm-core = { path = "../jcode-swarm-core" }
@@ -96,6 +98,9 @@ jcode-selfdev-types = { path = "../jcode-selfdev-types" }
 jcode-session-types = { path = "../jcode-session-types" }
 jcode-setup-hints = { path = "../jcode-setup-hints" }
 jcode-task-types = { path = "../jcode-task-types" }
+jcode-tasker-pi = { path = "../jcode-tasker-pi" }
+jcode-tasker-store = { path = "../jcode-tasker-store" }
+jcode-tasker-types = { path = "../jcode-tasker-types" }
 jcode-tool-core = { path = "../jcode-tool-core" }
 jcode-tool-types = { path = "../jcode-tool-types" }
 
@@ -103,6 +108,7 @@ jcode-tool-types = { path = "../jcode-tool-types" }
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
+wait-timeout = "0.2"
 agentgrep = { git = "https://github.com/1jehuang/agentgrep.git", tag = "v0.1.6" }
 
 [features]
@@ -132,6 +138,7 @@ async-stream = "0.3"
 # *this* crate's own test target. Feature unification applies this only to
 # test/bench/example builds, not to a normal `cargo build`.
 jcode-base = { path = "../jcode-base", default-features = false, features = ["test-support"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
@@ -142,3 +149,6 @@ global-hotkey = "0.7"
 # events, cursor positioning, display bounds). `highsierra` enables the
 # CGEventCreateScrollWheelEvent2 binding used for scroll.
 core-graphics = { version = "0.23", features = ["highsierra"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+jcode-computer-use-linux = { path = "../jcode-computer-use-linux" }

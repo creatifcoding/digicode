@@ -9,15 +9,22 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("prompt/system_prompt.md");
 /// Prompt guidance for the optional Mermaid rendering capability.
 pub const MERMAID_PROMPT: &str = "# Mermaid\n\nRender fenced `mermaid` blocks inline.";
 
+/// Prompt guidance for the native durable Tasker capability.
+pub const TASKER_PROMPT: &str = "# Durable Tasker\n\nUse the `tasker` tool for canonical cross-session project work. Inspect the current revision and ready work before mutation. Respect dependencies and optimistic revision conflicts. Keep `todo` for the lightweight current-session plan; the two systems are intentionally distinct. Runtime Tasker state is authoritative.";
+
 /// Harness capabilities that conditionally contribute prompt modules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptCapabilities {
     pub mermaid: bool,
+    pub tasker: bool,
 }
 
 impl Default for PromptCapabilities {
     fn default() -> Self {
-        Self { mermaid: true }
+        Self {
+            mermaid: true,
+            tasker: true,
+        }
     }
 }
 
@@ -25,6 +32,7 @@ impl PromptCapabilities {
     fn current() -> Self {
         Self {
             mermaid: crate::config::config().features.mermaid,
+            tasker: true,
         }
     }
 }
@@ -33,6 +41,9 @@ fn base_system_prompt_parts(capabilities: PromptCapabilities) -> Vec<String> {
     let mut parts = vec![DEFAULT_SYSTEM_PROMPT.to_string()];
     if capabilities.mermaid {
         parts.push(MERMAID_PROMPT.to_string());
+    }
+    if capabilities.tasker {
+        parts.push(TASKER_PROMPT.to_string());
     }
     parts
 }

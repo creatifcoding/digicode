@@ -735,19 +735,52 @@ pub fn load_pi_external_session(
     path: &Path,
     include_tools: bool,
 ) -> ImportCoreResult<Option<ExternalSessionRecord>> {
+    load_pi_family_external_session(path, include_tools, "pi", "Pi")
+}
+
+/// Load an OMP transcript. OMP uses Pi's journal schema, but may prepend a
+/// mutable `title` record before the durable `session` record.
+pub fn load_omp_external_session(
+    path: &Path,
+    include_tools: bool,
+) -> ImportCoreResult<Option<ExternalSessionRecord>> {
+    load_pi_family_external_session(path, include_tools, "omp", "OMP")
+}
+
+fn load_pi_family_external_session(
+    path: &Path,
+    include_tools: bool,
+    source: &'static str,
+    display_name: &str,
+) -> ImportCoreResult<Option<ExternalSessionRecord>> {
     let file = File::open(path)?;
     let mut lines = BufReader::new(file).lines();
-    let Some(first_line) = lines.next() else {
-        return Ok(None);
+    let mut title = None;
+    let header = loop {
+        let Some(line) = lines.next() else {
+            return Ok(None);
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line?) else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("session") => break value,
+            Some("title") => {
+                title = value
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .or(title);
+            }
+            _ => {}
+        }
     };
-    let header: serde_json::Value = serde_json::from_str(&first_line?)?;
-    if header.get("type").and_then(|v| v.as_str()) != Some("session") {
-        return Ok(None);
-    }
     let session_id = header
         .get("id")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
     if session_id.is_empty() {
         return Ok(None);
     }
@@ -757,7 +790,7 @@ pub fn load_pi_external_session(
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let mut provider_key = Some("pi".to_string());
+    let mut provider_key = Some(source.to_string());
     let mut model = None;
     let mut messages = Vec::new();
     for line in lines.map_while(|line| line.ok()) {
@@ -779,6 +812,14 @@ pub fn load_pi_external_session(
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
                     .or(model);
+            }
+            Some("title") => {
+                title = value
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+                    .or(title);
             }
             Some("message") => {
                 let Some(message) = value.get("message") else {
@@ -809,10 +850,15 @@ pub fn load_pi_external_session(
         }
     }
     Ok(Some(ExternalSessionRecord {
-        source: "pi",
+        source,
         session_id: session_id.to_string(),
-        short_name: Some(format!("pi {}", truncate_str(session_id, 8))),
-        title: Some(format!("Pi session {}", truncate_str(session_id, 8))),
+        short_name: Some(format!("{source} {}", truncate_str(&session_id, 8))),
+        title: title.or_else(|| {
+            Some(format!(
+                "{display_name} session {}",
+                truncate_str(&session_id, 8)
+            ))
+        }),
         working_dir,
         provider_key,
         model,
@@ -1249,6 +1295,32 @@ pub fn imported_cursor_session_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omp_loader_accepts_title_before_session_header() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            concat!(
+                "{\"type\":\"title\",\"title\":\"Inspect OMP sessions\",\"updatedAt\":\"2026-07-29T00:00:00Z\"}\n",
+                "{\"type\":\"session\",\"version\":3,\"id\":\"omp-123\",\"timestamp\":\"2026-07-29T00:00:00Z\",\"cwd\":\"/workspace/demo\"}\n",
+                "{\"type\":\"model_change\",\"timestamp\":\"2026-07-29T00:00:01Z\",\"provider\":\"openai-codex\",\"modelId\":\"gpt-test\"}\n",
+                "{\"type\":\"message\",\"id\":\"m1\",\"timestamp\":\"2026-07-29T00:00:02Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hello omp\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let record = load_omp_external_session(file.path(), false)
+            .unwrap()
+            .expect("OMP transcript should load");
+        assert_eq!(record.source, "omp");
+        assert_eq!(record.session_id, "omp-123");
+        assert_eq!(record.title.as_deref(), Some("Inspect OMP sessions"));
+        assert_eq!(record.working_dir.as_deref(), Some("/workspace/demo"));
+        assert_eq!(record.provider_key.as_deref(), Some("openai-codex"));
+        assert_eq!(record.model.as_deref(), Some("gpt-test"));
+        assert_eq!(record.messages[0].text, "hello omp");
+    }
 
     #[test]
     fn clean_optional_text_trims_and_drops_empty() {
