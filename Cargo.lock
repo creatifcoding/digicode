@@ -4799,6 +4799,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcode-tasker-git"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jcode-tasker-types",
+]
+
+[[package]]
 name = "jcode-tasker-pi"
 version = "0.1.0"
 dependencies = [
