@@ -79,6 +79,7 @@ members = [
     "crates/jcode-tasker-types",
     "crates/jcode-tasker-store",
     "crates/jcode-tasker-pi",
+    "crates/jcode-tasker-promotion",
     "crates/jcode-tasker-git",
     "crates/jcode-tool-core",
     "crates/jcode-tool-types",
