@@ -4839,6 +4839,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcode-tasker-promotion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jcode-tasker-git",
+ "jcode-tasker-pi",
+ "jcode-tasker-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "jcode-tasker-rounds"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "jcode-tasker-pi",
+ "jcode-tasker-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "jcode-tasker-store"
 version = "0.1.0"
 dependencies = [
