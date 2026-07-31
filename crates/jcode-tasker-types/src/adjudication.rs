@@ -897,7 +897,7 @@ mod tests {
             ballot(13, vec![assessment(first.id, true, true, 100)], false),
         ];
 
-        let evaluations = evaluate_hard_gates(&[first.clone()], &ballots).unwrap();
+        let evaluations = evaluate_hard_gates(std::slice::from_ref(&first), &ballots).unwrap();
         assert!(!evaluations[0].passed);
         assert_eq!(evaluations[0].failures.len(), 1);
 

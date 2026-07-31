@@ -5009,6 +5009,7 @@ mod tests {
         drop(conn);
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let noise = {
             let path = path.clone();
             let stop = stop.clone();
@@ -5025,10 +5026,17 @@ mod tests {
                         })
                         .unwrap();
                     i += 1;
+                    if i == 1 {
+                        started_tx.send(()).unwrap();
+                    }
                 }
                 i
             })
         };
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("noise writer did not commit its first task");
 
         let mut store =
             PiTaskerStore::open(ProjectPartition::with_db_path(path.clone(), "/repo/root"))
