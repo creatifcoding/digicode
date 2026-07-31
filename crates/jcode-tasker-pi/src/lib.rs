@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
@@ -744,8 +744,14 @@ pub struct PiTaskerStore {
 impl PiTaskerStore {
     pub fn open(partition: ProjectPartition) -> Result<Self> {
         let conn = Connection::open(&partition.db_path)?;
+        // Busy handler must be installed before the WAL pragma: enabling WAL
+        // itself takes a write lock, and an unprotected open racing another
+        // writer fails immediately with `database is locked`.
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+        // WAL + NORMAL is durable across application crashes and avoids a
+        // full fsync per transaction, which matters once writers contend.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         let store = Self { conn, partition };
         store.preflight()?;
         Ok(store)
@@ -760,7 +766,7 @@ impl PiTaskerStore {
             let backup = rusqlite::backup::Backup::new(&self.conn, &mut conn)?;
             backup.run_to_completion(128, std::time::Duration::from_millis(1), None)?;
         }
-        conn.busy_timeout(std::time::Duration::from_millis(5_000))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         let store = Self {
             conn,
             partition: self.partition.clone(),
@@ -801,7 +807,9 @@ impl PiTaskerStore {
         }
         let now = now_ms();
         let name = project_name(&self.partition.project_root);
-        self.conn.execute("INSERT INTO task_lists (list_id, project_root, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![self.partition.list_id, self.partition.project_root, name, now, now])?;
+        // OR IGNORE: two connections can both observe the row as missing and
+        // race this insert; the second must not fail on the primary key.
+        self.conn.execute("INSERT OR IGNORE INTO task_lists (list_id, project_root, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)", params![self.partition.list_id, self.partition.project_root, name, now, now])?;
         Ok(self.list_meta()?.expect("inserted list meta"))
     }
 
@@ -1013,7 +1021,9 @@ impl PiTaskerStore {
         &mut self,
         input: VisualArtifactCreateInput,
     ) -> Result<VisualArtifact> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
         let artifact = VisualArtifact {
             id: make_visual_artifact_id(),
@@ -1126,7 +1136,9 @@ impl PiTaskerStore {
     }
 
     pub fn claim_task(&mut self, input: ClaimTaskInput) -> Result<ClaimResult> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_stale_claims_tx(&tx, &self.partition)?;
         touch_session_instance_tx(&tx, &self.partition, &input.context)?;
         let task = match load_task_tx(&tx, &self.partition, &input.task_id)? {
@@ -1227,7 +1239,9 @@ impl PiTaskerStore {
     }
 
     pub fn release_claim(&mut self, input: ReleaseClaimInput) -> Result<ReleaseResult> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_stale_claims_tx(&tx, &self.partition)?;
         touch_session_instance_tx(&tx, &self.partition, &input.context)?;
         let active = load_active_claims_tx(&tx, &self.partition)?;
@@ -1259,7 +1273,9 @@ impl PiTaskerStore {
     }
 
     pub fn get_working_set(&mut self, context: WorkContextInput) -> Result<WorkingSetResult> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_stale_claims_tx(&tx, &self.partition)?;
         touch_session_instance_tx(&tx, &self.partition, &context)?;
         let tasks = load_tasks_tx(&tx, &self.partition)?;
@@ -1291,7 +1307,9 @@ impl PiTaskerStore {
         &mut self,
         input: NextWorkUnitInput,
     ) -> Result<NextWorkUnitResult> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         cleanup_stale_claims_tx(&tx, &self.partition)?;
         touch_session_instance_tx(&tx, &self.partition, &input.context)?;
         let Some(feature_id) = input.feature_id.as_deref() else {
@@ -1394,7 +1412,9 @@ impl PiTaskerStore {
     }
 
     pub fn create_task(&mut self, input: CreateTask) -> Result<Task> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_list_meta_tx(&tx, &self.partition)?;
         let now = now_ms();
         let display_id: i64 = tx.query_row(
@@ -1423,7 +1443,9 @@ impl PiTaskerStore {
     }
 
     pub fn update_task(&mut self, task_id: &str, input: UpdateTask) -> Result<Task> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut task = load_task_tx(&tx, &self.partition, task_id)?
             .ok_or_else(|| PiTaskerError::NotFound(task_id.into()))?;
         if let Some(v) = input.title {
@@ -1513,7 +1535,9 @@ impl PiTaskerStore {
     }
 
     pub fn batch_execute(&mut self, operations: Vec<BatchOperation>) -> Result<BatchResult> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_list_meta_tx(&tx, &self.partition)?;
         let snapshot_tasks = load_tasks_tx(&tx, &self.partition)?;
         let mut visible_tasks = snapshot_tasks.clone();
@@ -1643,7 +1667,9 @@ impl PiTaskerStore {
             }
         }
 
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_list_meta_tx(&tx, &self.partition)?;
         let mut key_map = BTreeMap::new();
         let mut created_tasks = Vec::new();
@@ -1701,7 +1727,9 @@ impl PiTaskerStore {
     pub fn feature_plan_import(&mut self, input: FeaturePlanInput) -> Result<FeaturePlanResult> {
         validate_feature_plan_keys(&input.feature)?;
 
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_list_meta_tx(&tx, &self.partition)?;
 
         let mut key_map = BTreeMap::new();
@@ -1742,7 +1770,9 @@ impl PiTaskerStore {
     }
 
     pub fn create_feature(&mut self, input: CreateFeature) -> Result<Feature> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_list_meta_tx(&tx, &self.partition)?;
         let now = now_ms();
         let display_id: i64 = tx.query_row("SELECT COALESCE(MAX(display_id),0)+1 FROM features WHERE list_id=?1 AND project_root=?2", params![self.partition.list_id, self.partition.project_root], |r| r.get(0))?;
@@ -1783,7 +1813,9 @@ impl PiTaskerStore {
     }
 
     pub fn update_feature(&mut self, feature_id: &str, input: UpdateFeature) -> Result<Feature> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut f = load_feature_tx(&tx, &self.partition, feature_id)?
             .ok_or_else(|| PiTaskerError::NotFound(feature_id.into()))?;
         if let Some(v) = input.title {
@@ -1866,7 +1898,9 @@ impl PiTaskerStore {
         gate_index: usize,
         input: ResolveFeatureGate,
     ) -> Result<Vec<FeatureGate>> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut feature = load_feature_tx(&tx, &self.partition, feature_id)?
             .ok_or_else(|| PiTaskerError::NotFound(feature_id.into()))?;
         let mut gates = feature_gates_from_value(feature.gates)?;
@@ -1914,7 +1948,9 @@ impl PiTaskerStore {
         results: Vec<(usize, FeatureGateCheckResult)>,
         mode: FeatureGateCheckMode,
     ) -> Result<Vec<AppliedFeatureGateCheck>> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut feature = load_feature_tx(&tx, &self.partition, feature_id)?
             .ok_or_else(|| PiTaskerError::NotFound(feature_id.into()))?;
         let mut gates = feature_gates_from_value(feature.gates)?;
@@ -1996,7 +2032,9 @@ impl PiTaskerStore {
         task_id: &str,
         depends_on: &[String],
     ) -> Result<Vec<TaskDependency>> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         set_dependencies_tx(&tx, &self.partition, task_id, depends_on)?;
         tx.commit()?;
         Ok(self
@@ -2011,7 +2049,9 @@ impl PiTaskerStore {
         feature_id: &str,
         depends_on: &[String],
     ) -> Result<Vec<FeatureDependency>> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM feature_dependencies WHERE feature_id=?1 AND list_id=?2 AND project_root=?3", params![feature_id, self.partition.list_id, self.partition.project_root])?;
         let now = now_ms();
         for dep in depends_on {
@@ -4818,5 +4858,162 @@ mod tests {
             )
             .unwrap();
         assert!(store.list_dependencies().unwrap().is_empty());
+    }
+
+    /// Regression for #1877: six parallel public tasker calls against one
+    /// canonical DB file yielded `database is locked`. Every store connection
+    /// must survive open-time WAL contention and interleaved Immediate write
+    /// transactions with bounded waiting, unique display IDs, and zero lost
+    /// writes.
+    #[test]
+    fn concurrent_writers_do_not_lock_and_lose_nothing() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::mem::forget(file);
+        let conn = Connection::open(&path).unwrap();
+        install_schema(&conn).unwrap();
+        drop(conn);
+
+        const WRITERS: usize = 6;
+        const TASKS_PER_WRITER: usize = 10;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || -> Result<Vec<String>> {
+                // All writers open (and thus race the WAL pragma) together.
+                barrier.wait();
+                let mut store =
+                    PiTaskerStore::open(ProjectPartition::with_db_path(path, "/repo/root"))?;
+                let mut ids = Vec::new();
+                for i in 0..TASKS_PER_WRITER {
+                    let task = store.create_task(CreateTask {
+                        title: format!("w{w}-t{i}"),
+                        ..Default::default()
+                    })?;
+                    ids.push(task.id);
+                }
+                Ok(ids)
+            }));
+        }
+        let mut all_ids = Vec::new();
+        for handle in handles {
+            let ids = handle
+                .join()
+                .expect("writer thread panicked")
+                .expect("writer hit a database error (e.g. `database is locked`)");
+            all_ids.extend(ids);
+        }
+        assert_eq!(all_ids.len(), WRITERS * TASKS_PER_WRITER);
+
+        let store =
+            PiTaskerStore::open(ProjectPartition::with_db_path(path, "/repo/root")).unwrap();
+        let tasks = store.list_tasks(None).unwrap();
+        assert_eq!(tasks.len(), WRITERS * TASKS_PER_WRITER, "lost writes");
+        let mut display_ids: Vec<i64> = tasks.iter().map(|t| t.display_id).collect();
+        display_ids.sort_unstable();
+        display_ids.dedup();
+        assert_eq!(
+            display_ids.len(),
+            WRITERS * TASKS_PER_WRITER,
+            "display_id collision under concurrency"
+        );
+        // Exactly one list-meta row despite racing ensure_list_meta calls.
+        let metas: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM task_lists", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(metas, 1);
+    }
+
+    /// Regression for #1877: a failing native batch must roll back atomically
+    /// even while another connection holds the write lock intermittently.
+    #[test]
+    fn batch_execute_is_atomic_under_concurrent_writer() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::mem::forget(file);
+        let conn = Connection::open(&path).unwrap();
+        install_schema(&conn).unwrap();
+        drop(conn);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let noise = {
+            let path = path.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut store =
+                    PiTaskerStore::open(ProjectPartition::with_db_path(path, "/repo/root"))
+                        .unwrap();
+                let mut i = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    store
+                        .create_task(CreateTask {
+                            title: format!("noise-{i}"),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    i += 1;
+                }
+                i
+            })
+        };
+
+        let mut store =
+            PiTaskerStore::open(ProjectPartition::with_db_path(path.clone(), "/repo/root"))
+                .unwrap();
+        for round in 0..5 {
+            // Batch whose second op references a nonexistent dependency: the
+            // whole batch must roll back, including the first create.
+            let before: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE title LIKE 'batch-%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let result = store.batch_execute(vec![
+                BatchOperation::Create {
+                    key: Some("a".into()),
+                    title: format!("batch-{round}-a"),
+                    description: None,
+                    state: None,
+                    depends_on: vec![],
+                    notes: vec![],
+                    indexes: None,
+                },
+                BatchOperation::Create {
+                    key: Some("b".into()),
+                    title: format!("batch-{round}-b"),
+                    description: None,
+                    state: None,
+                    depends_on: vec!["#999999".into()],
+                    notes: vec![],
+                    indexes: None,
+                },
+            ]);
+            assert!(result.is_err(), "invalid dependency must fail the batch");
+            let after: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE title LIKE 'batch-%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(before, after, "partial batch write leaked (round {round})");
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let noise_written = noise.join().unwrap();
+        assert!(noise_written > 0, "noise writer never ran");
+        let tasks = store.list_tasks(None).unwrap();
+        assert_eq!(
+            tasks.len(),
+            noise_written,
+            "noise writes lost or extras leaked"
+        );
     }
 }
