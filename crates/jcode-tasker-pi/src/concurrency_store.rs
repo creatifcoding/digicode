@@ -851,6 +851,52 @@ impl ConcurrencyStore {
         row.map(|row| candidate_set_value(&row)).transpose()
     }
 
+    /// Return active candidate sets and their bounded candidate metadata for
+    /// mutation admission. Canonical writes need the candidate resource
+    /// intents, not merely the set policy, so this projection deliberately
+    /// includes the same candidate shape exposed by `candidate_set_projection`.
+    pub fn active_candidate_set_projections(&self) -> ConcurrencyResult<Vec<Value>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT id, project_id, task_id, base_revision, base_commit,
+                        acceptance_digest, policy_json, policy_version, state,
+                        created_at, updated_at
+                 FROM candidate_sets
+                 WHERE state IN ('open', 'adjudicating', 'promoting')
+                 ORDER BY created_at ASC, id ASC",
+            )?
+            .query_map([], row_candidate_set)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(|row| {
+                let candidate_set = candidate_set_value(&row)?;
+                let candidates = self
+                    .conn
+                    .prepare(
+                        "SELECT id, candidate_set_id, state, base_commit, result_commit,
+                                diff_digest, summary, provenance_json, supersedes_candidate_id,
+                                created_at, updated_at, submitted_at
+                         FROM candidates
+                         WHERE candidate_set_id = ?1
+                         ORDER BY created_at ASC, id ASC",
+                    )?
+                    .query_map([&row.id], row_candidate)
+                    .map_err(ConcurrencyStoreError::from)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let candidates = candidates
+                    .iter()
+                    .map(|candidate| candidate_value(&self.conn, candidate))
+                    .collect::<ConcurrencyResult<Vec<_>>>()?;
+                Ok(json!({
+                    "candidateSet": candidate_set,
+                    "candidates": candidates,
+                }))
+            })
+            .collect()
+    }
+
     pub fn candidate(&self, id: &str) -> ConcurrencyResult<Option<Value>> {
         let row = self
             .conn

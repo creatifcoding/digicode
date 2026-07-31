@@ -1,10 +1,17 @@
 mod concurrency_store;
+mod mutation_policy;
 
 pub use concurrency_store::{
     ConcurrencyMutation, ConcurrencyProjection, ConcurrencyResult, ConcurrencyStore,
     ConcurrencyStoreError, PromotionRecovery, PromotionRecoveryAction,
 };
+pub use mutation_policy::{
+    CandidateMutationContext, CandidateSetSnapshot, CandidateSnapshot, CanonicalMutation,
+    MutationPolicyDecision, MutationPolicyError, MutationPolicyGate, MutationPolicyRejection,
+    MutationPolicyResult, decide_mutation_policy,
+};
 
+use jcode_tasker_types::{ResourceAccess, ResourceIntent, ResourceKind};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +36,10 @@ pub enum PiTaskerError {
     NotFound(String),
     #[error("invalid reference: {0}")]
     InvalidReference(String),
+    #[error("mutation policy evaluation failed: {0}")]
+    MutationPolicyEvaluation(#[from] MutationPolicyError),
+    #[error("mutation policy rejected: {0}")]
+    MutationPolicyRejected(#[from] MutationPolicyRejection),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1142,6 +1153,45 @@ impl PiTaskerStore {
             .collect())
     }
 
+    /// Evaluate a mutation against the live candidate policy in the same
+    /// database partition. Candidate callers use the returned speculative
+    /// decision to keep writes in their isolated lane; canonical helpers below
+    /// call the same gate without a candidate context.
+    pub fn evaluate_mutation_policy(&self, mutation: &CanonicalMutation) -> MutationPolicyResult {
+        let concurrency = self
+            .open_concurrency_store()
+            .map_err(MutationPolicyError::from)?;
+        MutationPolicyGate::new(&concurrency).evaluate(mutation)
+    }
+
+    fn enforce_canonical_task_mutation(&self, task_id: &str) -> Result<()> {
+        let mutation = CanonicalMutation::new(
+            task_id,
+            vec![ResourceIntent {
+                kind: ResourceKind::Task,
+                selector: task_id.into(),
+                access: ResourceAccess::ProposeWrite,
+                rationale: Some("Pi canonical task mutation".into()),
+            }],
+            None,
+        );
+        match self.evaluate_mutation_policy(&mutation)? {
+            MutationPolicyDecision::Admit => Ok(()),
+            MutationPolicyDecision::Reject { reason } => {
+                Err(PiTaskerError::MutationPolicyRejected(reason))
+            }
+            MutationPolicyDecision::AdmitSpeculative { candidate_id } => {
+                Err(PiTaskerError::MutationPolicyRejected(
+                    MutationPolicyRejection::InvalidCandidateContext {
+                        reason: format!(
+                            "canonical task mutation unexpectedly admitted candidate lane {candidate_id}"
+                        ),
+                    },
+                ))
+            }
+        }
+    }
+
     pub fn claim_task(&mut self, input: ClaimTaskInput) -> Result<ClaimResult> {
         let tx = self
             .conn
@@ -1450,6 +1500,7 @@ impl PiTaskerStore {
     }
 
     pub fn update_task(&mut self, task_id: &str, input: UpdateTask) -> Result<Task> {
+        self.enforce_canonical_task_mutation(task_id)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1542,6 +1593,14 @@ impl PiTaskerStore {
     }
 
     pub fn batch_execute(&mut self, operations: Vec<BatchOperation>) -> Result<BatchResult> {
+        let snapshot_tasks = self.list_tasks(None)?;
+        for operation in &operations {
+            if let BatchOperation::Update { task_id, .. } = operation
+                && let Some(resolved_task_id) = resolve_task_id_from(&snapshot_tasks, task_id)?
+            {
+                self.enforce_canonical_task_mutation(&resolved_task_id)?;
+            }
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2039,6 +2098,7 @@ impl PiTaskerStore {
         task_id: &str,
         depends_on: &[String],
     ) -> Result<Vec<TaskDependency>> {
+        self.enforce_canonical_task_mutation(task_id)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2074,10 +2134,12 @@ impl PiTaskerStore {
     }
 
     pub fn link_task(&mut self, task_id: &str, feature_id: &str) -> Result<()> {
+        self.enforce_canonical_task_mutation(task_id)?;
         self.conn.execute("UPDATE tasks SET feature_id=?1, updated_at=?2 WHERE id=?3 AND list_id=?4 AND project_root=?5", params![feature_id, now_ms(), task_id, self.partition.list_id, self.partition.project_root])?;
         Ok(())
     }
     pub fn unlink_task(&mut self, task_id: &str) -> Result<()> {
+        self.enforce_canonical_task_mutation(task_id)?;
         self.conn.execute("UPDATE tasks SET feature_id=NULL, updated_at=?1 WHERE id=?2 AND list_id=?3 AND project_root=?4", params![now_ms(), task_id, self.partition.list_id, self.partition.project_root])?;
         Ok(())
     }
@@ -2088,6 +2150,7 @@ impl PiTaskerStore {
         category: Option<&str>,
         content: &str,
     ) -> Result<TaskNote> {
+        self.enforce_canonical_task_mutation(task_id)?;
         let note = TaskNote {
             id: make_task_note_id(),
             task_id: task_id.into(),
@@ -5022,5 +5085,69 @@ mod tests {
             noise_written,
             "noise writes lost or extras leaked"
         );
+    }
+
+    #[test]
+    fn canonical_update_is_rejected_by_active_candidate_policy() {
+        let mut store = temp_store();
+        let task = store
+            .create_task(CreateTask {
+                title: "canonical target".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut concurrency = store.open_concurrency_store().unwrap();
+        concurrency
+            .create_candidate_set(
+                serde_json::json!({
+                    "id": "set-1",
+                    "projectId": "project-1",
+                    "taskId": task.id.clone(),
+                    "baseRevision": 0,
+                    "baseCommit": "base-commit",
+                    "acceptanceDigest": "acceptance-digest",
+                    "policy": {"kind": "speculative", "max_candidates": 2},
+                    "policyVersion": 1,
+                    "state": "open"
+                }),
+                0,
+            )
+            .unwrap();
+        concurrency
+            .register_candidate(
+                serde_json::json!({
+                    "id": "candidate-1",
+                    "candidateSetId": "set-1",
+                    "state": "authoring",
+                    "baseCommit": "base-commit",
+                    "provenance": {
+                        "agentId": "holder-agent",
+                        "sessionId": "holder-session"
+                    },
+                    "resourceIntents": [{
+                        "kind": "task",
+                        "selector": task.id,
+                        "access": "propose_write"
+                    }]
+                }),
+                1,
+            )
+            .unwrap();
+        drop(concurrency);
+
+        let error = store
+            .update_task(
+                &task.id,
+                UpdateTask {
+                    title: Some("must not win canonically".into()),
+                    ..Default::default()
+                },
+            )
+            .expect_err("active candidate set must reject a direct canonical write");
+        assert!(matches!(
+            error,
+            PiTaskerError::MutationPolicyRejected(MutationPolicyRejection::Conflict { .. })
+        ));
+        assert_eq!(store.list_tasks(None).unwrap()[0].title, "canonical target");
     }
 }
