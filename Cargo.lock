@@ -4807,10 +4807,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "jcode-tasker-orchestration"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "jcode-tasker-git",
+ "jcode-tasker-pi",
+ "jcode-tasker-rounds",
+ "jcode-tasker-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "jcode-tasker-pi"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "jcode-tasker-types",
  "rusqlite",
  "serde",
  "serde_json",
