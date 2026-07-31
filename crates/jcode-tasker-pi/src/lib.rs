@@ -1,3 +1,10 @@
+mod concurrency_store;
+
+pub use concurrency_store::{
+    ConcurrencyMutation, ConcurrencyProjection, ConcurrencyResult, ConcurrencyStore,
+    ConcurrencyStoreError, PromotionRecovery, PromotionRecoveryAction,
+};
+
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
