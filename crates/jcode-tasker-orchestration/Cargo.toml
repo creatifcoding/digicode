@@ -17,4 +17,5 @@ sha1 = "0.10"
 thiserror = "2"
 
 [dev-dependencies]
+jcode-tasker-promotion = { path = "../jcode-tasker-promotion" }
 tempfile = "3"

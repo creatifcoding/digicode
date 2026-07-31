@@ -550,6 +550,14 @@ impl PromotionReconciler {
         &mut self,
         prepared: &PreparedPromotion,
     ) -> PromotionResult<PromotionReceipt> {
+        // Candidate refs are temporary isolation artifacts. Remove every
+        // losing ref before finalizing the durable winner so a cleanup failure
+        // leaves the intent ref_updated and recoverable instead of hiding an
+        // incomplete repository cleanup behind a completed promotion.
+        self.cleanup_loser_candidate_refs(
+            &prepared.verified.candidate_set_id,
+            &prepared.verified.candidate_id,
+        )?;
         let revision = self
             .store
             .current_revision(prepared.project_id())
@@ -689,6 +697,15 @@ impl PromotionReconciler {
             .store
             .current_revision(&project_id)
             .map_err(PromotionSagaError::Store)?;
+        if intent
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state == "finalized")
+        {
+            let candidate_set_id = metadata_string(&intent, "promotion intent", "candidateSetId")?;
+            let candidate_id = metadata_string(&intent, "promotion intent", "candidateId")?;
+            self.cleanup_loser_candidate_refs(&candidate_set_id, &candidate_id)?;
+        }
         Ok(PromotionRecoveryResult {
             intent_id: intent_id.to_owned(),
             observed_commit,
@@ -755,6 +772,40 @@ impl PromotionReconciler {
 
     fn observe_canonical_ref(&self, ref_name: &str) -> PromotionResult<Option<String>> {
         observe_ref(self.git.repo_path(), ref_name)
+    }
+
+    fn cleanup_loser_candidate_refs(
+        &self,
+        candidate_set_id: &str,
+        winner_id: &str,
+    ) -> PromotionResult<()> {
+        let candidate_set_id = candidate_set_id
+            .parse::<CandidateSetId>()
+            .map_err(|error| PromotionSagaError::InvalidCandidateIdentity {
+                value: candidate_set_id.to_owned(),
+                reason: error.to_string(),
+            })?;
+        let winner_id = winner_id.parse::<CandidateId>().map_err(|error| {
+            PromotionSagaError::InvalidCandidateIdentity {
+                value: winner_id.to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+
+        for candidate_ref in self
+            .git
+            .list_candidate_refs()
+            .map_err(PromotionSagaError::Git)?
+        {
+            if candidate_ref.candidate_set_id() == candidate_set_id
+                && candidate_ref.candidate_id() != winner_id
+            {
+                self.git
+                    .cleanup_abandoned_candidate(&candidate_ref)
+                    .map_err(PromotionSagaError::Git)?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -4813,6 +4813,7 @@ dependencies = [
  "chrono",
  "jcode-tasker-git",
  "jcode-tasker-pi",
+ "jcode-tasker-promotion",
  "jcode-tasker-rounds",
  "jcode-tasker-types",
  "rusqlite",
