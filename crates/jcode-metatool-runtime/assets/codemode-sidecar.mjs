@@ -256,7 +256,7 @@ try {
 	  const search = (query, options = {}) => {
 	    const needle = String(query ?? "").toLowerCase();
 	    const matches = tasks.filter((task) => {
-	      const text = (String(task?.title ?? "") + "\n" + String(task?.description ?? "")).toLowerCase();
+	      const text = (String(task?.title ?? "") + "\\n" + String(task?.description ?? "")).toLowerCase();
 	      return text.includes(needle) && (!options.state || task?.state === options.state);
 	    });
 	    return limited(matches, options.limit);
