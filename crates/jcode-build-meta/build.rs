@@ -18,6 +18,7 @@ fn main() {
 
     let pkg_version = root_package_version(&repo_root).unwrap_or_else(|| "0.0.0".to_string());
     let base_version = parse_semver(&pkg_version).unwrap_or((0, 0, 0));
+    enforce_base_version_not_behind_release_tags(&repo_root, base_version);
     let build_semver = resolve_build_semver(base_version).unwrap_or_else(|err| {
         eprintln!("cargo:warning=failed to resolve auto build semver: {err}");
         pkg_version.clone()
@@ -227,6 +228,55 @@ fn explicit_build_semver_override() -> Option<String> {
         .ok()
         .map(|value| value.trim().trim_start_matches('v').to_string())
         .filter(|value| parse_semver(value).is_some())
+}
+
+/// Fail the build when the root `Cargo.toml` base version is *behind* the
+/// newest `vMAJOR.MINOR.PATCH` release tag reachable in the repository.
+///
+/// Rationale: every version comparison in the update/reload machinery treats
+/// the base semver as this build's identity. When the base version lags the
+/// released channel (as happened with 0.61.2 vs the 0.64.x releases), every
+/// locally built dev binary "loses" to the tool-less release binary and
+/// auto-update/reload actively reverts operators off their own features.
+/// Refusing to build makes the drift impossible to reintroduce silently.
+///
+/// The check is advisory-fail-open when git or tags are unavailable (fresh
+/// tarball builds, shallow clones without tags), and can be explicitly
+/// bypassed with `JCODE_ALLOW_STALE_BASE_VERSION=1` for archaeology builds of
+/// old commits.
+fn enforce_base_version_not_behind_release_tags(repo_root: &Path, base_version: (u32, u32, u32)) {
+    println!("cargo:rerun-if-env-changed=JCODE_ALLOW_STALE_BASE_VERSION");
+    if std::env::var("JCODE_ALLOW_STALE_BASE_VERSION").is_ok() {
+        return;
+    }
+    let Some(tags) = git_output(repo_root, ["tag", "--list", "v*"]) else {
+        return;
+    };
+    let newest_tag = tags
+        .lines()
+        .filter_map(|line| parse_semver(line.trim()))
+        .max();
+    let Some(newest) = newest_tag else {
+        return;
+    };
+    if base_version < newest {
+        panic!(
+            "jcode-build-meta: root Cargo.toml version {}.{}.{} is behind the newest \
+             release tag v{}.{}.{}. Dev builds would identify as older than the \
+             released binary, so auto-update/reload would revert them. Bump \
+             [package].version in the root Cargo.toml to at least {}.{}.{}, or set \
+             JCODE_ALLOW_STALE_BASE_VERSION=1 to build an old commit intentionally.",
+            base_version.0,
+            base_version.1,
+            base_version.2,
+            newest.0,
+            newest.1,
+            newest.2,
+            newest.0,
+            newest.1,
+            newest.2,
+        );
+    }
 }
 
 fn resolve_build_semver(base_version: (u32, u32, u32)) -> Result<String, String> {
