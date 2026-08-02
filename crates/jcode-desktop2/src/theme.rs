@@ -31,6 +31,11 @@ pub struct Theme {
     pub rule: Color,
     /// Quiet fill for code blocks and wells.
     pub wash: Color,
+    /// Fill behind an *inline* code span. One density stronger than
+    /// [`Self::wash`], because a wash tuned for a whole block is too faint to
+    /// mark a single word inside a line of prose, and a code span you cannot
+    /// see is the same as no code span.
+    pub code_wash: Color,
     /// Fill of an input field. The composer is a field, not a code block, so
     /// it gets its own role: a grey slab reads as disabled, paper with a
     /// hairline reads as somewhere to type.
@@ -51,6 +56,13 @@ pub struct Theme {
     /// tuned to contrast with paper nearly vanishes on a wash, and a
     /// highlight you cannot see is the same as no highlight.
     pub selection_on_wash: Color,
+    /// Ink for an added line of a diff, and for a removed one. The one place
+    /// the print theme spends hue: a diff is read by scanning for which side a
+    /// line is on, and `+`/`-` alone makes that a character-by-character job.
+    /// Kept desaturated so a card full of them still reads as a document
+    /// rather than as a terminal.
+    pub added: Color,
+    pub removed: Color,
 }
 
 impl Theme {
@@ -64,12 +76,15 @@ impl Theme {
             faint: Color::from_rgb8(0x99, 0x99, 0x99),
             rule: Color::from_rgb8(0xcc, 0xcc, 0xcc),
             wash: Color::from_rgb8(0xf4, 0xf4, 0xf4),
+            code_wash: Color::from_rgb8(0xea, 0xea, 0xea),
             field: Color::from_rgb8(0xff, 0xff, 0xff),
             field_border: Color::from_rgb8(0xd4, 0xd4, 0xd4),
             field_border_focus: Color::from_rgb8(0x77, 0x77, 0x77),
             error: Color::from_rgb8(0x11, 0x11, 0x11),
             selection: Color::from_rgb8(0xd8, 0xd8, 0xd8),
             selection_on_wash: Color::from_rgb8(0xc4, 0xc4, 0xc4),
+            added: Color::from_rgb8(0x1a, 0x6b, 0x3a),
+            removed: Color::from_rgb8(0x9b, 0x22, 0x26),
         }
     }
 
@@ -83,12 +98,15 @@ impl Theme {
             faint: Color::from_rgb8(0x66, 0x66, 0x66),
             rule: Color::from_rgb8(0x33, 0x33, 0x33),
             wash: Color::from_rgb8(0x14, 0x14, 0x14),
+            code_wash: Color::from_rgb8(0x24, 0x24, 0x24),
             field: Color::from_rgb8(0x10, 0x10, 0x10),
             field_border: Color::from_rgb8(0x3a, 0x3a, 0x3a),
             field_border_focus: Color::from_rgb8(0x88, 0x88, 0x88),
             error: Color::from_rgb8(0xee, 0xee, 0xee),
             selection: Color::from_rgb8(0x3a, 0x3a, 0x3a),
             selection_on_wash: Color::from_rgb8(0x4c, 0x4c, 0x4c),
+            added: Color::from_rgb8(0x6d, 0xd4, 0x92),
+            removed: Color::from_rgb8(0xf0, 0x8b, 0x8b),
         }
     }
 

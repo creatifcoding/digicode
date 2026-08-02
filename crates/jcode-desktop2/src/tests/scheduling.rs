@@ -71,6 +71,74 @@ fn an_unfocused_window_sleeps() {
     );
 }
 
+/// An unfocused window with a turn running must keep waking: the spinner is
+/// the proof the agent is alive, and a user watching from another window
+/// reads a frozen spinner as a hang.
+#[test]
+fn an_unfocused_running_turn_still_animates() {
+    let mut app = focused_app();
+    app.model.focused = false;
+    app.model.busy = true;
+    let now = Instant::now();
+    app.model.activity.start(now);
+    let deadline = app
+        .animation_deadline(now)
+        .expect("an unfocused turn scheduled no frames, so the spinner froze");
+    assert!(
+        deadline <= now + Duration::from_millis(250),
+        "the background spinner cadence is too slow to read as motion"
+    );
+}
+
+/// A reply streaming into an unfocused window must keep revealing: the text
+/// arriving is the information, and freezing it mid-sweep makes the reply
+/// look stalled from across the desktop.
+#[test]
+fn an_unfocused_streaming_reveal_still_animates() {
+    let mut app = focused_app();
+    app.model.focused = false;
+    let now = Instant::now();
+    app.model.stream.extend_to(400, now);
+    assert!(
+        app.animation_deadline(now).is_some(),
+        "a reply streaming into a background window froze mid-reveal"
+    );
+}
+
+/// Background wakes must stay on the timer path, not chain display-paced
+/// frames: 10fps is the point of the background cadence, and chaining would
+/// silently promote it back to the display rate.
+#[test]
+fn background_animation_stays_on_the_timer() {
+    let mut app = focused_app();
+    app.model.focused = false;
+    app.model.busy = true;
+    let now = Instant::now();
+    app.model.activity.start(now);
+    app.model.stream.extend_to(400, now);
+    assert!(
+        !app.wants_display_paced_frame(now),
+        "an unfocused window chained display-rate frames"
+    );
+}
+
+/// The decorative animations stay off in the background: a blinking caret in
+/// a window that cannot receive typing lies, and the donut is not worth the
+/// GPU while nobody is looking at it.
+#[test]
+fn an_unfocused_idle_window_still_skips_the_caret_and_donut() {
+    let mut app = focused_app();
+    app.model.focused = false;
+    app.model.donut = Some(crate::donut::Donut::new(8));
+    // A fresh caret would blink soon if it were being scheduled.
+    app.model.caret = Caret::with_activity(Instant::now());
+    assert_eq!(
+        app.animation_deadline(Instant::now()),
+        None,
+        "an unfocused window scheduled wakes for decorative motion"
+    );
+}
+
 /// While a turn is streaming the composer shows the activity line, so there is
 /// no caret to blink and no reason to wake for one. A busy turn with no running
 /// activity (the state right after attaching) must still sleep.
@@ -238,11 +306,17 @@ mod footnote {
     use crate::Model;
 
     fn attached() -> Model {
-        Model {
+        let mut model = Model {
             session_id: Some("session_test".into()),
             status: "attached: session_test".into(),
             ..Model::default()
-        }
+        };
+        // A conversation in progress: the empty page is its own case, since it
+        // is where the build version is shown.
+        model
+            .transcript
+            .push(crate::transcript::Message::user("hello"));
+        model
     }
 
     /// The steady state must be silent. This is the whole reason the masthead
@@ -260,6 +334,21 @@ mod footnote {
             None,
             "an idle healthy session still drew a footnote"
         );
+    }
+
+    /// The version is the one fact about the client the window cannot
+    /// otherwise answer, so an empty page carries it. It yields to every
+    /// actionable message, and disappears as soon as there is a conversation.
+    #[test]
+    fn an_empty_page_shows_the_client_version() {
+        let mut model = attached();
+        model.transcript = crate::transcript::Transcript::default();
+        model.meta = crate::meta::Meta {
+            version: "v1.2.3".into(),
+            update: crate::meta::UpdateState::Current,
+            account: Some("someone@example.dev (anthropic)".into()),
+        };
+        assert_eq!(model.footnote().as_deref(), Some("v1.2.3"));
     }
 
     /// A failure to connect must be visible, or a dead runtime is

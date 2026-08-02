@@ -816,11 +816,11 @@ pub struct AutoReviewConfig {
     pub model: Option<String>,
 }
 
-/// Tool partner discovery configuration.
+/// Integration discovery configuration (legacy `[sponsors]` section name).
 ///
-/// Partner discovery makes third-party developer tools discoverable to the
-/// agent via a `discover_tools` tool backed by a hosted directory. Some
-/// partners may share revenue with Jcode when a referred user becomes a
+/// Integration discovery makes third-party developer tools discoverable to
+/// the agent via a `discover_tools` tool backed by a hosted directory. Some
+/// providers may share revenue with Jcode when a referred user becomes a
 /// customer, but partnership status never influences recommendations. Each
 /// session's first use of `discover_tools` shows a concise disclosure with a
 /// learn-more link.
@@ -828,7 +828,7 @@ pub struct AutoReviewConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SponsorsConfig {
-    /// Enable tool partner discovery. Enabled by default; set to false to opt
+    /// Enable integration discovery. Enabled by default; set to false to opt
     /// out. When false, no discovery categories are added to the prompt, the
     /// `discover_tools` tool is not registered, and jcode never contacts the
     /// discovery endpoint.
@@ -1037,7 +1037,11 @@ pub struct DisplayConfig {
     pub latex_rendering: LatexRenderingMode,
     /// Pin read images to side pane (default: true)
     pub pin_images: bool,
-    /// Show idle animation before first prompt (default: true)
+    /// Pin the full session todo list to the top of the chat transcript while
+    /// it scrolls, like the sticky previous-prompt preview (default: false)
+    #[serde(default)]
+    pub pin_todos: bool,
+    /// Show idle animation before first prompt (default: false)
     pub idle_animation: bool,
     /// Briefly animate user prompt line when it enters viewport (default: true)
     pub prompt_entry_animation: bool,
@@ -1080,6 +1084,12 @@ pub struct DisplayConfig {
     /// adapts jcode's palette for light backgrounds. Default: auto.
     #[serde(default)]
     pub theme: String,
+    /// Per-role color overrides, e.g. `user = "#8ab4f8"`. Any TUI color can be
+    /// configured: the named roles are substituted directly, and ad hoc shades
+    /// used by widgets follow the role they belong to. Run `/colors` to list
+    /// roles and `/colors harmony` to score the result.
+    #[serde(default)]
+    pub colors: std::collections::BTreeMap<String, String>,
     /// Opt-in active sessions manager: pressing Left arrow on an empty input
     /// opens a picker scoped to live (open) sessions, showing which are still
     /// working and which are ready for input (default: false). The `/active`
@@ -1098,6 +1108,7 @@ impl Default for DisplayConfig {
             diff_mode: DiffDisplayMode::default(),
             show_diffs: None,
             pin_images: true,
+            pin_todos: false,
             queue_mode: false,
             auto_server_reload: true,
             mouse_capture: true,
@@ -1109,7 +1120,7 @@ impl Default for DisplayConfig {
             diagram_mode: DiagramDisplayMode::default(),
             markdown_spacing: MarkdownSpacingMode::default(),
             latex_rendering: LatexRenderingMode::default(),
-            idle_animation: true,
+            idle_animation: false,
             prompt_entry_animation: true,
             disabled_animations: Vec::new(),
             diff_line_wrap: true,
@@ -1124,6 +1135,7 @@ impl Default for DisplayConfig {
             native_scrollbars: NativeScrollbarConfig::default(),
             keybinding_hints: true,
             theme: String::new(),
+            colors: std::collections::BTreeMap::new(),
             active_sessions_manager: false,
             overscroll_status: OverscrollStatusMode::default(),
         }
@@ -1182,6 +1194,10 @@ pub struct FeatureConfig {
     pub swarm: bool,
     /// Enable Mermaid rendering and Mermaid-specific model guidance (default: true)
     pub mermaid: bool,
+    /// Default state of auto-poke (automatic follow-up when the model stops with
+    /// incomplete todos). `/poke on` / `/poke off` still override this per session
+    /// (default: true)
+    pub auto_poke: bool,
     /// Inject timestamps into user messages and tool results sent to the model (default: true)
     pub message_timestamps: bool,
     /// Persist auto-recalled memory injections into normal session history instead of sending
@@ -1204,6 +1220,7 @@ impl Default for FeatureConfig {
             memory: true,
             swarm: true,
             mermaid: true,
+            auto_poke: true,
             message_timestamps: true,
             persist_memory_injections: false,
             kv_cache_miss_notices: true,

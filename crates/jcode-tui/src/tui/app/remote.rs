@@ -113,11 +113,13 @@ pub(super) async fn handle_tick(app: &mut App, remote: &mut RemoteConnection) ->
 
     needs_redraw |= app.refresh_todos_view_if_needed();
     needs_redraw |= app.refresh_todo_card_if_needed();
+    needs_redraw |= app.refresh_pinned_todos_if_needed();
     needs_redraw |= app.refresh_side_panel_linked_content_if_due();
     needs_redraw |= app.poll_model_picker_load();
     needs_redraw |= app.poll_session_picker_load();
     needs_redraw |= app.poll_session_picker_presence();
     needs_redraw |= app.onboarding_tick();
+    needs_redraw |= app.refresh_keybindings_if_config_reloaded();
 
     let _ = check_debug_command(app, remote).await;
 
@@ -380,6 +382,9 @@ async fn apply_terminal_event(
             app.set_client_focused(false);
         }
         Some(Ok(Event::Key(key))) => {
+            // Start the key-to-paint clock at the moment the key is read, which is
+            // the only point that corresponds to the user's press.
+            crate::tui::ui::note_key_event_read();
             input_attribution.event = Some(format!("key:{:?}:{:?}", key.code, key.kind));
             input_attribution.scroll_delta = key_scroll_delta(&key);
             app.note_client_interaction();
@@ -1366,8 +1371,12 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
         if let Some(interleave_msg) = app.interleave_message.take()
             && !interleave_msg.trim().is_empty()
         {
+            let interleave_images = std::mem::take(&mut app.interleave_images);
             let msg_clone = interleave_msg.clone();
-            match remote.soft_interrupt(interleave_msg, false).await {
+            match remote
+                .soft_interrupt(interleave_msg, interleave_images, false)
+                .await
+            {
                 Err(e) => {
                     app.push_display_message(DisplayMessage::error(format!(
                         "Failed to queue soft interrupt: {}",
@@ -1383,6 +1392,10 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
     }
 
     if let Some(interleave_msg) = app.interleave_message.take() {
+        // Carry the staged attachments through. A local revert of #627 had this
+        // passing `vec![]`, which silently dropped every image on an interleaved
+        // send while still compiling, so the comment marks why the take matters.
+        let interleave_images = std::mem::take(&mut app.interleave_images);
         if !interleave_msg.trim().is_empty() {
             app.push_display_message(DisplayMessage {
                 role: "user".to_string(),
@@ -1392,8 +1405,17 @@ pub(super) async fn process_remote_followups(app: &mut App, remote: &mut RemoteC
                 title: None,
                 tool_data: None,
             });
-            if let Err(e) =
-                begin_remote_send(app, remote, interleave_msg, vec![], false, None, false, 0).await
+            if let Err(e) = begin_remote_send(
+                app,
+                remote,
+                interleave_msg,
+                interleave_images,
+                false,
+                None,
+                false,
+                0,
+            )
+            .await
             {
                 app.push_display_message(DisplayMessage::error(format!(
                     "Failed to send message: {}",
@@ -1812,8 +1834,7 @@ fn handle_disconnected_key_internal(
                 return Ok(());
             }
             KeyCode::Char('l') if !app.diff_pane_visible() => {
-                app.clear_display_messages();
-                app.queued_messages.clear();
+                app.clear_view_keep_context();
                 return Ok(());
             }
             _ => {
@@ -1880,8 +1901,7 @@ fn handle_disconnected_key_internal(
         return Ok(());
     }
 
-    if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
-        input::insert_input_text(app, "\n");
+    if crate::tui::app::input::newline::enter_inserts_newline(app, code, modifiers) {
         return Ok(());
     }
 

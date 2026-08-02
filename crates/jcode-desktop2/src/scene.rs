@@ -43,6 +43,43 @@ const CIRCLE_TOLERANCE: f64 = 0.05;
 /// bolted next to it.
 pub(crate) const SPINNER_SIZE: f64 = 13.0;
 
+/// The delivery mark beside a user's message: a small dot, hollow while the
+/// message is only on its way and solid once the agent has acknowledged it.
+///
+/// A dot rather than a word ("sent", "delivered") because the transcript is
+/// prose: a label would be read as something someone said. Hollow-to-solid is
+/// the same grammar as the app's halftone dots elsewhere, so it needs no key.
+fn draw_delivery_dot(
+    scene: &mut Scene,
+    delivery: crate::ack::Delivery,
+    center: (f64, f64),
+    theme: &crate::theme::Theme,
+    scale: f64,
+) {
+    use crate::ack::DOT_RADIUS;
+    let circle = vello::kurbo::Circle::new((center.0, center.1), DOT_RADIUS);
+    if delivery.is_acked() {
+        scene.fill(
+            vello::peniko::Fill::NonZero,
+            Affine::scale(scale),
+            theme.muted,
+            None,
+            &circle,
+        );
+        return;
+    }
+    // Pending: a ring, so the mark is present from the moment the message is
+    // sent. An absent mark would be indistinguishable from a message the app
+    // never tried to send.
+    scene.stroke(
+        &vello::kurbo::Stroke::new(1.2),
+        Affine::scale(scale),
+        theme.faint,
+        None,
+        &circle,
+    );
+}
+
 /// The activity spinner: a ring of halftone dots with a bright head that walks
 /// around it. Same visual language as the hero donut, so "the agent is working"
 /// looks like part of the app rather than a stock throbber.
@@ -84,7 +121,21 @@ pub(crate) fn draw_spinner(
     }
 }
 
-fn draw_donut(scene: &mut Scene, field: &donut::Donut, box_: Rect, ink: Color, scale: f64) {
+/// `grow` scales the whole halftone screen about the box's centre, which is how
+/// the boot reveal brings the donut in: scaling the *box* instead would keep the
+/// fixed dot pitch and simply show fewer dots, i.e. a coarsening blob rather
+/// than a donut arriving.
+fn draw_donut(
+    scene: &mut Scene,
+    field: &donut::Donut,
+    box_: Rect,
+    ink: Color,
+    scale: f64,
+    grow: f64,
+) {
+    if grow <= 0.0 || ink.components[3] <= 0.0 {
+        return;
+    }
     let side = box_.width().min(box_.height());
     if side < layout::DONUT_MIN_SIDE {
         return;
@@ -118,19 +169,22 @@ fn draw_donut(scene: &mut Scene, field: &donut::Donut, box_: Rect, ink: Color, s
             dots.extend(Circle::new((px, py), radius).path_elements(CIRCLE_TOLERANCE));
         }
     }
-    scene.fill(
-        vello::peniko::Fill::NonZero,
-        Affine::scale(scale),
-        ink,
-        None,
-        &dots,
-    );
+    let centre = vello::kurbo::Vec2::new(cx, cy);
+    let transform = Affine::scale(scale)
+        * Affine::translate(centre)
+        * Affine::scale(grow)
+        * Affine::translate(-centre);
+    scene.fill(vello::peniko::Fill::NonZero, transform, ink, None, &dots);
 }
 
-/// Draw the hero block shown on an empty session: the wordmark, the halftone
-/// donut, and one line of invitation, stacked and centred exactly like the
-/// website's landing section.
-fn draw_hero(
+/// Draw the hero's text: the wordmark over the donut and the one line of
+/// invitation under it, stacked and centred exactly like the website's landing
+/// section.
+///
+/// The donut itself is drawn by the caller, outside the chrome reveal layer:
+/// during boot the torus arrives *first* and the words after it, so the two
+/// cannot share one draw.
+fn draw_hero_text(
     scene: &mut Scene,
     text: &mut text::TextSystem,
     model: &Model,
@@ -155,9 +209,6 @@ fn draw_hero(
         },
         scale,
     );
-    if let Some(field) = model.donut.as_ref() {
-        draw_donut(scene, field, hero.donut, model.theme.text, scale);
-    }
     text.draw_paragraph_scaled(
         scene,
         HERO_TAGLINE,
@@ -174,78 +225,77 @@ fn draw_hero(
     );
 }
 
-/// Draw the session strip: a row of bars at the top of the window, one per
-/// live session, grouped by working directory.
+/// Draw the session strip: a row of small rectangles at the top of the window,
+/// one per live session, enclosed in an outlined rectangle per working
+/// directory.
 ///
 /// Deliberately the same visual language as the author's waybar
 /// `niri-workspaces` module, because it is the language he already reads
-/// without thinking: a dim group label, then thin ticks for the sessions in
-/// it, with the focused one a wide solid block.
+/// without thinking: thin ticks for the sessions in a place, with the focused
+/// one a wide solid block.
+///
+/// Purely geometric: the group's name used to be spelled out beside its bars,
+/// which turned the chrome row into a line of prose that had to be *read*
+/// (`jcode-website jcode jcode-desktop2 ...`) and grew with every checkout.
+/// The enclosure carries the same information as shape, so the row is scanned
+/// rather than read, and stays the same width whatever the directories are
+/// called. Which place is which is answered by the overview, where there is
+/// room to name them.
 fn draw_strip(
     scene: &mut Scene,
-    text: &mut text::TextSystem,
     model: &Model,
     band: (f64, f64),
     frame: &layout::Frame,
     scale: f64,
 ) {
     let (top, bottom) = band;
-    let label_style = ParagraphStyle {
-        font_size: layout::STRIP_LABEL_SIZE,
-        color: model.theme.faint,
-        letter_spacing_em: 0.08,
-        line_height: 1.0,
-        ..Default::default()
-    };
-    // Measure labels through the same text system that draws them, so the bars
-    // sit where the label really ends rather than at an estimate. Measured up
-    // front because layout needs them all and the text system is exclusive.
-    let widths: Vec<(String, f64)> = model
-        .strip
-        .groups()
-        .iter()
-        .map(|group| {
-            (
-                group.label.clone(),
-                text.measure_width(&group.label, label_style, scale),
-            )
-        })
-        .collect();
-    let items = crate::strip::layout_items(&model.strip, frame.left, frame.right, |label| {
-        widths
-            .iter()
-            .find(|(name, _)| name == label)
-            .map(|(_, width)| *width)
-            .unwrap_or(0.0)
-    });
+    let items = crate::strip::layout_items(&model.strip, frame.left, frame.right);
 
-    // Bars are centred in the band; the label sits on the same row.
-    let bar_top = top + (bottom - top - layout::STRIP_BAR_HEIGHT) / 2.0;
-    let label_top = top + (bottom - top - f64::from(layout::STRIP_LABEL_SIZE)) / 2.0;
+    // Blocks are centred in the band; the enclosure adds its padding around
+    // them, so both are derived from the same centre line.
+    let block_top = top + (bottom - top - layout::STRIP_BAR_HEIGHT) / 2.0;
+    let block_bottom = block_top + layout::STRIP_BAR_HEIGHT;
+    let pad = layout::STRIP_FRAME_PAD;
 
     for item in items {
         match item {
-            crate::strip::Item::Label { group, x } => {
-                let Some(group) = model.strip.groups().get(group) else {
-                    continue;
+            crate::strip::Item::Frame {
+                x,
+                width,
+                focused,
+                group: _,
+            } => {
+                // The enclosure is a hairline so it frames without competing
+                // with the blocks inside it. The focused group's outline is
+                // full-weight rule ink; the others are faint, so the row shows
+                // where you are before you count anything.
+                let color = if focused {
+                    model.theme.muted
+                } else {
+                    model.theme.rule
                 };
-                text.draw_paragraph_scaled(
-                    scene,
-                    &group.label,
-                    (x, label_top),
-                    frame.column() as f32,
-                    label_style,
-                    scale,
+                scene.stroke(
+                    &vello::kurbo::Stroke::new(frame.hairline().max(1.0 / scale)),
+                    Affine::scale(scale),
+                    color,
+                    None,
+                    &RoundedRect::new(
+                        x,
+                        block_top - pad,
+                        x + width,
+                        block_bottom + pad,
+                        layout::STRIP_FRAME_RADIUS,
+                    ),
                 );
             }
-            crate::strip::Item::Bar {
+            crate::strip::Item::Block {
                 x,
                 width,
                 focused,
                 group,
                 index,
             } => {
-                // Unfocused bars are dim so the focused one reads instantly;
+                // Unfocused blocks are dim so the focused one reads instantly;
                 // a busy session is drawn at full ink even when unfocused, so
                 // work happening off-screen is visible rather than silent.
                 let busy = model
@@ -267,13 +317,7 @@ fn draw_strip(
                     Affine::scale(scale),
                     color,
                     None,
-                    &RoundedRect::new(
-                        x,
-                        bar_top,
-                        x + width,
-                        bar_top + layout::STRIP_BAR_HEIGHT,
-                        1.0,
-                    ),
+                    &RoundedRect::new(x, block_top, x + width, block_bottom, 1.0),
                 );
             }
         }
@@ -282,84 +326,6 @@ fn draw_strip(
 
 /// The tagline under the donut, matching the website's hero copy.
 const HERO_TAGLINE: &str = "an open source coding agent, written in rust";
-
-/// Draw the working directory and the RAM readout on the trailing end of the
-/// top chrome row.
-///
-/// Right-aligned against the strip's bars so the row reads as "these sessions,
-/// this place": the answer to "which checkout am I talking to" was previously
-/// only inferable from the strip's leaf labels, and not available at all in a
-/// single-session window. Head-elided rather than middle-elided because the
-/// tail of a path is the part that identifies it. The RAM caption sits after
-/// the path (`ui 105 MB · srv 428 MB`): it is metadata about the same corner
-/// of the app, and a second row for it would spend a whole band on two
-/// numbers.
-fn draw_place(
-    scene: &mut Scene,
-    text: &mut text::TextSystem,
-    model: &Model,
-    band: (f64, f64),
-    frame: &layout::Frame,
-    scale: f64,
-) {
-    let path = model
-        .working_dir
-        .as_deref()
-        .map(|dir| crate::place::display_path(dir, crate::place::home().as_deref()))
-        .filter(|path| !path.is_empty());
-    let mem = model.mem.as_ref().map(crate::mem::Readout::caption);
-    let (top, bottom) = band;
-    let style = ParagraphStyle {
-        font_size: layout::STRIP_LABEL_SIZE,
-        color: model.theme.faint,
-        letter_spacing_em: 0.08,
-        line_height: 1.0,
-        align: text::Align::End,
-        ..Default::default()
-    };
-    // Never more than half the row: the strip is the interactive half and must
-    // not be pushed off the page by a deep path. The RAM caption is small and
-    // fixed-format, so it is kept whole and the path absorbs the elision.
-    let budget = (frame.column() / (f64::from(layout::STRIP_LABEL_SIZE) * 0.62) / 2.0) as usize;
-    let label = match (path, mem) {
-        (Some(path), Some(mem)) => {
-            let path_budget = budget.max(8).saturating_sub(mem.chars().count() + 3);
-            if path_budget >= 8 {
-                format!("{}  ·  {mem}", elide_head(&path, path_budget))
-            } else {
-                mem
-            }
-        }
-        (Some(path), None) => elide_head(&path, budget.max(8)),
-        (None, Some(mem)) => mem,
-        (None, None) => return,
-    };
-    let label_top = top + (bottom - top - f64::from(layout::STRIP_LABEL_SIZE)) / 2.0;
-    text.draw_paragraph_scaled(
-        scene,
-        &label,
-        (frame.left, label_top),
-        frame.column() as f32,
-        style,
-        scale,
-    );
-}
-
-/// Elide `text` from the left, keeping the tail: `.../crates/jcode-desktop2`.
-pub fn elide_head(text: &str, max_chars: usize) -> String {
-    let text = text.trim();
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
-        return text.to_string();
-    }
-    if max_chars <= 3 {
-        return "...".to_string();
-    }
-    let keep = max_chars - 3;
-    let mut out = String::from("...");
-    out.extend(&chars[chars.len() - keep..]);
-    out
-}
 
 /// Body paragraph style for transcript prose. One definition, so measuring in
 /// [`crate::viewport`] and drawing here can never disagree.
@@ -459,7 +425,7 @@ fn draw_transcript(
     frame: &layout::Frame,
     scale: f64,
 ) {
-    use crate::transcript::{CODE_PAD_Y, Role, USER_PAD_X, USER_RADIUS};
+    use crate::transcript::{CODE_PAD_Y, Role, USER_PAD_X, USER_PAD_Y, USER_RADIUS};
     use jcode_render_core::BlockKind;
 
     let theme = &model.theme;
@@ -484,16 +450,52 @@ fn draw_transcript(
     // has been read and must be drawn whole. The live tool card is skipped:
     // it is pinned to the tail as a status readout and appears whole, while
     // the reveal animates the text arriving above it (the same message
-    // `Transcript::streaming_len` counts, or the two would disagree).
+    // `Transcript::streaming_len` counts, or the two would disagree). Queued
+    // messages are skipped the same way: they sit *below* the streaming text,
+    // waiting for their turn, and were typed rather than streamed.
     let streaming_index = laid
         .iter()
-        .rposition(|message| message.role != Role::Tool)
+        .rposition(|message| {
+            !matches!(message.role, Role::Tool | Role::Notice | Role::Edit)
+                && message.delivery != Some(crate::ack::Delivery::Queued)
+        })
         .filter(|_| model.stream.is_revealing())
         .filter(|index| laid[*index].role != Role::User);
 
+    let now = std::time::Instant::now();
     for placed in &view.visible {
         let message_top = frame.body_top + placed.top;
         let is_user = placed.message.role == Role::User;
+        // The acknowledgement nod. Applied to the card *and* its text, so the
+        // message moves as one object; it decays to zero, so nothing here can
+        // leave the transcript permanently off its column.
+        let wiggle = placed
+            .message
+            .delivery
+            .map_or(0.0, |delivery| delivery.wiggle(now));
+        // The delivery tone: a message the agent has not confirmed yet is
+        // drawn faint, and the acknowledgement ramps it to full ink over the
+        // wiggle. One layer over the whole card, so the wash, the dot, and
+        // the text fade as one object rather than as three.
+        let tone = placed
+            .message
+            .delivery
+            .map_or(1.0, |delivery| delivery.tone(now));
+        let toned = tone < 1.0;
+        if toned {
+            scene.push_layer(
+                vello::peniko::Fill::NonZero,
+                vello::peniko::Mix::Normal,
+                tone as f32,
+                Affine::scale(scale),
+                &Rect::new(
+                    frame.left + wiggle - crate::ack::WIGGLE_AMPLITUDE,
+                    message_top,
+                    frame.right + wiggle + crate::ack::WIGGLE_AMPLITUDE,
+                    message_top + placed.message.height,
+                ),
+            );
+        }
         // The user's card: the same fill and radius as the composer, so the
         // message and the field it came from are visibly one object.
         if is_user {
@@ -503,45 +505,37 @@ fn draw_transcript(
                 theme.wash,
                 None,
                 &RoundedRect::new(
-                    frame.left,
+                    frame.left + wiggle,
                     message_top,
-                    frame.right,
+                    frame.right + wiggle,
                     message_top + placed.message.height,
                     USER_RADIUS,
                 ),
             );
+            // The delivery mark: hollow while the message is only *sent*,
+            // solid once the agent has it. The dot is the state the wiggle
+            // announces, and it stays after the motion is over, so a user who
+            // looked away can still tell what landed.
+            if let Some(delivery) = placed.message.delivery {
+                draw_delivery_dot(
+                    scene,
+                    delivery,
+                    (
+                        frame.right + wiggle - USER_PAD_X + crate::ack::DOT_GAP,
+                        message_top + placed.message.height - USER_PAD_Y,
+                    ),
+                    theme,
+                    scale,
+                );
+            }
         }
-        let text_left = frame.left + USER_PAD_X;
+        let text_left = frame.left + USER_PAD_X + wiggle;
         let text_top = message_top + placed.message.top_padding();
 
-        // A reasoning message carries a rule down its whole left edge: one
-        // mark for the thought, rather than a label repeated per paragraph.
-        // It is the quote convention, which is exactly what a thought is here.
-        // Adjacent reasoning messages are one thought that happened to arrive
-        // in pieces, so the rule bridges the gap between them instead of
-        // restarting: the thought reads as one aside, not several.
-        if placed.message.role == Role::Reasoning {
-            let joins_previous = placed
-                .index
-                .checked_sub(1)
-                .is_some_and(|previous| laid[previous].role == Role::Reasoning);
-            let rule_top = match joins_previous {
-                true => message_top - crate::transcript::MESSAGE_GAP,
-                false => message_top,
-            };
-            scene.fill(
-                vello::peniko::Fill::NonZero,
-                Affine::scale(scale),
-                theme.rule,
-                None,
-                &Rect::new(
-                    text_left,
-                    rule_top,
-                    text_left + frame.hairline() * 2.0,
-                    message_top + placed.message.height,
-                ),
-            );
-        }
+        // A thought carries no rule and no indent: it is set apart by being
+        // dimmer and slightly smaller than the reply (see `lay_out_message`).
+        // Furniture down the left edge made every aside look like a quoted
+        // block, which is louder than a thought should ever read.
 
         // The live tool card: one card for the call running right now, on
         // the composer's wash with the app's halftone spinner beside its
@@ -580,15 +574,54 @@ fn draw_transcript(
             }
         }
 
+        // An edit card: the change itself, kept in the transcript. Marked by a
+        // rule down its left edge rather than a wash, because the diff's own
+        // code block already carries one and a card inside a card reads as two
+        // nested quotes. The rule is body ink: the edit is something that
+        // happened to the user's files, not an aside.
+        if placed.message.role == Role::Edit {
+            scene.fill(
+                vello::peniko::Fill::NonZero,
+                Affine::scale(scale),
+                theme.rule,
+                None,
+                &Rect::new(
+                    frame.left + USER_PAD_X,
+                    message_top,
+                    frame.left + USER_PAD_X + frame.hairline() * 2.0,
+                    message_top + placed.message.height,
+                ),
+            );
+        }
+
+        // A failure notice: a rule down its left edge, no wash. A washed card
+        // is the user's own message in this theme, and dressing an error as
+        // something the user typed is worse than not marking it at all. The
+        // rule is the print convention for an interjection, and it takes the
+        // error ink so the mark is as loud as the text it labels.
+        if placed.message.role == Role::Notice {
+            scene.fill(
+                vello::peniko::Fill::NonZero,
+                Affine::scale(scale),
+                theme.error,
+                None,
+                &Rect::new(
+                    frame.left + USER_PAD_X,
+                    message_top,
+                    frame.left + USER_PAD_X + frame.hairline() * 2.0,
+                    message_top + placed.message.height,
+                ),
+            );
+        }
+
         // Glyphs in this message, and how many earlier blocks have consumed,
-        // so the reveal sweeps across block boundaries as one motion.
+        // so the reveal sweeps across block boundaries as one motion. Counts
+        // come from layout time, so this is arithmetic, not a per-frame walk
+        // over every glyph run.
         let message_glyphs: usize = match streaming_index {
-            Some(index) if index == placed.index => placed
-                .message
-                .blocks
-                .iter()
-                .map(|block| crate::text::glyph_count(&block.layout))
-                .sum(),
+            Some(index) if index == placed.index => {
+                placed.message.blocks.iter().map(|block| block.glyphs).sum()
+            }
             _ => 0,
         };
         let mut drawn_glyphs = 0usize;
@@ -654,6 +687,24 @@ fn draw_transcript(
             let inset_x = block.inset;
             // Selection bands go under the glyphs, so highlighted text stays
             // legible on the band rather than being painted over by it.
+            // Inline code sits under both: it is a property of the text, so a
+            // selection must read as drawn *over* the code span rather than
+            // being hidden by it.
+            for wash in &block.washes {
+                scene.fill(
+                    vello::peniko::Fill::NonZero,
+                    Affine::scale(scale),
+                    theme.code_wash,
+                    None,
+                    &RoundedRect::new(
+                        text_left + inset_x + wash.x0,
+                        block_top + inset_y + wash.y0,
+                        text_left + inset_x + wash.x1,
+                        block_top + inset_y + wash.y1,
+                        crate::transcript::INLINE_CODE_RADIUS,
+                    ),
+                );
+            }
             if let Some(selection) = model.selection.as_ref()
                 && let Some(range) =
                     selection.range_in(placed.index, block_index, block.source.len())
@@ -705,7 +756,10 @@ fn draw_transcript(
                 scale,
                 revealed,
             );
-            drawn_glyphs += crate::text::glyph_count(&block.layout);
+            drawn_glyphs += block.glyphs;
+        }
+        if toned {
+            scene.pop_layer();
         }
     }
 }
@@ -761,18 +815,49 @@ pub fn build_scene(
         );
     };
 
-    // Paper.
-    fill(
-        scene,
-        theme.background,
-        &Rect::new(0.0, 0.0, frame.width, frame.height),
+    // Paper. Black on the opening frames of the boot reveal, then the theme's
+    // own background: the window fades up from nothing rather than snapping
+    // into existence fully drawn.
+    let page = Rect::new(0.0, 0.0, frame.width, frame.height);
+    fill(scene, model.boot.paper_color(theme.background), &page);
+
+    // The hero donut, drawn before (and outside) the chrome reveal: during boot
+    // the torus arrives first and everything else is created around it.
+    let placeholder = model.transcript.is_empty();
+    let hero = frame.hero().filter(|_| placeholder);
+    if let (Some(hero), Some(field)) = (hero, model.donut.as_ref()) {
+        draw_donut(
+            scene,
+            field,
+            hero.donut,
+            model.boot.donut_ink(theme.text, theme.background),
+            scale,
+            model.boot.donut(),
+        );
+    }
+
+    // Everything that is not the donut fades in as one group, so the composer,
+    // the wordmark, and the chrome read as one thing being created rather than
+    // as several arrivals.
+    match model.boot.chrome_layer() {
+        crate::boot::ChromeReveal::Hidden => return,
+        crate::boot::ChromeReveal::Fading(alpha) => scene.push_layer(
+            vello::peniko::Fill::NonZero,
+            vello::peniko::Mix::Normal,
+            alpha,
+            Affine::scale(scale),
+            &page,
+        ),
+        crate::boot::ChromeReveal::Solid => {}
+    }
+    let revealing = matches!(
+        model.boot.chrome_layer(),
+        crate::boot::ChromeReveal::Fading(_)
     );
 
-    // Top chrome row: the session strip on the left, and where this window is
-    // on the right.
+    // Top chrome row: the session strip.
     if let Some(band) = frame.strip() {
-        draw_strip(scene, text, model, band, &frame, scale);
-        draw_place(scene, text, model, band, &frame, scale);
+        draw_strip(scene, model, band, &frame, scale);
     }
 
     // Composer: a real input field. Paper fill plus a hairline border, rather
@@ -802,14 +887,13 @@ pub fn build_scene(
 
     // Transcript: ink on paper, bottom-aligned against the composer so new
     // lines rise from the well rather than dangling from the masthead.
-    let placeholder = model.transcript.is_empty();
-
-    // On an empty session the transcript region is dead space, so the hero
-    // donut from the website lives there: the same halftone torus, and
-    // draggable in the same way. It stands down the moment there is real
-    // content, so it can never compete with the transcript.
-    if let Some(hero) = frame.hero().filter(|_| placeholder) {
-        draw_hero(scene, text, model, hero, &frame, scale);
+    //
+    // On an empty session the transcript region is dead space, so the hero from
+    // the website lives there: the wordmark and tagline around the halftone
+    // torus drawn above. It stands down the moment there is real content, so it
+    // can never compete with the transcript.
+    if let Some(hero) = hero {
+        draw_hero_text(scene, text, model, hero, &frame, scale);
     }
 
     // On an empty session the hero says everything, so there is no filler
@@ -881,26 +965,16 @@ pub fn build_scene(
 
         // An empty field carries a rotating invitation rather than a label:
         // "message jcode" is a caption you stop seeing, while a prompt you
-        // could actually type teaches what the thing is for. While busy it says
-        // so instead, because "nothing is happening" and "working" must never
-        // look the same.
-        // The busy line is the activity line when a turn is running: the
-        // current phase and elapsed time, so a long turn shows progress
-        // instead of a frozen label. The elapsed clock is the liveness
-        // signal; a spinner here would only add noise beside the caret.
-        let busy_line = model
-            .busy
-            .then(|| model.activity.line(std::time::Instant::now()))
-            .flatten()
-            .unwrap_or_else(|| "working... esc to interrupt".to_string());
+        // could actually type teaches what the thing is for.
+        //
+        // The field never carries the turn's status: liveness belongs to the
+        // transcript's live tool card and the window's own busy cues, and a
+        // phase/elapsed line here fought the caret and the next message the
+        // user was already typing.
         if model.editor.is_empty() {
             text.draw_paragraph_scaled(
                 scene,
-                if model.busy {
-                    busy_line.as_str()
-                } else {
-                    crate::hints::hint(model.hint)
-                },
+                crate::hints::hint(model.hint),
                 (prompt_x, prompt_y),
                 prompt_width,
                 ParagraphStyle {
@@ -936,9 +1010,7 @@ pub fn build_scene(
 
         // An unfocused window must not show a blinking caret: it would claim
         // keystrokes land here when they do not.
-        // No caret while a turn runs: it would sit on top of the activity
-        // line, and typing is not what the field is showing right now.
-        if model.focused && model.caret.visible() && !(model.busy && model.editor.is_empty()) {
+        if model.focused && model.caret.visible() {
             let bar = input.caret_rect(model.editor.cursor(), layout::CARET_WIDTH);
             let top = (origin_y + bar.y0).max(clip_top);
             let bottom = (origin_y + bar.y1).min(clip_bottom);
@@ -1024,6 +1096,10 @@ pub fn build_scene(
             scale,
             std::time::Instant::now(),
         );
+    }
+
+    if revealing {
+        scene.pop_layer();
     }
 }
 

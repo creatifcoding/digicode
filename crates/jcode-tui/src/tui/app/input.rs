@@ -1,9 +1,9 @@
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
 use super::{
-    App, ContentBlock, DisplayMessage, Message, ProcessingStatus, Role, SendAction, SkillRegistry,
-    commands, ctrl_bracket_fallback_to_esc, is_context_limit_error,
-    is_request_payload_too_large_error, remote,
+    App, ContentBlock, DisplayMessage, Message, ProcessingStatus, Role, SendAction, commands,
+    ctrl_bracket_fallback_to_esc, is_context_limit_error, is_request_payload_too_large_error,
+    remote,
 };
 use crate::bus::{
     Bus, BusEvent, ClipboardPasteCompleted, ClipboardPasteContent, ClipboardPasteKind,
@@ -602,6 +602,7 @@ where
     true
 }
 
+pub(in crate::tui::app) mod newline;
 mod paste_guard;
 #[cfg(test)]
 pub(in crate::tui::app) use paste_guard::expire_for_test as paste_guard_expire_for_test;
@@ -1089,13 +1090,8 @@ pub(super) fn handle_text_input(app: &mut App, text: &str) -> bool {
     true
 }
 
-fn visible_prompt_history(app: &App) -> Vec<String> {
-    app.display_messages
-        .iter()
-        .filter(|message| message.role == "user")
-        .map(|message| message.content.trim().to_string())
-        .filter(|content| !content.is_empty())
-        .collect()
+fn visible_prompt_history(app: &mut App) -> Vec<String> {
+    app.merged_prompt_history()
 }
 
 fn byte_offset_for_line_column(
@@ -1340,6 +1336,7 @@ pub(super) fn retrieve_pending_message_for_edit(app: &mut App) -> bool {
     if let Some(msg) = app.interleave_message.take()
         && !msg.is_empty()
     {
+        app.pending_images.append(&mut app.interleave_images);
         parts.push(msg);
         had_pending = true;
     }
@@ -1383,10 +1380,6 @@ pub(super) fn send_action(app: &App, alternate_shortcut: bool) -> SendAction {
     } else {
         SendAction::Interleave
     }
-}
-
-pub(super) fn handle_shift_enter(app: &mut App) {
-    insert_input_text(app, "\n");
 }
 
 impl App {
@@ -1477,7 +1470,7 @@ impl App {
         let _ = crate::todo::clear_gate_observations(&session_id);
         let Some(digest) = digest else {
             crate::logging::info(&format!(
-                "TODO_GATE_DIGEST action=skip reason=all_resolved observations={}",
+                "TODO_GATE_DIGEST action=skip reason=nothing_to_report observations={}",
                 observations.len()
             ));
             return false;
@@ -1519,9 +1512,10 @@ impl App {
                 return false;
             }
             // Deferred quality checks land here, once, instead of interrupting
-            // every todo write during the turn. Points whose scores rose while
-            // the agent worked are filtered out, so this stays silent in the
-            // common case where exploration resolved them on its own.
+            // every todo write during the turn. Every point recorded during the
+            // turn is raised, including ones whose score later climbed: work
+            // done while the score was low never benefited from the assessment
+            // that arrived after it.
             if self.deliver_deferred_gate_digest_if_needed() {
                 return true;
             }
@@ -1742,7 +1736,7 @@ pub(super) fn handle_alternate_enter(app: &mut App) {
         SendAction::Queue => queue_message(app),
         SendAction::Interleave => {
             let prepared = take_prepared_input(app);
-            stage_local_interleave(app, prepared.expanded);
+            stage_local_interleave(app, prepared.expanded, prepared.images);
         }
     }
 }
@@ -2338,6 +2332,11 @@ pub(super) fn handle_modal_key(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> Result<bool> {
+    if app.prompt_history_search.is_some() {
+        app.handle_prompt_history_search_key(code, modifiers);
+        return Ok(true);
+    }
+
     if app.changelog_scroll.is_some() {
         app.handle_changelog_key(code)?;
         return Ok(true);
@@ -2423,6 +2422,7 @@ pub(super) fn handle_global_control_shortcuts(
             if app.is_processing {
                 app.cancel_requested = true;
                 app.interleave_message = None;
+                app.interleave_images.clear();
                 app.pending_soft_interrupts.clear();
                 app.pending_soft_interrupt_requests.clear();
                 if app.cancel_overnight_for_interrupt() {
@@ -2436,14 +2436,20 @@ pub(super) fn handle_global_control_shortcuts(
             true
         }
         KeyCode::Char('r') => {
-            app.recover_session_without_tools();
+            app.open_prompt_history_search();
             true
         }
         KeyCode::Char('a') if app.input.is_empty() => {
             app.copy_chat_viewport_context_to_clipboard();
             true
         }
-        KeyCode::Char('l') => true,
+        // Ctrl+L: terminal-style view clear (context kept). Only reachable
+        // when no side pane claimed 'l' for focus (handle_diagram_ctrl_key
+        // runs first and wins while a diagram or diff pane is available).
+        KeyCode::Char('l') => {
+            app.clear_view_keep_context();
+            true
+        }
         _ => handle_control_key(app, code),
     }
 }
@@ -2462,7 +2468,7 @@ pub(super) fn handle_enter(app: &mut App) -> bool {
             SendAction::Queue => queue_message(app),
             SendAction::Interleave => {
                 let prepared = take_prepared_input(app);
-                stage_local_interleave(app, prepared.expanded);
+                stage_local_interleave(app, prepared.expanded, prepared.images);
             }
         }
     }
@@ -2552,6 +2558,7 @@ pub(super) fn handle_basic_key(app: &mut App, code: KeyCode) -> bool {
                         .any(|message| super::commands::is_poke_message(message));
                 app.cancel_requested = true;
                 app.interleave_message = None;
+                app.interleave_images.clear();
                 app.pending_soft_interrupts.clear();
                 app.pending_soft_interrupt_requests.clear();
                 let cancelled_overnight = app.cancel_overnight_for_interrupt();
@@ -2579,6 +2586,7 @@ pub(super) fn handle_basic_key(app: &mut App, code: KeyCode) -> bool {
 
 pub(super) fn take_prepared_input(app: &mut App) -> PreparedInput {
     let raw_input = std::mem::take(&mut app.input);
+    app.record_prompt_history(&raw_input);
     let expanded = expand_paste_placeholders(app, &raw_input);
     app.pasted_contents.clear();
     let images = std::mem::take(&mut app.pending_images);
@@ -2591,8 +2599,13 @@ pub(super) fn take_prepared_input(app: &mut App) -> PreparedInput {
     }
 }
 
-pub(super) fn stage_local_interleave(app: &mut App, content: String) {
+pub(super) fn stage_local_interleave(
+    app: &mut App,
+    content: String,
+    images: Vec<(String, String)>,
+) {
     app.interleave_message = Some(content);
+    app.interleave_images = images;
     app.set_status_notice("⏭ Sending now (interleave)");
 }
 
@@ -2790,9 +2803,9 @@ impl App {
             return Ok(());
         }
 
-        // Shift+Enter and Alt/Option+Enter insert a newline in the input box.
-        if code == KeyCode::Enter && modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) {
-            handle_shift_enter(self);
+        // Shift+Enter, Alt/Option+Enter, and the trailing-backslash fallback all
+        // insert a newline in the input box.
+        if newline::enter_inserts_newline(self, code, modifiers) {
             return Ok(());
         }
 
@@ -3050,9 +3063,10 @@ impl App {
     pub(super) async fn send_interleave_now(
         &mut self,
         content: String,
+        images: Vec<(String, String)>,
         remote: &mut crate::tui::backend::RemoteConnection,
     ) {
-        remote::send_interleave_now(self, content, remote).await;
+        remote::send_interleave_now(self, content, images, remote).await;
     }
 
     /// Retrieve all pending unsent messages into the input for editing.
@@ -3572,6 +3586,9 @@ impl App {
         }
 
         let raw_input = std::mem::take(&mut self.input);
+        // Persist to cross-session prompt history (no-op for slash/shell
+        // commands, secret-intercept inputs, and oversized pastes).
+        self.record_prompt_history(&raw_input);
         let mut input = self.expand_paste_placeholders(&raw_input);
         if let Some(notice) = input_exceeds_submit_limit(&input) {
             self.input = raw_input;
@@ -3646,19 +3663,19 @@ impl App {
             return;
         }
 
-        // A terminal file drop is user input even when its absolute path starts
-        // with `/`. Check the filesystem-aware drop parser before slash routing
-        // so a real file can never collide with a skill name.
+        // File drops remain ordinary input. Registry-aware resolution supports
+        // multi-word skill names without weakening that guard.
+        let initial_snapshot = self.current_skills_snapshot();
         let skill_invocation = parse_dropped_paths(&input)
             .is_none()
-            .then(|| SkillRegistry::parse_invocation(&input))
+            .then(|| initial_snapshot.resolve_invocation(&input))
             .flatten();
 
         // Check for skill invocation.
         if let Some(invocation) = skill_invocation {
             let skill_name = invocation.name.to_string();
             let trailing_prompt = invocation.prompt.map(str::to_string);
-            let mut skill = self.current_skills_snapshot().get(&skill_name).cloned();
+            let mut skill = initial_snapshot.get(&skill_name).cloned();
 
             // Remote/minimal TUI clients may start with an empty skill snapshot, and
             // daemon-side `skill_manage reload_all` can update a different process.

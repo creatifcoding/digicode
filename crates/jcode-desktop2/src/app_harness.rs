@@ -12,14 +12,45 @@ impl App {
         let Some((updates, _)) = self.harness.as_ref() else {
             return;
         };
+        // Whether a turn boundary went by in this batch. Queued messages are
+        // sent at the boundary, after the drain: the flush needs `&mut self`,
+        // which the loop's borrow of the update channel forbids.
+        let mut turn_ended = false;
         while let Ok(update) = updates.try_recv() {
             match update {
                 harness::HarnessUpdate::Status(status) => self.model.status = status,
+                // A failure goes into the conversation, not only the status
+                // line: the status line is suppressed once a session is
+                // attached, which is exactly when a failed turn happens, so a
+                // status-only report was invisible. The turn also ends, so the
+                // spinner stops claiming work.
+                harness::HarnessUpdate::Failed(message) => {
+                    self.model.status = message.clone();
+                    self.model.failure = Some(message.clone());
+                    self.model.transcript.push_notice(&message);
+                    self.model.busy = false;
+                    self.model.activity.finish();
+                    // The notice appears whole, so nothing is being revealed;
+                    // leaving a reveal in flight would fade the failure in
+                    // behind an animation that has nothing left to animate.
+                    self.model.stream.reveal_all();
+                    // A failure ends the turn as surely as `TurnDone` (the
+                    // daemon sends `error` *instead of* `done`), so a message
+                    // queued behind the failed turn gets its chance now
+                    // rather than waiting forever.
+                    turn_ended = true;
+                }
                 harness::HarnessUpdate::Attached {
                     session_id,
                     working_dir,
                 } => {
                     self.model.status = format!("attached: {session_id}");
+                    // A successful attach is the proof the failure is over: a
+                    // reconnected window must not keep reporting the outage it
+                    // just recovered from.
+                    self.model.failure = None;
+                    // A reconnect re-attaches the same session; the transcript
+                    // on screen is the one that was being read, so it stays.
                     self.model.strip.focus_session(&session_id);
                     self.model.session_id = Some(session_id);
                     self.model.working_dir = working_dir;
@@ -66,6 +97,25 @@ impl App {
                         std::time::Instant::now(),
                     );
                 }
+                harness::HarnessUpdate::Edit(card) => {
+                    // The one tool result that stays: an edit changed the
+                    // user's files, so the transcript keeps its intent and its
+                    // diff where the user can scroll back to them.
+                    self.model.transcript.push_edit(&card);
+                    self.model.stream.extend_to(
+                        self.model.transcript.streaming_len(),
+                        std::time::Instant::now(),
+                    );
+                }
+                harness::HarnessUpdate::MessageAccepted => {
+                    // The agent has the oldest message still in flight. Marking
+                    // it here rather than on the first token is the point of
+                    // the whole mechanism: "received" and "answered" are
+                    // different facts, and the user is owed the first one now.
+                    self.model
+                        .transcript
+                        .acknowledge_oldest_pending(std::time::Instant::now());
+                }
                 harness::HarnessUpdate::TurnDone => {
                     self.model.busy = false;
                     self.model.activity.finish();
@@ -73,6 +123,7 @@ impl App {
                     // there is none, and a card left behind would claim work
                     // is still happening.
                     self.model.transcript.clear_live_tool();
+                    turn_ended = true;
                 }
                 harness::HarnessUpdate::Peek {
                     session_id,
@@ -92,6 +143,13 @@ impl App {
                 }
             }
         }
+        // The turn is over and the channel is drained: if the user typed
+        // while the agent was busy, the oldest waiting message goes now. Its
+        // card leaves the queued tone, and the send is exactly the one the
+        // submit would have made had the agent been free.
+        if turn_ended && !self.model.busy {
+            self.flush_queued_message();
+        }
     }
 
     /// Switch to whichever session the strip now points at.
@@ -107,7 +165,12 @@ impl App {
         if self.model.session_id.as_deref() == Some(target.as_str()) {
             return;
         }
+        // Switching sessions changes the conversation, not the user's view
+        // preferences: the thinking-display mode is carried across so a new
+        // session does not silently revert to the structural default.
+        let reasoning = self.model.transcript.reasoning_mode();
         self.model.transcript = transcript::Transcript::default();
+        self.model.transcript.set_reasoning_mode(reasoning);
         self.model.stream.reveal_all();
         self.model.busy = false;
         self.model.activity.finish();

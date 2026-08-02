@@ -81,6 +81,16 @@ fn the_benched_gesture_never_opens() {
 
 /// Press Super, which opens the field at once, and return the clock it opened
 /// at so a test can keep advancing from there.
+/// Let Super back up, then let the debounce window expire.
+///
+/// The window itself is the fix for keyd-style remappers, which lift Super
+/// around any key they rewrite; every test that releases Super goes through
+/// here so none of them can accidentally assert on the pre-debounce state.
+fn release_super(app: &mut App, at: Instant) {
+    app.on_super_changed(false, at);
+    app.settle_super_release(at + crate::SUPER_BOUNCE);
+}
+
 fn hold_super(app: &mut App) -> Instant {
     let start = Instant::now();
     app.on_super_changed(true, start);
@@ -132,7 +142,7 @@ fn a_brief_tap_of_super_changes_nothing() {
     let mut app = app();
     let start = Instant::now();
     app.on_super_changed(true, start);
-    app.on_super_changed(false, start + SUPER_TAP / 2);
+    release_super(&mut app, start + SUPER_TAP / 2);
     assert!(!app.model.overview.is_visible(), "a tap left the field up");
     assert_eq!(
         app.model.session_id.as_deref(),
@@ -158,7 +168,7 @@ fn a_super_chord_cancels_the_pending_overview() {
         "an editing chord left the overview up"
     );
     // The release that follows must not commit either.
-    app.on_super_changed(false, start + SUPER_TAP * 2);
+    release_super(&mut app, start + SUPER_TAP * 2);
     assert_eq!(
         app.model.session_id.as_deref(),
         Some("session_mushroom_2_b"),
@@ -188,7 +198,7 @@ fn releasing_super_attaches_to_the_highlighted_session() {
         .clone();
     app.model.overview.set_focus(&target);
 
-    app.on_super_changed(false, Instant::now());
+    release_super(&mut app, Instant::now());
     assert_eq!(
         app.model.session_id.as_deref(),
         Some(target.as_str()),
@@ -209,7 +219,7 @@ fn escape_leaves_the_session_alone() {
     app.model.overview.set_focus("session_harbor_4_d");
     press_overview(&mut app, Key::Named(NamedKey::Escape));
     assert!(!app.model.overview.is_open());
-    app.on_super_changed(false, Instant::now() + SUPER_TAP * 2);
+    release_super(&mut app, Instant::now() + SUPER_TAP * 2);
     assert_eq!(
         app.model.session_id.as_deref(),
         Some("session_mushroom_2_b"),
@@ -415,9 +425,201 @@ fn committing_to_the_current_session_keeps_the_transcript() {
         .push(crate::transcript::Message::user("keep me"));
     let opened = hold_super(&mut app);
     settle(&mut app, opened);
-    app.on_super_changed(false, Instant::now());
+    release_super(&mut app, Instant::now());
     assert!(
         !app.model.transcript.is_empty(),
         "a no-op switch wiped the conversation"
+    );
+}
+
+/// The whole gesture through the window's own dispatch: hold Super, press one
+/// of hjkl, release. The previous tests reach into `overview_keydown` and
+/// `apply` directly, so a regression in `key_pressed` (the arm the compositor
+/// actually calls) could not fail any of them.
+#[test]
+fn the_full_super_hjkl_gesture_switches_session_through_key_pressed() {
+    for letter in ["h", "l", "k", "j"] {
+        let mut app = app();
+        app.modifiers = winit::keyboard::ModifiersState::SUPER;
+        let opened = hold_super(&mut app);
+        settle(&mut app, opened);
+        assert!(
+            app.model.overview.is_open(),
+            "{letter}: holding super did not open the field"
+        );
+        app.key_pressed(&Key::Character(SmolStr::new(letter)), Some(letter));
+        assert!(
+            app.model.overview.is_open(),
+            "{letter}: motion dismissed the field"
+        );
+        assert!(
+            app.model.editor.text().is_empty(),
+            "{letter}: the motion key was typed into the composer"
+        );
+        let target = app
+            .model
+            .overview
+            .focus()
+            .expect("the field always highlights something")
+            .to_string();
+        app.modifiers = winit::keyboard::ModifiersState::empty();
+        release_super(&mut app, opened + SUPER_TAP * 4);
+        assert_eq!(
+            app.model.session_id.as_deref(),
+            Some(target.as_str()),
+            "{letter}: releasing super did not attach to the highlight"
+        );
+    }
+}
+
+/// At least one of the four directions has to leave the session you started
+/// in, or "super hjkl moves me" is false however green the wiring tests are.
+#[test]
+fn super_hjkl_reaches_other_sessions() {
+    let mut reached = std::collections::BTreeSet::new();
+    for letter in ["h", "l", "k", "j"] {
+        let mut app = app();
+        app.modifiers = winit::keyboard::ModifiersState::SUPER;
+        let opened = hold_super(&mut app);
+        settle(&mut app, opened);
+        app.key_pressed(&Key::Character(SmolStr::new(letter)), Some(letter));
+        app.modifiers = winit::keyboard::ModifiersState::empty();
+        release_super(&mut app, opened + SUPER_TAP * 4);
+        if app.model.session_id.as_deref() != Some("session_mushroom_2_b") {
+            reached.insert(app.model.session_id.clone().unwrap_or_default());
+        }
+    }
+    assert!(
+        reached.len() >= 2,
+        "super+hjkl only reached {reached:?} from the starting session"
+    );
+}
+
+/// Everything in one project is the common case in this repo, and it used to
+/// make j/k dead: `neighbor` refuses to leave the row. A motion key whose axis
+/// could never work reads as a broken binding, so a dead axis falls back to
+/// the reading-order step. But the *edge* of a live axis is a wall: h at the
+/// start of the row stays put rather than wrapping to the far end.
+#[test]
+fn dead_axes_move_but_live_edges_clamp() {
+    let entries = || {
+        (0..4)
+            .map(|i| Entry {
+                session_id: format!("session_{i}"),
+                working_dir: Some("/home/j/jcode".into()),
+                busy: false,
+                weight: 1_000.0 * f64::from(i + 1),
+            })
+            .collect::<Vec<_>>()
+    };
+    // Up and down could never move in a single-row field, so they cycle.
+    for dir in [crate::overview::Dir::Up, crate::overview::Dir::Down] {
+        let mut app = App::default();
+        app.model.session_id = Some("session_0".into());
+        app.model.strip = Strip::build(entries(), Some("session_0"));
+        let opened = hold_super(&mut app);
+        settle(&mut app, opened);
+        app.move_overview(dir);
+        assert_ne!(
+            app.model.overview.focus(),
+            Some("session_0"),
+            "{dir:?} went nowhere in a single-row field"
+        );
+    }
+    // Left at the start of the row is an edge of a live axis: it clamps
+    // instead of wrapping to the far end.
+    let mut app = App::default();
+    app.model.session_id = Some("session_0".into());
+    app.model.strip = Strip::build(entries(), Some("session_0"));
+    let opened = hold_super(&mut app);
+    settle(&mut app, opened);
+    app.move_overview(crate::overview::Dir::Left);
+    assert_eq!(
+        app.model.overview.focus(),
+        Some("session_0"),
+        "left at the row's start wrapped around"
+    );
+    // While right, with room to move, moves.
+    app.move_overview(crate::overview::Dir::Right);
+    assert_eq!(
+        app.model.overview.focus(),
+        Some("session_1"),
+        "right did not walk the row"
+    );
+}
+
+/// keyd (`[meta] h = left`) and every other Super+hjkl remapper rewrites the
+/// chord by *lifting* Super, sending the arrow, and pressing Super again. Acted
+/// on literally that committed and reopened the field on every motion key,
+/// which is the flicker that made held-Super navigation look broken: the
+/// highlight never got to move, because each keystroke restarted the gesture
+/// from the attached session.
+///
+/// So a release followed immediately by a press must leave the gesture running,
+/// with the highlight it had accumulated.
+#[test]
+fn a_remappers_super_bounce_does_not_restart_the_gesture() {
+    let mut app = app();
+    app.modifiers = winit::keyboard::ModifiersState::SUPER;
+    let opened = hold_super(&mut app);
+    settle(&mut app, opened);
+    let start = app.model.overview.focus().unwrap_or_default().to_string();
+
+    let mut clock = opened + SUPER_TAP * 4;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..3 {
+        // Exactly what the remapper emits: Super up, the rewritten key, Super
+        // back down, all inside one input batch.
+        app.modifiers = winit::keyboard::ModifiersState::empty();
+        app.on_super_changed(false, clock);
+        app.key_pressed(&Key::Named(NamedKey::ArrowRight), None);
+        app.modifiers = winit::keyboard::ModifiersState::SUPER;
+        clock += Duration::from_millis(1);
+        app.on_super_changed(true, clock);
+        app.settle_super_release(clock);
+        assert!(
+            app.model.overview.is_open(),
+            "a remapper's super bounce closed the field"
+        );
+        assert_eq!(
+            app.model.session_id.as_deref(),
+            Some(start.as_str()),
+            "a remapper's super bounce committed mid-gesture"
+        );
+        seen.insert(app.model.overview.focus().unwrap_or_default().to_string());
+        clock += Duration::from_millis(120);
+    }
+    assert!(
+        seen.len() > 1 || seen.iter().next().map(String::as_str) != Some(start.as_str()),
+        "the highlight never left {start} across three remapped presses"
+    );
+
+    // A real release still commits, one debounce window later.
+    let target = app.model.overview.focus().unwrap_or_default().to_string();
+    app.modifiers = winit::keyboard::ModifiersState::empty();
+    release_super(&mut app, clock);
+    assert_eq!(
+        app.model.session_id.as_deref(),
+        Some(target.as_str()),
+        "the real release after a bounce did not attach"
+    );
+}
+
+/// The debounce must resolve on the app's own frame clock: a user who lets go
+/// of Super with nothing else animating gets no further input events, so a
+/// release that only resolves on the next event would hang the field open.
+#[test]
+fn a_pending_super_release_asks_for_a_frame_to_resolve_on() {
+    let mut app = app();
+    let opened = hold_super(&mut app);
+    settle(&mut app, opened);
+    let at = opened + SUPER_TAP * 4;
+    app.on_super_changed(false, at);
+    let deadline = app
+        .animation_deadline(at)
+        .expect("a pending release must schedule its own wake");
+    assert!(
+        deadline <= at + crate::SUPER_BOUNCE,
+        "the pending release scheduled no wake inside the debounce window"
     );
 }

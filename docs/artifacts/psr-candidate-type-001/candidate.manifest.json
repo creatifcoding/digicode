@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "1.0.0",
+  "candidate": {
+    "type": "001",
+    "meaning": "first candidate instance",
+    "templateKey": "psr",
+    "artifactKey": "psr-candidate-type-001"
+  },
+  "owningApi": "MetaTool mt evaluate",
+  "admission": {
+    "requestFile": "mt-admission.request.json",
+    "receiptRequired": true,
+    "executionClaim": "blocked until observed mt result exists"
+  },
+  "checks": [
+    {
+      "description": "Packet files exist and JSON manifests parse.",
+      "tier": "observed",
+      "status": "ready"
+    },
+    {
+      "description": "Reusable template key is psr while Candidate Type 001 means first candidate instance.",
+      "tier": "observed",
+      "status": "ready"
+    },
+    {
+      "description": "MetaTool admission request file is present and machine-readable.",
+      "tier": "observed",
+      "status": "ready"
+    },
+    {
+      "description": "Admission has executed through mt and returned a receipt/result.",
+      "tier": "blocked",
+      "status": "blocked",
+      "requires": "supported non-interactive mt evaluate CLI path or manual tool execution"
+    }
+  ],
+  "commands": {
+    "compatibilityAdmissionDryRun": "./scripts/seed_psr_artifact.sh --dry-run",
+    "writeRequest": "./scripts/seed_psr_artifact.sh --write-request",
+    "attemptAdmission": "./scripts/seed_psr_artifact.sh --admit"
+  },
+  "relatedFiles": [
+    "psr.md",
+    "artifact.manifest.json",
+    "candidate.manifest.json",
+    "revisions.md",
+    "rendered.html",
+    "mt-admission.request.json",
+    "scripts/seed_psr_artifact.sh"
+  ]
+}

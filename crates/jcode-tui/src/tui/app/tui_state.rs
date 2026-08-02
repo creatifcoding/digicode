@@ -765,6 +765,10 @@ impl crate::tui::TuiState for App {
         self.command_suggestion_selected
     }
 
+    fn prompt_history_search(&self) -> Option<crate::tui::PromptHistorySearchView> {
+        self.prompt_history_search_view()
+    }
+
     fn active_skill(&self) -> Option<String> {
         self.active_skill.clone()
     }
@@ -794,6 +798,10 @@ impl crate::tui::TuiState for App {
 
     fn client_focused(&self) -> bool {
         App::client_focused(self)
+    }
+
+    fn time_since_user_interaction(&self) -> Option<std::time::Duration> {
+        self.last_user_interaction.map(|at| at.elapsed())
     }
 
     fn stream_message_ended(&self) -> bool {

@@ -6,7 +6,7 @@
 //! they read as a unit, while interleaved with window and harness plumbing
 //! they read as neither. The drawing half lives in `crate::scene_overview`.
 
-use crate::{App, OVERVIEW_FRAME, SUPER_TAP, harness, keymap, overview};
+use crate::{App, OVERVIEW_FRAME, SUPER_BOUNCE, SUPER_TAP, harness, keymap, overview};
 
 impl App {
     /// Lay out the blob field for the current model.
@@ -97,7 +97,22 @@ impl App {
             self.model.overview.set_focus(&id);
             self.request_peek();
             self.request_redraw();
+            return;
         }
+        // Nothing that way. If the axis could never move here (one project
+        // row makes j/k dead, a row of one makes h/l dead), a motion key that
+        // does nothing reads as broken, so fall back to the reading-order
+        // step in the same sense. But an *edge* of a live axis is a wall the
+        // highlight should stop at: wrapping there made the key look like a
+        // teleport, so stay put instead.
+        if !field.axis_is_dead(&from, dir) {
+            return;
+        }
+        let step = match dir {
+            overview::Dir::Left | overview::Dir::Up => -1,
+            overview::Dir::Right | overview::Dir::Down => 1,
+        };
+        self.cycle_overview(step);
     }
 
     /// Step the highlight through the field in reading order.
@@ -136,6 +151,12 @@ impl App {
             return;
         }
         if down {
+            // A press inside the bounce window is a remapper's re-press around
+            // a key it rewrote, not the user starting a new gesture: drop the
+            // pending release and carry on with the gesture already running.
+            if self.pending_super_release.take().is_some() {
+                return;
+            }
             if self.super_held_since.is_none() && !self.model.overview.is_open() {
                 self.super_held_since = Some(now);
                 self.open_overview();
@@ -145,10 +166,33 @@ impl App {
         let tap = self
             .super_held_since
             .is_some_and(|since| now.duration_since(since) < SUPER_TAP);
-        self.super_held_since = None;
         if !self.model.overview.is_open() {
             // Enter or Escape already resolved the gesture while Super was
             // still down; the release must not commit a second time.
+            self.super_held_since = None;
+            return;
+        }
+        // Do not resolve yet: a remapper may be about to press Super straight
+        // back down. [`Self::settle_super_release`] finishes the job once the
+        // bounce window has passed with no re-press.
+        self.pending_super_release = Some((now, tap));
+    }
+
+    /// Resolve a Super release that has survived the bounce window.
+    ///
+    /// Called from the frame rather than from a timer thread for the same
+    /// reason the zoom is: one clock drives everything on screen, and a window
+    /// that is not drawing is not silently switching sessions either.
+    pub(crate) fn settle_super_release(&mut self, now: std::time::Instant) {
+        let Some((at, tap)) = self.pending_super_release else {
+            return;
+        };
+        if now.duration_since(at) < SUPER_BOUNCE {
+            return;
+        }
+        self.pending_super_release = None;
+        self.super_held_since = None;
+        if !self.model.overview.is_open() {
             return;
         }
         if tap && self.model.overview.focus() == self.model.session_id.as_deref() {
@@ -190,6 +234,12 @@ impl App {
         };
         if let Some(action) = action {
             let keep = self.apply(action, None);
+            if std::env::var_os("JCODE_DESKTOP2_LOG_INPUT").is_some() {
+                eprintln!(
+                    "[input] overview {action:?} -> focus {:?}",
+                    self.model.overview.focus()
+                );
+            }
             self.request_redraw();
             return keep;
         }
@@ -198,11 +248,39 @@ impl App {
         // blobs washing over the composer after the user has moved on reads
         // as lag, not as an animation.
         self.super_held_since = None;
+        self.pending_super_release = None;
         self.model.overview.abort();
         let keep = match keymap::resolve(logical_key, self.modifiers) {
             Some(action) => self.apply(action, typed),
             None => true,
         };
+        self.request_redraw();
+        keep
+    }
+
+    /// A key went down: the whole keyboard path, field or not.
+    ///
+    /// Extracted from the window arm so a headless script can drive exactly
+    /// what the compositor drives. The overview gesture is the one part of
+    /// this app whose bugs live entirely in dispatch order, and synthetic
+    /// compositor input is too flaky to be the only way to check it.
+    pub(crate) fn key_pressed(
+        &mut self,
+        logical_key: &winit::keyboard::Key,
+        typed: Option<&str>,
+    ) -> bool {
+        if self.model.overview.is_open() {
+            return self.overview_keydown(logical_key, typed);
+        }
+        // A key landing while the field is still zooming out erases it in the
+        // same frame: the user is typing, not gesturing.
+        self.super_held_since = None;
+        self.pending_super_release = None;
+        if self.model.overview.is_visible() {
+            self.model.overview.abort();
+        }
+        let action = keymap::resolve(logical_key, self.modifiers).unwrap_or(keymap::Action::Insert);
+        let keep = self.apply(action, typed);
         self.request_redraw();
         keep
     }
