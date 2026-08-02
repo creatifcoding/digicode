@@ -121,6 +121,63 @@ pub(crate) fn draw_spinner(
     }
 }
 
+/// A background task's progress bar: a faint track with a bright fill.
+///
+/// Two modes, because a task either knows how far along it is or does not, and
+/// pretending otherwise is the one thing a progress indicator must not do. A
+/// reported percentage fills the track from the left; a task that can only say
+/// "still working" gets a segment that sweeps across it, so the bar stays
+/// honest about what is known while still proving the wait is alive.
+pub(crate) fn draw_progress_bar(
+    scene: &mut Scene,
+    track: Rect,
+    fraction: Option<f64>,
+    theme: &crate::theme::Theme,
+    scale: f64,
+    elapsed: std::time::Duration,
+) {
+    let radius = crate::transcript::PROGRESS_BAR_RADIUS;
+    scene.fill(
+        vello::peniko::Fill::NonZero,
+        Affine::scale(scale),
+        theme.wash,
+        None,
+        &RoundedRect::from_rect(track, radius),
+    );
+    let width = track.width().max(0.0);
+    if width <= 0.0 {
+        return;
+    }
+    let (start, end) = match fraction {
+        Some(fraction) => (0.0, width * fraction.clamp(0.0, 1.0)),
+        None => {
+            let sweep = crate::transcript::PROGRESS_SWEEP_FRACTION * width;
+            let period = crate::transcript::PROGRESS_SWEEP_PERIOD.as_secs_f64();
+            // A bounce rather than a wrap: the segment eases from one end of
+            // the track to the other and back, so it is fully visible at every
+            // phase (including zero, which is what a still capture draws) and
+            // never pops out of existence at the edges.
+            let phase = (elapsed.as_secs_f64() % period) / period;
+            let travel = (1.0 - (std::f64::consts::TAU * phase).cos()) / 2.0;
+            let start = travel * (width - sweep).max(0.0);
+            (start, (start + sweep).min(width))
+        }
+    };
+    if end <= start {
+        return;
+    }
+    scene.fill(
+        vello::peniko::Fill::NonZero,
+        Affine::scale(scale),
+        theme.muted,
+        None,
+        &RoundedRect::from_rect(
+            Rect::new(track.x0 + start, track.y0, track.x0 + end, track.y1),
+            radius,
+        ),
+    );
+}
+
 /// `grow` scales the whole halftone screen about the box's centre, which is how
 /// the boot reveal brings the donut in: scaling the *box* instead would keep the
 /// fixed dot pitch and simply show fewer dots, i.e. a coarsening blob rather
@@ -327,6 +384,117 @@ fn draw_strip(
 /// The tagline under the donut, matching the website's hero copy.
 const HERO_TAGLINE: &str = "an open source coding agent, written in rust";
 
+/// Draw the settings gear in the top margin's trailing corner.
+///
+/// A drawn gear rather than a glyph: the app ships no icon font, and a "⚙"
+/// from whatever the system happens to have installed renders at a different
+/// weight and baseline on every machine. Six teeth around a ring, built as one
+/// path so it is a single fill, in the same faint ink as the other chrome so
+/// it waits to be looked for rather than competing with the conversation.
+fn draw_gear(scene: &mut Scene, box_: Rect, ink: Color, scale: f64) {
+    let cx = box_.x0 + box_.width() / 2.0;
+    let cy = box_.y0 + box_.height() / 2.0;
+    let side = box_.width().min(box_.height());
+    let radius = side * layout::GEAR_RADIUS;
+    // Teeth first, as stubby spokes poking out of the ring: drawn as strokes
+    // rather than as a star polygon, so the tooth width stays legible at 18
+    // logical pixels instead of collapsing into the ring's own thickness.
+    let tooth = vello::kurbo::Stroke::new(side * 0.11);
+    for index in 0..layout::GEAR_TEETH {
+        let angle = std::f64::consts::TAU * index as f64 / layout::GEAR_TEETH as f64;
+        let (sin, cos) = angle.sin_cos();
+        let mut spoke = BezPath::new();
+        spoke.move_to((cx + cos * radius * 0.75, cy + sin * radius * 0.75));
+        spoke.line_to((cx + cos * radius * 1.55, cy + sin * radius * 1.55));
+        scene.stroke(&tooth, Affine::scale(scale), ink, None, &spoke);
+    }
+    // The ring, with a hole: the hub is what makes the mark read as a gear
+    // rather than as a sun.
+    scene.stroke(
+        &vello::kurbo::Stroke::new(side * 0.14),
+        Affine::scale(scale),
+        ink,
+        None,
+        &Circle::new((cx, cy), radius),
+    );
+}
+
+/// Draw the settings panel the gear opens: one row per setting, each a label
+/// on the left and its current value on the right.
+///
+/// Values rather than checkboxes or switches, because every setting here has
+/// more than two states and a row that says `theme   dark` answers "what is it
+/// now" and "what will clicking do" in the same three words.
+fn draw_settings_panel(
+    scene: &mut Scene,
+    text: &mut text::TextSystem,
+    model: &Model,
+    frame: &layout::Frame,
+    scale: f64,
+) {
+    let theme = &model.theme;
+    let rows = crate::settings::ROWS;
+    let panel = frame.panel(rows.len());
+    scene.fill(
+        vello::peniko::Fill::NonZero,
+        Affine::scale(scale),
+        theme.field,
+        None,
+        &RoundedRect::from_rect(panel, layout::PANEL_RADIUS),
+    );
+    scene.stroke(
+        &vello::kurbo::Stroke::new(layout::COMPOSER_BORDER),
+        Affine::scale(scale),
+        theme.field_border,
+        None,
+        &RoundedRect::from_rect(panel, layout::PANEL_RADIUS),
+    );
+    for (index, row) in rows.iter().enumerate() {
+        let band = frame.panel_row(rows.len(), index);
+        if model.panel.hover() == Some(index) {
+            scene.fill(
+                vello::peniko::Fill::NonZero,
+                Affine::scale(scale),
+                theme.wash,
+                None,
+                &RoundedRect::from_rect(band, layout::PANEL_RADIUS / 2.0),
+            );
+        }
+        // Both captions sit on one baseline inside the row, so the label and
+        // its value read as one sentence rather than as two columns.
+        let baseline = band.y0 + (band.height() - f64::from(layout::CAPTION_SIZE) * 1.4) / 2.0;
+        let width = (band.width() - layout::PANEL_TEXT_PAD * 2.0).max(1.0) as f32;
+        let left = band.x0 + layout::PANEL_TEXT_PAD;
+        text.draw_paragraph_scaled(
+            scene,
+            row.label(),
+            (left, baseline),
+            width,
+            ParagraphStyle {
+                font_size: layout::CAPTION_SIZE,
+                color: theme.muted,
+                letter_spacing_em: 0.1,
+                ..Default::default()
+            },
+            scale,
+        );
+        text.draw_paragraph_scaled(
+            scene,
+            model.settings.value(*row),
+            (left, baseline),
+            width,
+            ParagraphStyle {
+                font_size: layout::CAPTION_SIZE,
+                color: theme.text,
+                letter_spacing_em: 0.1,
+                align: text::Align::End,
+                ..Default::default()
+            },
+            scale,
+        );
+    }
+}
+
 /// Body paragraph style for transcript prose. One definition, so measuring in
 /// [`crate::viewport`] and drawing here can never disagree.
 pub fn transcript_body_style(model: &Model) -> ParagraphStyle {
@@ -456,8 +624,10 @@ fn draw_transcript(
     let streaming_index = laid
         .iter()
         .rposition(|message| {
-            !matches!(message.role, Role::Tool | Role::Notice | Role::Edit)
-                && message.delivery != Some(crate::ack::Delivery::Queued)
+            !matches!(
+                message.role,
+                Role::Tool | Role::Notice | Role::Edit | Role::Progress
+            ) && message.delivery != Some(crate::ack::Delivery::Queued)
         })
         .filter(|_| model.stream.is_revealing())
         .filter(|index| laid[*index].role != Role::User);
@@ -574,25 +744,56 @@ fn draw_transcript(
             }
         }
 
-        // An edit card: the change itself, kept in the transcript. Marked by a
-        // rule down its left edge rather than a wash, because the diff's own
-        // code block already carries one and a card inside a card reads as two
-        // nested quotes. The rule is body ink: the edit is something that
-        // happened to the user's files, not an aside.
-        if placed.message.role == Role::Edit {
+        // A background task's progress card: the same wash as the live tool
+        // card (both are live status, not conversation) with a bar under its
+        // label. The bar is drawn rather than written as text because a
+        // fraction the eye reads at a glance is the whole point of waiting on
+        // a long task, and `50% · linking` on its own is a sentence to parse.
+        if placed.message.role == Role::Progress {
             scene.fill(
                 vello::peniko::Fill::NonZero,
                 Affine::scale(scale),
-                theme.rule,
+                theme.wash,
                 None,
-                &Rect::new(
-                    frame.left + USER_PAD_X,
+                &RoundedRect::new(
+                    frame.left,
                     message_top,
-                    frame.left + USER_PAD_X + frame.hairline() * 2.0,
+                    frame.right,
                     message_top + placed.message.height,
+                    USER_RADIUS,
                 ),
             );
+            let bar_top = message_top + placed.message.height
+                - crate::transcript::TOOL_PAD_Y
+                - crate::transcript::PROGRESS_BAR_HEIGHT;
+            draw_progress_bar(
+                scene,
+                Rect::new(
+                    // Aligned with the card's label, which is indented by
+                    // `TOOL_INSET`: a bar starting left of the text it belongs
+                    // to reads as furniture rather than as that task's readout.
+                    text_left + crate::transcript::TOOL_INSET,
+                    bar_top,
+                    frame.right - USER_PAD_X,
+                    bar_top + crate::transcript::PROGRESS_BAR_HEIGHT,
+                ),
+                placed.message.fraction(),
+                theme,
+                scale,
+                // The cards' shared clock drives the indeterminate sweep, so
+                // every bar sweeps in step and a still capture (no clock) draws
+                // the segment at its start rather than at a random phase.
+                model
+                    .progress_clock
+                    .map(|started| now.saturating_duration_since(started))
+                    .unwrap_or_default(),
+            );
         }
+
+        // An edit card carries no furniture down its left edge. The diff body
+        // is already the loudest object on the page (a wash, per-row bands,
+        // and hue), and a rule beside it only narrowed the measure while
+        // saying a second time what the colour had already said.
 
         // A failure notice: a rule down its left edge, no wash. A washed card
         // is the user's own message in this theme, and dressing an error as
@@ -628,6 +829,10 @@ fn draw_transcript(
 
         for (block_index, block) in placed.message.blocks.iter().enumerate() {
             let block_top = text_top + block.top;
+            // The block's own left edge: inside any list indent it inherited,
+            // so a fenced block written under an item keeps its wash under that
+            // item instead of back at the margin.
+            let block_left = text_left + block.edge();
             match &block.kind {
                 // A code block gets a wash and an inset, so it reads as a
                 // quoted artefact rather than as more prose.
@@ -638,7 +843,7 @@ fn draw_transcript(
                         theme.wash,
                         None,
                         &RoundedRect::new(
-                            text_left,
+                            block_left,
                             block_top,
                             frame.right - USER_PAD_X,
                             block_top + block.height,
@@ -655,9 +860,9 @@ fn draw_transcript(
                         theme.rule,
                         None,
                         &Rect::new(
-                            text_left,
+                            block_left,
                             block_top,
-                            text_left + frame.hairline() * 2.0,
+                            block_left + frame.hairline() * 2.0,
                             block_top + block.height,
                         ),
                     );
@@ -669,7 +874,7 @@ fn draw_transcript(
                         theme.rule,
                         None,
                         &Rect::new(
-                            text_left,
+                            block_left,
                             block_top + block.height / 2.0,
                             frame.right - USER_PAD_X,
                             block_top + block.height / 2.0 + frame.hairline(),
@@ -705,6 +910,41 @@ fn draw_transcript(
                     ),
                 );
             }
+            // Diff row bands, under everything else in the block: they say
+            // which side a row is on across the card's full measure, so the
+            // shape of a change is visible before a single word is read. Drawn
+            // to the card's edges rather than to the text, or the band would
+            // be as ragged as the code and stop being a shape at all.
+            for band in &block.diff_bands {
+                let color = match (band.change, band.emphasis) {
+                    (crate::edits::Change::Added, false) => theme.added_wash,
+                    (crate::edits::Change::Removed, false) => theme.removed_wash,
+                    (crate::edits::Change::Added, true) => theme.added_mark,
+                    (crate::edits::Change::Removed, true) => theme.removed_mark,
+                };
+                // A row band spans the card; an emphasis band hugs the glyphs
+                // it marks, because *that* is the thing it is pointing at.
+                let (x0, x1) = if band.emphasis {
+                    (
+                        text_left + inset_x + band.rect.x0,
+                        text_left + inset_x + band.rect.x1,
+                    )
+                } else {
+                    (block_left, frame.right - USER_PAD_X)
+                };
+                scene.fill(
+                    vello::peniko::Fill::NonZero,
+                    Affine::scale(scale),
+                    color,
+                    None,
+                    &Rect::new(
+                        x0,
+                        block_top + inset_y + band.rect.y0,
+                        x1,
+                        block_top + inset_y + band.rect.y1,
+                    ),
+                );
+            }
             if let Some(selection) = model.selection.as_ref()
                 && let Some(range) =
                     selection.range_in(placed.index, block_index, block.source.len())
@@ -714,7 +954,7 @@ fn draw_transcript(
                     // need the stronger band: the paper-tuned one is nearly
                     // invisible against the card the user's own message is in.
                     let on_wash = is_user
-                        || placed.message.role == Role::Tool
+                        || matches!(placed.message.role, Role::Tool | Role::Progress)
                         || matches!(block.kind, BlockKind::CodeBlock { .. });
                     let band_color = if on_wash {
                         theme.selection_on_wash
@@ -859,6 +1099,20 @@ pub fn build_scene(
     if let Some(band) = frame.strip() {
         draw_strip(scene, model, band, &frame, scale);
     }
+
+    // The settings gear, in the margin above the column's trailing edge. Faint
+    // until the panel is open, when it takes full ink so the mark and the menu
+    // it opened read as one thing.
+    draw_gear(
+        scene,
+        frame.gear(),
+        if model.panel.is_open() {
+            theme.text
+        } else {
+            theme.faint
+        },
+        scale,
+    );
 
     // Composer: a real input field. Paper fill plus a hairline border, rather
     // than a grey slab: a filled block reads as disabled or as a code block,
@@ -1083,6 +1337,13 @@ pub fn build_scene(
             },
             scale,
         );
+    }
+
+    // The settings panel sits over the page, under the overview: it is a
+    // menu hanging off the gear, so it is drawn after the content it covers
+    // and before the mode that would replace the whole window.
+    if model.panel.is_open() {
+        draw_settings_panel(scene, text, model, &frame, scale);
     }
 
     // The session overview sits over everything: it is a mode, not a panel,

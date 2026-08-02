@@ -9,6 +9,7 @@ mod activity;
 mod app_harness;
 mod app_overview;
 mod app_selection;
+mod app_settings;
 mod boot;
 mod capture;
 mod caret;
@@ -37,10 +38,12 @@ mod scroll;
 mod scroll_bench;
 mod scroll_profile;
 mod select;
+mod settings;
 mod states;
 mod stream;
 mod stream_bench;
 mod strip;
+mod syntax;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -199,6 +202,13 @@ const SUPER_TAP: std::time::Duration = std::time::Duration::from_millis(180);
 /// still commits within a frame or two.
 const SUPER_BOUNCE: std::time::Duration = std::time::Duration::from_millis(90);
 
+/// Frame interval for an indeterminate progress bar's sweep. Well short of
+/// the display rate: the segment crosses the track over more than a second, so
+/// 40ms is smooth to the eye while costing a fraction of a display-paced
+/// animation, and it stays outside [`CONTINUOUS_FRAME`] so a window waiting on
+/// a build sleeps between wakes instead of chaining frames.
+const PROGRESS_FRAME: std::time::Duration = std::time::Duration::from_millis(40);
+
 /// Frame interval while the overview zooms (~60fps).
 const OVERVIEW_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
@@ -313,6 +323,18 @@ pub struct Model {
     /// the window. Default is *finished*, so captures and tests see the settled
     /// frame; the real window replaces it on the first paint.
     pub boot: boot::Boot,
+    /// When the first background-progress card appeared, or `None` when none
+    /// are on screen.
+    ///
+    /// One clock for all of them, so an indeterminate bar's sweep is a pure
+    /// function of the model (a pinned capture passes its own `now`) and so
+    /// several bars sweep in step rather than each starting its own phase.
+    pub progress_clock: Option<std::time::Instant>,
+    /// The user's settings, and the gear panel that edits them. In the model
+    /// rather than in `App` so a frame stays a pure function of the model and
+    /// every state of the panel is capturable.
+    pub settings: settings::Settings,
+    pub panel: settings::Panel,
     /// Live RAM readout for this window and the daemon, drawn on the trailing
     /// end of the top chrome row. `None` until the first sample, and always
     /// `None` in pinned captures, so frames stay deterministic.
@@ -343,9 +365,14 @@ impl ModelId {
 
 impl Default for Model {
     fn default() -> Self {
+        // One source of truth: the saved settings decide the palette, the
+        // thinking display, and whether the hero animates, so a fresh window
+        // opens the way the last one was left rather than the way the
+        // environment happened to be exported.
+        let settings = settings::Settings::load();
         Self {
-            theme: theme::Theme::from_env(),
-            theme_preference: theme::Theme::preference_from_env(),
+            theme: theme::Theme::for_mode(settings.theme, theme::system_prefers_dark()),
+            theme_preference: settings.theme,
             meta: meta::Meta::detect(),
             status: "starting...".into(),
             session_id: None,
@@ -354,7 +381,7 @@ impl Default for Model {
                 // once here rather than consulted per delta: a mid-turn config
                 // edit must not change what the transcript on screen means.
                 let mut transcript = transcript::Transcript::default();
-                transcript.set_reasoning_mode(reasoning::ReasoningMode::from_env());
+                transcript.set_reasoning_mode(settings.reasoning);
                 transcript
             },
             editor: editor::Editor::default(),
@@ -366,7 +393,7 @@ impl Default for Model {
             selection: None,
             notice: None,
             failure: None,
-            donut: (!donut_disabled()).then(|| donut::Donut::new(DONUT_GRID)),
+            donut: settings.motion.then(|| donut::Donut::new(DONUT_GRID)),
             spin: donut::Spin::default(),
             hint: hints::arbitrary_index(),
             stream: stream::Stream::default(),
@@ -377,6 +404,9 @@ impl Default for Model {
             working_dir: None,
             model: None,
             boot: boot::Boot::default(),
+            progress_clock: None,
+            settings,
+            panel: settings::Panel::default(),
             mem: None,
         }
     }
@@ -391,7 +421,7 @@ pub const DONUT_GRID: usize = 152;
 
 /// Escape hatch: `JCODE_DESKTOP2_DONUT=0` turns the animation off for users who
 /// do not want motion, and for benchmarking the rest of the frame.
-fn donut_disabled() -> bool {
+pub(crate) fn donut_disabled() -> bool {
     matches!(
         std::env::var("JCODE_DESKTOP2_DONUT").as_deref(),
         Ok("0") | Ok("off") | Ok("false")
@@ -685,6 +715,12 @@ impl App {
             }
             return;
         }
+        // The gear and its panel sit above the page, so they get first look
+        // at a press: a menu that the click behind it also acted on is a menu
+        // you cannot safely dismiss.
+        if self.settings_press(x, y) {
+            return;
+        }
         let hit = self.composer_offset_at(x, y);
         if std::env::var_os("JCODE_DESKTOP2_LOG_INPUT").is_some() {
             eprintln!(
@@ -756,6 +792,41 @@ impl App {
         self.geometry_saved = Some((now, self.geometry.sanitized()));
     }
 
+    /// The scale every logical coordinate in the app is resolved against: the
+    /// window's own DPI scaling times the user's zoom. One function, because
+    /// the renderer and pointer hit-testing must never disagree about how big
+    /// a logical pixel is.
+    fn effective_scale(&self) -> f64 {
+        let window = self
+            .state
+            .as_ref()
+            .map(|state| state.scale_factor())
+            .unwrap_or(1.0);
+        window * self.geometry.sanitized().zoom
+    }
+
+    /// Grow, shrink, or reset the UI zoom. Returns whether anything moved, so
+    /// the caller can say "already at the largest size" instead of silently
+    /// doing nothing.
+    fn set_zoom(&mut self, zoom: f64) -> bool {
+        let clamped = zoom.clamp(window_state::MIN_ZOOM, window_state::MAX_ZOOM);
+        if (clamped - self.geometry.zoom).abs() < f64::EPSILON {
+            return false;
+        }
+        self.geometry.zoom = clamped;
+        // A zoom change is a layout change for every cached message, and the
+        // cache keys off the measured geometry rather than off this number, so
+        // nothing here needs invalidating: the next frame measures at the new
+        // scale and misses the cache by itself.
+        //
+        // Only a real window persists: a headless test or capture driving the
+        // same action must not rewrite the user's saved window state.
+        if self.state.is_some() {
+            self.save_geometry(true);
+        }
+        true
+    }
+
     /// Whether a logical point is inside the composer well.
     fn in_composer(&self, x: f64, y: f64) -> bool {
         y >= self.frame.composer_top
@@ -800,7 +871,14 @@ impl App {
     /// the input box looks editable before it is clicked.
     fn update_cursor_icon(&mut self) {
         let (x, y) = self.pointer;
-        let wanted = if self.in_composer(x, y) {
+        let panel_rows = crate::settings::ROWS.len();
+        let wanted = if self.frame.hits_gear(x, y)
+            || (self.model.panel.is_open() && self.frame.panel_row_at(panel_rows, x, y).is_some())
+        {
+            // A pointing hand over the gear and its rows, so the one clickable
+            // chrome in the window says so before it is clicked.
+            winit::window::CursorIcon::Pointer
+        } else if self.in_composer(x, y) {
             winit::window::CursorIcon::Text
         } else if self.in_transcript(x, y) {
             // The transcript is selectable, so it must say so before it is
@@ -848,6 +926,9 @@ impl App {
             self.model.spin.drag_to(self.pointer.0);
             self.request_redraw();
             return;
+        }
+        if self.settings_hover(self.pointer.0, self.pointer.1) {
+            self.request_redraw();
         }
         self.update_cursor_icon();
         if self.selecting {
@@ -988,7 +1069,13 @@ impl App {
             // The reveal keeps running unfocused: a window opened behind the
             // pointer's focus must not be stuck on a black frame.
             let boot = self.model.boot.next_frame_at(now);
-            return [overview, bounce, spinner, stream, smooth, boot]
+            // A progress bar is informative motion too, and waiting on a build
+            // from another window is exactly when a user watches it, so an
+            // indeterminate bar keeps sweeping at the background cadence.
+            let progress = (self.model.progress_clock.is_some()
+                && self.model.transcript.has_indeterminate_progress())
+            .then(|| now + BACKGROUND_FRAME);
+            return [overview, bounce, spinner, stream, smooth, boot, progress]
                 .into_iter()
                 .flatten()
                 .min();
@@ -1010,6 +1097,12 @@ impl App {
         // Scroll smoothing and the scrollbar fade both need frames, and both
         // stop themselves once the view has landed and the bar is gone.
         let smooth = self.model.smooth.next_frame_at(now);
+        // An indeterminate progress bar sweeps, so it needs frames for as long
+        // as a task is running without a percentage. A determinate bar is a
+        // still image between ticks and asks for nothing.
+        let progress = (self.model.progress_clock.is_some()
+            && self.model.transcript.has_indeterminate_progress())
+        .then(|| now + PROGRESS_FRAME);
         // The delivery wiggle: short, and it stops itself, so an idle window
         // with every message acknowledged still sleeps.
         let ack = self
@@ -1019,7 +1112,7 @@ impl App {
             .filter_map(|delivery| delivery.next_frame_at(now))
             .min();
         [
-            caret, donut, spinner, stream, smooth, overview, bounce, boot, ack,
+            caret, donut, spinner, stream, smooth, overview, bounce, boot, ack, progress,
         ]
         .into_iter()
         .flatten()
@@ -1155,12 +1248,29 @@ impl App {
             Action::OverviewCommit => self.close_overview(true),
             Action::OverviewCancel => self.close_overview(false),
 
+            // The gear's chord. Opening it moves no focus and takes no
+            // keystrokes: the composer keeps the keyboard, so typing through
+            // an accidentally-opened panel still lands in the message.
+            Action::ToggleSettings => {
+                self.model.panel.toggle();
+            }
+
+            // The palette, on a key. The notice names what it landed on, so
+            // the chord is self-documenting the first time it is hit by
+            // accident and there is no doubt about which of the three the
+            // window is now following.
+            Action::ToggleTheme => {
+                self.toggle_theme();
+                let label = self.model.settings.value(crate::settings::Row::Theme);
+                self.model.set_notice(format!("theme: {label}"));
+            }
+
             // A view choice, applied live: the notice is the only feedback the
             // user gets when the mode change has no immediate visible effect
             // (nothing is thinking right now).
             Action::CycleReasoningDisplay => {
                 let next = self.model.transcript.reasoning_mode().cycle();
-                self.model.transcript.set_reasoning_mode(next);
+                self.set_reasoning_from_keyboard(next);
                 self.model.set_notice(format!("thinking: {}", next.label()));
             }
 
@@ -1255,6 +1365,26 @@ impl App {
                 None => self.model.set_notice("clipboard is empty"),
             },
 
+            // Zoom: the whole UI, not just the transcript, so the composer,
+            // chrome, and hit-testing stay in proportion. Reported as a notice
+            // because the step is small enough to be hard to see on one press.
+            Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => {
+                let current = self.geometry.zoom;
+                let target = match action {
+                    Action::ZoomIn => current * window_state::ZOOM_STEP,
+                    Action::ZoomOut => current / window_state::ZOOM_STEP,
+                    _ => 1.0,
+                };
+                if self.set_zoom(target) {
+                    self.model
+                        .set_notice(format!("zoom {:.0}%", self.geometry.zoom * 100.0));
+                } else if matches!(action, Action::ZoomReset) {
+                    self.model.set_notice("zoom 100%");
+                } else {
+                    self.model.set_notice("zoom limit reached");
+                }
+            }
+
             // In a multi-line input, Up/Down move between lines first and only
             // fall through to history recall at the edges, like a normal
             // multi-line composer.
@@ -1294,6 +1424,12 @@ impl App {
             // Escape never quits: it cancels, then clears, then re-follows the
             // tail, matching the TUI.
             Action::Cancel => {
+                // An open menu is the most recent thing the user opened, so
+                // Escape shuts it before it reaches anything behind it.
+                if self.model.panel.is_open() {
+                    self.model.panel.close();
+                    return true;
+                }
                 // A visible highlight is the most recent thing the user did,
                 // so Escape dismisses that first rather than reaching past it
                 // to clear typed work.
@@ -1386,6 +1522,9 @@ impl ApplicationHandler for App {
                 self.save_geometry(false);
             }
             WindowEvent::Moved(position) => {
+                // Window position is a platform fact, so it is converted with
+                // the platform's scale factor only: the user's zoom must not
+                // move the window when it changes.
                 let scale = self
                     .state
                     .as_ref()
@@ -1396,11 +1535,7 @@ impl ApplicationHandler for App {
                 self.save_geometry(false);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let scale = self
-                    .state
-                    .as_ref()
-                    .map(|state| state.scale_factor())
-                    .unwrap_or(1.0);
+                let scale = self.effective_scale();
                 self.pointer = (position.x / scale, position.y / scale);
                 // A keystroke ends the reveal at once: an animation that eats
                 // the user's first character, or makes them watch it finish, is
@@ -1567,8 +1702,8 @@ impl ApplicationHandler for App {
                 }
                 let mut scene = Scene::new();
                 self.frame_meter.start();
+                let scale = self.effective_scale();
                 if let Some(state) = self.state.as_mut() {
-                    let scale = state.scale_factor();
                     let size = state.size();
                     // Record the geometry the frame was built with, so pointer
                     // hit-testing uses exactly what the user sees. Measured
@@ -1586,7 +1721,6 @@ impl ApplicationHandler for App {
                 // lookup rather than a relayout.
                 self.observe_stream_growth();
                 if let Some(state) = self.state.as_mut() {
-                    let scale = state.scale_factor();
                     let size = state.size();
                     build_scene(&mut scene, &mut self.painter, &self.model, size, scale);
                     self.frame_meter.end_build();

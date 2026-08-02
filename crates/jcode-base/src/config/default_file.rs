@@ -205,6 +205,11 @@ prompt_entry_animation = true
 # command is always available regardless of this setting.
 # active_sessions_manager = false
 
+# Include transcripts from other agent CLIs (Claude Code, Codex, Pi, OpenCode,
+# Cursor) in the session picker so they can be resumed or imported
+# (default: true). Set false to list only jcode's own sessions.
+# external_sessions = true
+
 # Overscroll status line (model/provider/context info below the input):
 #   "overscroll" - elastic reveal when scrolling past the bottom (default)
 #   "on"         - always visible
@@ -654,8 +659,7 @@ desktop_notifications = true
 # When enabled, the agent gains a `discover_tools` tool listing third-party
 # developer tools from Jcode's hosted integration directory. Some providers
 # may share revenue with Jcode when a referred user becomes a customer, but
-# partnership status never influences recommendations. Each session's first
-# use of discover_tools shows a concise disclosure with a learn-more link.
+# partnership status never influences recommendations.
 # See https://jcode.sh/discovery-tools
 # enabled = true
 # endpoint = "https://api.jcode.sh/v1/discovery"

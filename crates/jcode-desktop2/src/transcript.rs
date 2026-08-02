@@ -23,7 +23,7 @@
 use crate::text::{ParagraphStyle, TextSystem};
 use crate::theme::Theme;
 use jcode_render_core::{
-    Block, BlockKind, Document, FillRole, StyleRole, StyledLine, parse_markdown,
+    Alignment, Block, BlockKind, Document, FillRole, StyleRole, StyledLine, parse_markdown,
 };
 use parley::{Layout, StyleProperty};
 use vello::peniko::{Brush, Color};
@@ -55,6 +55,15 @@ pub enum Role {
     /// session is attached, and a failure the user cannot see is
     /// indistinguishable from an app that silently ignored them.
     Notice,
+    /// A background task the agent is waiting on: its label, its status line,
+    /// and a drawn bar when it reports a percentage.
+    ///
+    /// Like [`Role::Tool`] this is live status rather than history, so it is
+    /// pinned to the tail and retired when the task finishes. Unlike the tool
+    /// card there can be several at once: a turn can be waiting on a build, a
+    /// test sweep, and a swarm plan at the same time, and collapsing them into
+    /// one line would hide the one that is stuck.
+    Progress,
 }
 
 /// One turn of the conversation.
@@ -73,6 +82,15 @@ pub struct Message {
     /// a thought, or a user message replayed from history is not in flight,
     /// and marking it "sent" would be a claim about a past this app never saw.
     pub delivery: Option<crate::ack::Delivery>,
+    /// Completion of a [`Role::Progress`] card, in per mille (0..=1000).
+    /// `None` means the task is running but cannot say how far along it is,
+    /// which is drawn as an indeterminate track rather than a bar stuck at
+    /// zero.
+    ///
+    /// An integer rather than a float so a message stays `Eq` (the transcript
+    /// is compared wholesale in tests and in the paint cache) and so two ticks
+    /// reporting the same progress are byte-identical.
+    pub permille: Option<u16>,
 }
 
 impl Message {
@@ -84,6 +102,7 @@ impl Message {
             source: source.into(),
             call_id: None,
             delivery: None,
+            permille: None,
         }
     }
 
@@ -111,6 +130,7 @@ impl Message {
             source: source.into(),
             call_id: None,
             delivery: None,
+            permille: None,
         }
     }
 
@@ -120,6 +140,7 @@ impl Message {
             source: source.into(),
             call_id: None,
             delivery: None,
+            permille: None,
         }
     }
 
@@ -129,6 +150,7 @@ impl Message {
             source: label.into(),
             call_id: Some(call_id.into()),
             delivery: None,
+            permille: None,
         }
     }
 
@@ -139,7 +161,34 @@ impl Message {
             source: edit_source(card),
             call_id: None,
             delivery: None,
+            permille: None,
         }
+    }
+
+    /// A background task's live progress card. `task_id` rides in `call_id`
+    /// for the same reason a tool call's does: it is the key that lets the
+    /// next tick refine this card in place instead of stacking a new row per
+    /// update.
+    pub fn progress(
+        task_id: impl Into<String>,
+        label: &str,
+        summary: &str,
+        percent: Option<f32>,
+    ) -> Self {
+        Self {
+            role: Role::Progress,
+            source: progress_source(label, summary),
+            call_id: Some(task_id.into()),
+            delivery: None,
+            permille: percent.map(|percent| (percent.clamp(0.0, 100.0) * 10.0).round() as u16),
+        }
+    }
+
+    /// Completion as a 0..=1 fraction, for drawing. `None` for an
+    /// indeterminate task, and for every role that is not a progress card.
+    pub fn fraction(&self) -> Option<f64> {
+        self.permille
+            .map(|permille| f64::from(permille.min(1000)) / 1000.0)
     }
 
     /// A failure, placed in the conversation where the user is already looking.
@@ -149,6 +198,7 @@ impl Message {
             source: source.into(),
             call_id: None,
             delivery: None,
+            permille: None,
         }
     }
 }
@@ -180,10 +230,82 @@ fn edit_source(card: &crate::edits::EditCard) -> String {
         .join(" ");
     // Counts, always: a truncated diff still has to say how big the change was.
     source.push_str(&format!("{files} +{} -{}\n", card.added, card.removed));
+    // The fence carries the file's language, so the diff body is highlighted
+    // as the code it is rather than as plain text. It travels in the markdown
+    // because that is where every other code block's language comes from, and
+    // one path through layout is what keeps the two from drifting.
+    source.push_str("```");
+    source.push_str(card.language().unwrap_or(""));
+    source.push('\n');
+    source.push_str(&diff_body(card));
     source.push_str("```\n");
-    source.push_str(card.diff.trim_end());
-    source.push_str("\n```\n");
     source
+}
+
+/// The diff body of an edit card: line numbers right-aligned into a gutter,
+/// then the sign, then the line.
+///
+/// Alignment is the whole point. Tools emit `9- x` and `118- y`, so the code
+/// starts at a different column on almost every row and the change you are
+/// trying to compare is never above the thing it replaced. Padding the numbers
+/// to one width puts the two sides in the same column, which is what makes a
+/// diff readable at a glance.
+///
+/// Long diffs are truncated: a card is a summary of a change in a scrolling
+/// conversation, and a thousand-line rewrite pasted into it buries every other
+/// turn. The count in the header still reports the whole change, and the
+/// marker says how much is not shown.
+fn diff_body(card: &crate::edits::EditCard) -> String {
+    let rows = card.rows();
+    let width = rows
+        .iter()
+        .filter_map(|row| row.number)
+        .map(|number| number.to_string().len())
+        .max()
+        .unwrap_or(0);
+    let mut body = String::new();
+    for row in rows.iter().take(DIFF_ROW_LIMIT) {
+        let number = row
+            .number
+            .map(|number| number.to_string())
+            .unwrap_or_default();
+        let sign = match row.change {
+            crate::edits::Change::Added => '+',
+            crate::edits::Change::Removed => '-',
+        };
+        body.push_str(&format!("{number:>width$}{sign} {}\n", row.text));
+    }
+    if let Some(hidden) = rows.len().checked_sub(DIFF_ROW_LIMIT).filter(|n| *n > 0) {
+        body.push_str(&format!(
+            "… {hidden} more line{}\n",
+            if hidden == 1 { "" } else { "s" }
+        ));
+    }
+    body
+}
+
+/// Rows of a diff shown in a card before it is truncated.
+pub const DIFF_ROW_LIMIT: usize = 24;
+
+/// How much of the usual inter-block gap an edit card's parts take. The card
+/// is one statement, so its lines are set as one paragraph rather than as
+/// three.
+const EDIT_GAP_SCALE: f64 = 0.45;
+
+/// Markdown for a progress card: the task's label, then its status line.
+///
+/// One line, not two: the card is a status readout pinned to the tail, and a
+/// wrapped paragraph per background task would push the conversation off the
+/// page whenever a build got chatty.
+fn progress_source(label: &str, summary: &str) -> String {
+    let label = label.trim();
+    let summary = summary.trim();
+    match (label.is_empty(), summary.is_empty()) {
+        (true, true) => "background task".to_string(),
+        (true, false) => summary.to_string(),
+        (false, true) => label.to_string(),
+        (false, false) => format!("{label} · {summary}"),
+    }
 }
 
 /// The conversation. Streaming appends to the trailing assistant message
@@ -383,12 +505,27 @@ impl Transcript {
         index
     }
 
+    /// Start of the trailing run of background-progress cards, which sit just
+    /// above the queue and just below the live tool card.
+    ///
+    /// The tail band reads top to bottom as "what is being done now" (the tool
+    /// card), "what is being waited on" (the progress cards), "what happens
+    /// next" (the queue), and every append path routes through these three
+    /// functions so that order cannot come apart.
+    fn progress_tail_start(&self) -> usize {
+        let mut index = self.queued_tail_start();
+        while index > 0 && self.messages[index - 1].role == Role::Progress {
+            index -= 1;
+        }
+        index
+    }
+
     /// Where streamed text goes: the end of the transcript, except that a live
     /// tool card and the queued messages at the tail are skipped over. One
     /// definition, so every append path keeps the card and the queue pinned
     /// and none can strand them mid-transcript.
     fn text_tail(&self) -> usize {
-        let tail = self.queued_tail_start();
+        let tail = self.progress_tail_start();
         match tail.checked_sub(1).map(|index| &self.messages[index]) {
             Some(last) if last.role == Role::Tool => tail - 1,
             _ => tail,
@@ -440,6 +577,71 @@ impl Transcript {
         self.messages.retain(|message| message.role != Role::Tool);
     }
 
+    /// Show, or refine, a background task's progress card.
+    ///
+    /// Keyed by task id, so a task that ticks a hundred times is one card that
+    /// updates rather than a hundred rows. Cards live in the same pinned band
+    /// as the live tool card, below the streamed text and above the queue, so
+    /// a growing reply never strands a bar mid-transcript.
+    pub fn set_progress(
+        &mut self,
+        task_id: &str,
+        label: &str,
+        summary: &str,
+        percent: Option<f32>,
+    ) {
+        let updated = Message::progress(task_id, label, summary, percent);
+        if let Some(card) = self.messages.iter_mut().find(|message| {
+            message.role == Role::Progress && message.call_id.as_deref() == Some(task_id)
+        }) {
+            card.source = updated.source;
+            card.permille = updated.permille;
+            return;
+        }
+        // At the *end* of the progress band, so the cards read in the order
+        // their tasks started rather than newest-first: a bar that jumps above
+        // the ones already on screen makes a second task look like a restart.
+        let at = self.queued_tail_start();
+        self.messages.insert(at, updated);
+    }
+
+    /// Retire one task's progress card, because the task finished.
+    ///
+    /// Returns whether a card was actually removed, so the caller can skip a
+    /// redraw for a completion notice about a task this window never saw start.
+    pub fn clear_progress(&mut self, task_id: &str) -> bool {
+        let before = self.messages.len();
+        self.messages.retain(|message| {
+            message.role != Role::Progress || message.call_id.as_deref() != Some(task_id)
+        });
+        self.messages.len() != before
+    }
+
+    /// Retire every bar. The conversation on screen is being replaced (a
+    /// session switch), so bars belonging to the session being left must not
+    /// be shown against the one being opened.
+    pub fn clear_all_progress(&mut self) {
+        self.messages
+            .retain(|message| message.role != Role::Progress);
+    }
+
+    /// Whether any background task's bar is on the page. Drives the one clock
+    /// the bars animate off, so a window with nothing running still sleeps.
+    pub fn has_progress(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.role == Role::Progress)
+    }
+
+    /// Whether any bar on the page is indeterminate, and so needs frames to
+    /// keep its segment sweeping. A page of determinate bars is a still image
+    /// between ticks and must not pull the loop awake.
+    pub fn has_indeterminate_progress(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|message| message.role == Role::Progress && message.permille.is_none())
+    }
+
     /// Record a completed edit in the conversation.
     ///
     /// Placed above the live tool card, like streamed text: the card is pinned
@@ -463,9 +665,10 @@ impl Transcript {
             return;
         }
         self.clear_live_tool();
-        // Above the queued messages: a failure is part of the turn that just
-        // happened, while the queue is what happens next.
-        let at = self.queued_tail_start();
+        // Above the live status band: a failure is part of the turn that just
+        // happened, while progress cards and the queue are about what is still
+        // to come.
+        let at = self.progress_tail_start();
         if at
             .checked_sub(1)
             .map(|index| &self.messages[index])
@@ -533,6 +736,10 @@ pub struct LaidMessage {
     /// nothing (see [`crate::paint::TranscriptCache`], which refreshes this
     /// field on every frame instead).
     pub delivery: Option<crate::ack::Delivery>,
+    /// Completion of the progress card this message is, in per mille. Refreshed
+    /// on a cache hit like `delivery`: a bar advancing changes a drawn width,
+    /// never a wrap.
+    pub permille: Option<u16>,
     /// Laid-out blocks, in order, with their vertical offset from the top of
     /// the message and the kind that produced them.
     pub blocks: Vec<LaidBlock>,
@@ -552,12 +759,18 @@ impl LaidMessage {
             Role::User => USER_PAD_Y,
             // A notice is a card too: it has to be visibly an interjection
             // from the app rather than a line the model wrote.
-            Role::Tool | Role::Notice => TOOL_PAD_Y,
+            Role::Tool | Role::Notice | Role::Progress => TOOL_PAD_Y,
             // An edit card is a card too: the diff sits on a wash that must
             // not crop the first line of it.
             Role::Edit => TOOL_PAD_Y,
             Role::Assistant | Role::Reasoning => 0.0,
         }
+    }
+
+    /// Completion as a 0..=1 fraction, or `None` for an indeterminate task.
+    pub fn fraction(&self) -> Option<f64> {
+        self.permille
+            .map(|permille| f64::from(permille.min(1000)) / 1000.0)
     }
 }
 
@@ -585,6 +798,23 @@ pub struct LaidBlock {
     /// re-measure of every `` `span` `` in a reply is work that grows with the
     /// reply while the text has not changed.
     pub washes: Vec<vello::kurbo::Rect>,
+    /// Row bands for a diff body, in logical units relative to the block's
+    /// text origin. Empty for every block that is not an edit card's diff.
+    /// Computed at layout time for the same reason the washes are: the rows do
+    /// not move once laid out.
+    pub diff_bands: Vec<DiffBand>,
+}
+
+impl LaidBlock {
+    /// Where this block's furniture (a code wash, a quote rule) begins,
+    /// relative to the message's text left edge.
+    ///
+    /// Inside any list indent the block inherited, outside the block's own
+    /// padding: the wash wraps the text, and both have to agree on where the
+    /// block starts.
+    pub fn edge(&self) -> f64 {
+        (self.inset - own_pad(&self.kind)).max(0.0)
+    }
 }
 
 /// Vertical rhythm inside and between messages, in logical units.
@@ -625,6 +855,21 @@ pub const TOOL_INSET: f64 = 24.0;
 pub const NOTICE_INSET: f64 = 16.0;
 /// Vertical padding inside the live tool card.
 pub const TOOL_PAD_Y: f64 = 6.0;
+/// The progress bar's track: thin, because it is a readout rather than a
+/// control, and the same halftone language as the rest of the app means it
+/// only has to be legible, not loud.
+pub const PROGRESS_BAR_HEIGHT: f64 = 3.0;
+/// Gap between a progress card's label and its bar.
+pub const PROGRESS_BAR_GAP: f64 = 5.0;
+/// Corner radius of the bar. Half its height, so the track reads as a capsule
+/// rather than as a sliver of a rectangle.
+pub const PROGRESS_BAR_RADIUS: f64 = PROGRESS_BAR_HEIGHT / 2.0;
+/// Width of the moving segment of an indeterminate bar, as a fraction of the
+/// track. A task that cannot report a percentage still has to look alive, so
+/// the segment sweeps instead of the fill growing.
+pub const PROGRESS_SWEEP_FRACTION: f64 = 0.3;
+/// One full sweep of an indeterminate bar.
+pub const PROGRESS_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_millis(1400);
 /// Reasoning is set smaller than body copy, as a multiple of it. Enough to
 /// read as an aside at a glance without becoming unreadable.
 pub const REASONING_SCALE: f32 = 0.92;
@@ -744,7 +989,9 @@ pub fn lay_out_message_reusing(
         // faintest ink; the tool card stays merely muted because it labels
         // live work.
         Role::Reasoning => Some(theme.faint),
-        Role::Tool => Some(theme.muted),
+        // A progress card is the tool card's voice: live status about work in
+        // flight, not something the model said.
+        Role::Tool | Role::Progress => Some(theme.muted),
         _ => None,
     };
     // A failure is the one thing in the transcript that must not be quiet, so
@@ -759,16 +1006,19 @@ pub fn lay_out_message_reusing(
                 ..base
             },
             match message.role {
-                Role::Tool => TOOL_INSET,
+                // Both leave room for a drawn object down the left edge: the
+                // spinner for a tool call, the bar's track for a progress card.
+                Role::Tool | Role::Progress => TOOL_INSET,
                 _ => REASONING_INSET,
             },
         ),
         None => match notice {
             Some(color) => (ParagraphStyle { color, ..base }, NOTICE_INSET),
-            // An edit card is indented to clear the rule down its left edge,
-            // the same as a notice: the rule is what marks it, so the text must
-            // not sit on top of it.
-            None if message.role == Role::Edit => (base, NOTICE_INSET),
+            // An edit card sits at the margin. It used to be indented to clear
+            // a rule down its left edge; the rule is gone (the diff's own wash
+            // and hue already mark it), so the indent would only narrow the
+            // one block on the page that most wants the measure.
+            None if message.role == Role::Edit => (base, 0.0),
             None => (base, 0.0),
         },
     };
@@ -787,10 +1037,26 @@ pub fn lay_out_message_reusing(
     // Kind of the block laid immediately before this one, so the gap between
     // them can depend on the pair rather than on one of them alone.
     let mut previous_kind: Option<BlockKind> = None;
+    // Width of one monospace cell, measured lazily (see below).
+    let mut advance: Option<f64> = None;
 
     for block in &document.blocks {
-        let inset = block_inset(&block.kind) + role_inset;
-        let lines = block_lines(block);
+        let inset = block_inset(block) + role_inset;
+        let measure = (width - inset * 2.0).max(1.0);
+        // Measure available in *characters*: the app is a monospace stack, so a
+        // table's columns are laid out in cells, and the cell width has to come
+        // from the font rather than from a guess. Measured at most once per
+        // message, and only when a table asks: it costs a Parley layout, and a
+        // streaming delta re-flattens every block of the tail message.
+        let advance = &mut advance;
+        let lines = block_lines(block, || {
+            let cell = *advance.get_or_insert_with(|| text.measure_width("0", base, scale));
+            if cell <= 0.0 {
+                DEFAULT_TABLE_COLUMNS
+            } else {
+                ((measure / cell).floor() as usize).max(MIN_TABLE_COLUMNS)
+            }
+        });
         if lines.is_empty() {
             continue;
         }
@@ -807,12 +1073,35 @@ pub fn lay_out_message_reusing(
         // ink of the side it is on. Applied here, over the flattened block,
         // because "which side" is a property of the whole line and markdown has
         // no span for it.
-        let spans =
-            if message.role == Role::Edit && matches!(block.kind, BlockKind::CodeBlock { .. }) {
-                diff_spans(&source, theme)
-            } else {
-                spans
+        let is_diff =
+            message.role == Role::Edit && matches!(block.kind, BlockKind::CodeBlock { .. });
+        let spans = if is_diff {
+            let language = match &block.kind {
+                BlockKind::CodeBlock { language } => language.as_deref(),
+                _ => None,
             };
+            diff_spans(&source, language, theme)
+        } else {
+            spans
+        };
+        // An ordinary fenced block with a language is highlighted the same
+        // way. A code block is quoted *because* it is code, and flat ink
+        // throws away the one property that distinguishes it from the prose
+        // around it.
+        let spans = match &block.kind {
+            BlockKind::CodeBlock {
+                language: Some(language),
+            } if !is_diff => code_spans(&source, language, theme),
+            _ => spans,
+        };
+        // The card's header line: the counts take the diff's own ink, so
+        // "how much changed, and in which direction" is answered by the same
+        // two colours the body uses rather than by reading two numbers.
+        let spans = if message.role == Role::Edit && block.kind == BlockKind::Paragraph {
+            count_spans(&source, theme, spans)
+        } else {
+            spans
+        };
         if !is_rule && source.trim().is_empty() {
             continue;
         }
@@ -821,7 +1110,16 @@ pub fn lay_out_message_reusing(
         // want to sit close enough to read as one list, while a heading wants
         // air above it, and a single uniform gap cannot do both.
         if let Some(previous_kind) = previous_kind.as_ref() {
-            top += gap_between(previous_kind, &block.kind);
+            // An edit card's three parts (why, where, what) are one statement
+            // about one change, so they are set tight. At the paragraph gap
+            // the card came apart into three unrelated lines and the diff
+            // stopped looking like it belonged to the file named above it.
+            let gap = gap_between(previous_kind, &block.kind);
+            top += if message.role == Role::Edit {
+                gap * EDIT_GAP_SCALE
+            } else {
+                gap
+            };
         }
         if matching {
             let reusable = previous.peek().is_some_and(|cached| {
@@ -863,6 +1161,13 @@ pub fn lay_out_message_reusing(
         } else {
             inline_code_washes(&layout, &spans, scale)
         };
+        // Row bands, for a diff body only: every other block is prose, and a
+        // band across a paragraph would read as a table row.
+        let bands = if is_diff {
+            diff_bands(&layout, &source, scale)
+        } else {
+            Vec::new()
+        };
         blocks.push(LaidBlock {
             glyphs: crate::text::glyph_count(&layout),
             layout,
@@ -872,6 +1177,7 @@ pub fn lay_out_message_reusing(
             inset,
             kind: block.kind.clone(),
             washes,
+            diff_bands: bands,
         });
         top += height;
         previous_kind = Some(block.kind.clone());
@@ -883,12 +1189,17 @@ pub fn lay_out_message_reusing(
         // tint can never crop the text it wraps.
         Role::User => USER_PAD_Y * 2.0,
         Role::Tool | Role::Notice | Role::Edit => TOOL_PAD_Y * 2.0,
+        // The bar is drawn under the label inside the same card, so the card
+        // reserves its height here: measuring it anywhere else would let the
+        // bar paint over the message below.
+        Role::Progress => TOOL_PAD_Y * 2.0 + PROGRESS_BAR_GAP + PROGRESS_BAR_HEIGHT,
         Role::Assistant | Role::Reasoning => 0.0,
     };
     (
         LaidMessage {
             role: message.role,
             delivery: message.delivery,
+            permille: message.permille,
             blocks,
             height,
         },
@@ -896,38 +1207,357 @@ pub fn lay_out_message_reusing(
     )
 }
 
-/// Per-line ink for a diff body: added lines green, removed lines red, and
-/// anything else (a `...` truncation marker) left in the block's own colour.
+/// Per-line ink for a diff body.
 ///
-/// Byte ranges over the flattened block, so a wrapped long line keeps its ink
-/// across the wrap: the colour belongs to the text, not to the screen row.
-fn diff_spans(source: &str, theme: &Theme) -> Vec<SpanStyle> {
+/// Three things are being said at once, and each gets its own ink so none of
+/// them shouts over the others:
+///
+/// * the gutter (line number and sign) is *furniture*, so it takes the diff
+///   colour at full strength: it is the fastest way to answer "which side",
+///   and it is the one part of the row that is not code;
+/// * the code itself is syntax-highlighted, so a diff still reads as the
+///   language it is written in rather than as two blocks of flat colour;
+/// * that highlighting is then pulled a little toward the diff colour, so the
+///   side a line is on survives even where the syntax is loud.
+///
+/// A line the highlighter cannot colour (unknown language, prose, the
+/// truncation marker) falls back to the diff ink alone, which is exactly what
+/// this used to do for every line.
+///
+/// Byte ranges are over the flattened block, so a wrapped long line keeps its
+/// ink across the wrap: the colour belongs to the text, not to the screen row.
+fn diff_spans(source: &str, language: Option<&str>, theme: &Theme) -> Vec<SpanStyle> {
+    let dark = theme.mode == crate::theme::ThemeMode::Dark;
     let mut spans = Vec::new();
     let mut at = 0usize;
+    let ink = |color: Color, range: std::ops::Range<usize>| SpanStyle {
+        range,
+        role: StyleRole::Code,
+        fill: FillRole::None,
+        bold: false,
+        italic: false,
+        underline: false,
+        strikethrough: false,
+        color: Some(color),
+    };
     for line in source.split_inclusive('\n') {
-        let range = at..at + line.trim_end_matches('\n').len();
+        let start = at;
+        let text = line.trim_end_matches('\n');
         at += line.len();
-        let color = match crate::edits::classify(line) {
+        let side = match crate::edits::classify(line) {
             Some(crate::edits::Change::Added) => theme.added,
             Some(crate::edits::Change::Removed) => theme.removed,
-            None => continue,
+            // The truncation marker is not a change, so it takes the quiet
+            // voice the rest of the app uses for things it is telling you
+            // about itself.
+            None => {
+                spans.push(ink(theme.muted, start..start + text.len()));
+                continue;
+            }
         };
+        // Past the gutter: the digits and the sign, which are drawn in the
+        // diff colour, then one space, then the code.
+        let gutter = gutter_len(text);
+        spans.push(ink(side, start..start + gutter));
+        let code_at = (gutter + 1).min(text.len());
+        let code = &text[code_at..];
+        let runs = crate::syntax::highlight_line(code, language, dark);
+        if runs.is_empty() {
+            spans.push(ink(side, start + code_at..start + text.len()));
+            continue;
+        }
+        // Any gap between runs (whitespace the highlighter dropped) keeps the
+        // diff ink, so a line is never partly uncoloured.
+        let mut cursor = 0usize;
+        for (range, color) in runs {
+            if range.start > cursor {
+                spans.push(ink(
+                    side,
+                    start + code_at + cursor..start + code_at + range.start,
+                ));
+            }
+            cursor = range.end;
+            spans.push(ink(
+                crate::syntax::tint(color, side, DIFF_SYNTAX_TINT),
+                start + code_at + range.start..start + code_at + range.end,
+            ));
+        }
+        if code_at + cursor < text.len() {
+            spans.push(ink(side, start + code_at + cursor..start + text.len()));
+        }
+    }
+    spans
+}
+
+/// Bytes of a diff line taken by its gutter: the line number and the sign.
+/// Per-token ink for an ordinary fenced code block.
+/// Ink for the `+n -m` counts at the end of an edit card's header.
+///
+/// Only the two tokens are recoloured, and only when they are the last thing
+/// on the line: an intent that happens to contain `+2` is prose, and painting
+/// it green would be a lie about what changed.
+fn count_spans(source: &str, theme: &Theme, mut spans: Vec<SpanStyle>) -> Vec<SpanStyle> {
+    let mut tail = source.len();
+    for (ink, sign) in [(theme.added, '+'), (theme.removed, '-')].into_iter().rev() {
+        let head = source[..tail].trim_end();
+        let Some(at) = head.rfind(sign) else { break };
+        // Everything after the sign must be the digits of a count.
+        if head[at + 1..].is_empty() || !head[at + 1..].bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
         spans.push(SpanStyle {
-            range,
-            role: StyleRole::Code,
+            range: at..head.len(),
+            role: StyleRole::Text,
             fill: FillRole::None,
             bold: false,
             italic: false,
             underline: false,
             strikethrough: false,
-            color: Some(color),
+            color: Some(ink),
         });
+        tail = at;
     }
     spans
 }
 
-/// Horizontal inset for a block kind, relative to the message's text column.
-fn block_inset(kind: &BlockKind) -> f64 {
+/// Per-token ink for an ordinary fenced code block.
+///
+/// Only tokens the highlighter recognised get a span; everything else is left
+/// to the block's own colour, so an unknown language renders exactly as it did
+/// before this existed rather than as a wall of one accent.
+fn code_spans(source: &str, language: &str, theme: &Theme) -> Vec<SpanStyle> {
+    let dark = theme.mode == crate::theme::ThemeMode::Dark;
+    let mut spans = Vec::new();
+    let mut at = 0usize;
+    for line in source.split_inclusive('\n') {
+        let start = at;
+        let text = line.trim_end_matches('\n');
+        at += line.len();
+        for (range, color) in crate::syntax::highlight_line(text, Some(language), dark) {
+            spans.push(SpanStyle {
+                range: start + range.start..start + range.end,
+                role: StyleRole::Code,
+                fill: FillRole::None,
+                bold: false,
+                italic: false,
+                underline: false,
+                strikethrough: false,
+                color: Some(color),
+            });
+        }
+    }
+    spans
+}
+
+/// Bytes of a diff line taken by its gutter: the line number and the sign.
+fn gutter_len(line: &str) -> usize {
+    let lead = line.len() - line.trim_start().len();
+    let digits = line[lead..].len().saturating_sub(
+        line[lead..]
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .len(),
+    );
+    // The sign is one byte past the digits, when there is one at all.
+    (lead + digits + 1).min(line.len())
+}
+
+/// How far a syntax colour is pulled toward the diff's own ink. Enough that a
+/// line still reads as added or removed from the corner of the eye, little
+/// enough that a keyword and a string stay distinguishable.
+const DIFF_SYNTAX_TINT: f64 = 0.35;
+
+/// A coloured area inside a diff body: either a whole row, or the part of a
+/// row that actually differs from its counterpart on the other side.
+#[derive(Clone, Copy, Debug)]
+pub struct DiffBand {
+    /// In logical units relative to the block's text origin. `x` is only
+    /// meaningful for an emphasis band; a row band is drawn to the card's own
+    /// edges, because a band as ragged as the code stops being a shape.
+    pub rect: vello::kurbo::Rect,
+    pub change: crate::edits::Change,
+    /// Whether this is the *changed part* of the row rather than the row.
+    /// Drawn stronger, and over the row band: on a one-word change in a long
+    /// line, the row colour says a line changed and this says which word.
+    pub emphasis: bool,
+}
+
+/// Coloured areas for a laid-out diff body: one band per screen row, plus a
+/// stronger band over the part of each paired row that actually differs.
+///
+/// Derived from the same Parley geometry the selection bands use, so a band
+/// cannot drift from the text it marks, and a line long enough to wrap gets
+/// one band per screen row instead of one box around both.
+fn diff_bands(layout: &Layout<Brush>, source: &str, scale: f64) -> Vec<DiffBand> {
+    let mut bands = Vec::new();
+    // Each line's byte range in the flattened block, and which side it is on.
+    let mut lines = Vec::new();
+    let mut at = 0usize;
+    for line in source.split_inclusive('\n') {
+        let start = at;
+        let end = at + line.trim_end_matches('\n').len();
+        at += line.len();
+        if let Some(change) = crate::edits::classify(line)
+            && start < end
+        {
+            lines.push((start, end, change));
+        }
+    }
+    for &(start, end, change) in &lines {
+        for band in crate::select::layout_bands(layout, (start, end), scale) {
+            bands.push(DiffBand {
+                rect: band.rect,
+                change,
+                emphasis: false,
+            });
+        }
+    }
+    // Pair each removed line with the added line under it. That pairing is
+    // what an edit tool emits (`42- old` then `42+ new`), and it is the only
+    // case where "what changed within the line" is a question with an answer.
+    for pair in lines.windows(2) {
+        let [
+            (old_start, old_end, old_change),
+            (new_start, new_end, new_change),
+        ] = pair
+        else {
+            continue;
+        };
+        use crate::edits::Change::{Added, Removed};
+        if *old_change != Removed || *new_change != Added {
+            continue;
+        }
+        let old = &source[*old_start..*old_end];
+        let new = &source[*new_start..*new_end];
+        // Past the gutter on both sides: the line numbers differ as a matter
+        // of course, and diffing them would mark every row as changed.
+        let old_code = gutter_len(old).min(old.len());
+        let new_code = gutter_len(new).min(new.len());
+        let Some((old_range, new_range)) = changed_span(&old[old_code..], &new[new_code..]) else {
+            continue;
+        };
+        for (base, offset, range, change) in [
+            (*old_start, old_code, old_range, Removed),
+            (*new_start, new_code, new_range, Added),
+        ] {
+            for band in crate::select::layout_bands(
+                layout,
+                (base + offset + range.start, base + offset + range.end),
+                scale,
+            ) {
+                bands.push(DiffBand {
+                    rect: band.rect,
+                    change,
+                    emphasis: true,
+                });
+            }
+        }
+    }
+    bands
+}
+
+/// The part of each of two lines that differs, as byte ranges into each.
+///
+/// The common prefix and suffix are peeled off and what is left is the change.
+/// That is not a minimal edit script, and deliberately so: a real word-diff of
+/// a renamed variable marks every occurrence separately, which is *more*
+/// marks than the line has meaning, while prefix/suffix peeling marks the one
+/// contiguous region the eye should go to. `None` when the whole line changed
+/// (nothing to narrow) or nothing did.
+fn changed_span(old: &str, new: &str) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    if old == new {
+        return None;
+    }
+    let mut prefix = 0;
+    while prefix < old.len()
+        && prefix < new.len()
+        && old.as_bytes()[prefix] == new.as_bytes()[prefix]
+    {
+        prefix += 1;
+    }
+    while prefix > 0 && (!old.is_char_boundary(prefix) || !new.is_char_boundary(prefix)) {
+        prefix -= 1;
+    }
+    let mut suffix = 0;
+    while suffix < old.len() - prefix
+        && suffix < new.len() - prefix
+        && old.as_bytes()[old.len() - 1 - suffix] == new.as_bytes()[new.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    while suffix > 0
+        && (!old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix))
+    {
+        suffix -= 1;
+    }
+    let old_range = prefix..old.len() - suffix;
+    let new_range = prefix..new.len() - suffix;
+    // A change that covers essentially the whole line is not worth narrowing:
+    // the row band already says so, and a second band over the same pixels is
+    // just a darker row.
+    let shared = prefix + suffix;
+    let shortest = old.len().min(new.len());
+    if shared * 100 < shortest * MIN_SHARED_PERCENT {
+        return None;
+    }
+    Some((old_range, new_range))
+}
+
+/// How much of the shorter line must be unchanged before the changed part is
+/// worth marking on its own.
+const MIN_SHARED_PERCENT: usize = 15;
+
+/// Horizontal inset for a block, relative to the message's text column.
+///
+/// Two indents compose here. The block's *own* kind indents it (code sits in
+/// from its wash, a quote clears its rule), and the list it is written inside
+/// indents it again: a fenced block or a table under item 2 belongs to item 2,
+/// and drawing it at the margin breaks the list open around it.
+fn block_inset(block: &Block) -> f64 {
+    let own = own_pad(&block.kind);
+    // A list item's own depth already places it, so only *other* blocks take
+    // the enclosing list's indent, and they hang under the item's text rather
+    // than under its bullet.
+    let nested = match block.kind {
+        // A loose item's *second* paragraph is emitted as another list-item
+        // block with no marker of its own. It is continuation prose, so it
+        // hangs under the item's text; left at the margin it read as a new
+        // paragraph that had escaped the list.
+        BlockKind::ListItem { depth, .. } if !starts_with_marker(block) => {
+            (depth + 1) as f64 * LIST_INDENT
+        }
+        BlockKind::ListItem { .. } => 0.0,
+        _ => block.list_depth as f64 * LIST_INDENT,
+    };
+    own + nested
+}
+
+/// Whether a list-item block carries a marker (`• `, `1. `) of its own, as
+/// opposed to being a continuation paragraph of the item above it. Render-core
+/// emits the marker as a leading dim span, so its absence is what distinguishes
+/// the two.
+fn starts_with_marker(block: &Block) -> bool {
+    let Some(first) = block.lines.first().and_then(|line| line.spans.first()) else {
+        return false;
+    };
+    if first.role != StyleRole::Dim {
+        return false;
+    }
+    let text = first.text.trim_start();
+    text.starts_with('\u{2022}')
+        || text.split_once(". ").is_some_and(|(digits, _)| {
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// The part of a block's inset that is the block's *own* padding, as opposed to
+/// the indent it inherits from an enclosing list.
+///
+/// The scene needs the two apart: a code block's wash and a quote's rule sit at
+/// the block's *edge*, which is inside the list indent but outside the block's
+/// own padding. Deriving the edge as `inset - own_pad` keeps the furniture and
+/// the text from disagreeing about where the block is, which is what left a
+/// nested code block's wash back at the margin while its text was indented.
+pub fn own_pad(kind: &BlockKind) -> f64 {
     match kind {
         BlockKind::CodeBlock { .. } => CODE_PAD_X,
         BlockKind::BlockQuote => QUOTE_INSET,
@@ -1007,26 +1637,30 @@ fn block_style(kind: &BlockKind, base: ParagraphStyle, theme: &Theme) -> Paragra
     }
 }
 
-/// Heading sizes, as multiples of body copy. Restrained on purpose: an h1 in a
-/// chat reply is a sentence, not a cover page.
+/// Heading sizes, as multiples of body copy. Big enough that a heading reads
+/// as a heading at a glance, but an h1 in a chat reply is still a sentence,
+/// not a cover page.
 fn heading_scale(level: u8) -> f32 {
     match level {
-        1 => 1.32,
-        2 => 1.18,
-        3 => 1.08,
-        _ => 1.0,
+        1 => 1.55,
+        2 => 1.35,
+        3 => 1.18,
+        _ => 1.05,
     }
 }
 
 /// The styled lines a block contributes.
 ///
-/// Two kinds need front-end treatment. Tables are left to the front-end by
-/// render-core because column widths depend on the measure. Quotes arrive with
-/// a terminal `│ ` bar on every line, which the desktop replaces with a real
-/// drawn rule; keeping both would mark the quote twice.
-fn block_lines(block: &Block) -> Vec<StyledLine> {
+/// Three kinds need front-end treatment. Tables are left to the front-end by
+/// render-core because column widths depend on the measure, so `columns` (the
+/// measure in monospace cells, computed lazily because only a table needs it)
+/// is what bounds them. Quotes arrive with a terminal `│ ` bar on every line,
+/// which the desktop replaces with a real drawn rule. Task-list items arrive as
+/// literal `[x]` text, which is the terminal's checkbox and reads as source
+/// here.
+fn block_lines(block: &Block, columns: impl FnOnce() -> usize) -> Vec<StyledLine> {
     if block.kind == BlockKind::Table && block.lines.is_empty() {
-        return table_lines(&block.table);
+        return table_lines(&block.table, &block.alignments, columns());
     }
     if block.kind == BlockKind::BlockQuote {
         return block
@@ -1043,17 +1677,245 @@ fn block_lines(block: &Block) -> Vec<StyledLine> {
     // (see `block_inset`), so keeping the spaces as well would double the
     // indent and, worse, leave a wrapped continuation line sitting under the
     // bullet rather than under the text.
-    if matches!(block.kind, BlockKind::ListItem { depth, .. } if depth > 0) {
+    if let BlockKind::ListItem { depth, .. } = block.kind {
         return block
             .lines
             .iter()
             .map(|line| StyledLine {
-                spans: strip_leading_indent(&line.spans),
+                spans: checkbox_spans(&if depth > 0 {
+                    strip_leading_indent(&line.spans)
+                } else {
+                    line.spans.clone()
+                }),
                 alignment: line.alignment,
             })
             .collect();
     }
     block.lines.clone()
+}
+
+/// Replace a task list's literal `[ ] ` / `[x] ` marker with a drawn checkbox.
+///
+/// The terminal has no glyph for a checkbox that is not text, so render-core
+/// emits the source form. On screen that reads as unrendered markdown sitting
+/// next to a bullet that *was* rendered, which is exactly the inconsistency
+/// this transcript exists to avoid.
+fn checkbox_spans(spans: &[jcode_render_core::StyledSpan]) -> Vec<jcode_render_core::StyledSpan> {
+    let mut spans = spans.to_vec();
+    // The marker is its own span, emitted right after the bullet, so only the
+    // first two spans can carry it.
+    for span in spans.iter_mut().take(2) {
+        match span.text.as_str() {
+            "[ ] " => span.text = "\u{2610} ".to_string(),
+            "[x] " => span.text = "\u{2611} ".to_string(),
+            _ => continue,
+        }
+        break;
+    }
+    spans
+}
+
+/// Lay a GFM table out as aligned columns bounded by `columns` monospace cells.
+///
+/// The app is a monospace stack throughout, so padding each cell to its
+/// column's width produces true columns. Three things make this more than a
+/// `join`. Columns are *budgeted*: a table wider than the measure had its right
+/// edge run off the page, so wide columns are squeezed and their cells wrap
+/// inside the column rather than overflowing it. Cells honour the delimiter
+/// row's alignment, because a right-aligned numeric column that renders
+/// left-aligned misreads the author. And a separator row is emitted under the
+/// header, so a table reads as a table rather than as bold text above some
+/// rows.
+fn table_lines(rows: &[Vec<String>], alignments: &[Alignment], columns: usize) -> Vec<StyledLine> {
+    use jcode_render_core::{StyledSpan, TextAttrs};
+
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if count == 0 {
+        return Vec::new();
+    }
+    let widths = column_widths(rows, count, columns);
+
+    let mut lines = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        // Wrap every cell to its column, then emit as many physical lines as
+        // the tallest cell needs. Truncating instead would hide content, and a
+        // table is usually the densest thing in a reply.
+        let wrapped: Vec<Vec<String>> = (0..count)
+            .map(|column| {
+                let cell = row.get(column).map(String::as_str).unwrap_or("");
+                wrap_cell(cell, widths[column])
+            })
+            .collect();
+        let physical = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        for line in 0..physical {
+            let mut text = String::new();
+            for (column, width) in widths.iter().enumerate() {
+                let cell = wrapped[column].get(line).map(String::as_str).unwrap_or("");
+                text.push_str(&pad_cell(cell, *width, alignment_of(alignments, column)));
+                if column + 1 < count {
+                    text.push_str(COLUMN_GAP);
+                }
+            }
+            let mut span = StyledSpan::plain(text.trim_end().to_string());
+            // The header is the one piece of table structure worth carrying in
+            // the text: it says which way to read the rest.
+            if index == 0 {
+                span = span.with_attrs(TextAttrs {
+                    bold: true,
+                    ..TextAttrs::none()
+                });
+            }
+            lines.push(StyledLine::from_spans(vec![span]));
+        }
+        if index == 0 {
+            lines.push(StyledLine::from_spans(vec![StyledSpan::new(
+                header_rule(&widths, count),
+                StyleRole::Dim,
+            )]));
+        }
+    }
+    lines
+}
+
+/// Gap between two table columns, in monospace cells.
+const COLUMN_GAP: &str = "  ";
+
+/// The rule under a table's header row, drawn in the text so it wraps and
+/// scrolls with the columns it belongs to.
+fn header_rule(widths: &[usize], count: usize) -> String {
+    let mut rule = String::new();
+    for (column, width) in widths.iter().enumerate() {
+        rule.push_str(&"\u{2500}".repeat(*width));
+        if column + 1 < count {
+            rule.push_str(&"\u{2500}".repeat(COLUMN_GAP.len()));
+        }
+    }
+    rule
+}
+
+/// Column widths for a table: each column's widest cell, squeezed to fit the
+/// measure when the natural widths overflow it.
+///
+/// Squeezing takes from the widest column first, so a table of one long prose
+/// column and three short ones narrows the prose rather than shredding the
+/// short ones into one character each.
+fn column_widths(rows: &[Vec<String>], count: usize, columns: usize) -> Vec<usize> {
+    use unicode_width::UnicodeWidthStr;
+
+    let mut widths: Vec<usize> = (0..count)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.width())
+                .max()
+                .unwrap_or(0)
+                .max(1)
+        })
+        .collect();
+
+    let gaps = count.saturating_sub(1) * COLUMN_GAP.len();
+    let available = columns.saturating_sub(gaps);
+    if available == 0 {
+        return widths;
+    }
+    // Never squeeze below this: a column narrower than a short word wraps into
+    // a vertical stack of letters, which is less readable than a table that is
+    // merely tight.
+    let floor = (available / count).clamp(1, MIN_COLUMN_WIDTH);
+    while widths.iter().sum::<usize>() > available {
+        let Some((widest, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > floor)
+            .max_by_key(|(index, width)| (**width, std::cmp::Reverse(*index)))
+        else {
+            break;
+        };
+        widths[widest] -= 1;
+    }
+    widths
+}
+
+/// Measure to fall back to when the font reports no advance at all, and the
+/// narrowest measure a table is laid out against. A table squeezed below this
+/// is unreadable either way, so it is allowed to be the one thing that
+/// overflows rather than being shredded into single letters.
+const DEFAULT_TABLE_COLUMNS: usize = 80;
+const MIN_TABLE_COLUMNS: usize = 16;
+
+/// Narrowest a squeezed table column may become, in monospace cells.
+const MIN_COLUMN_WIDTH: usize = 6;
+
+/// Alignment of a column, defaulting to left when the delimiter row said
+/// nothing (or when a row has more cells than the header declared).
+fn alignment_of(alignments: &[Alignment], column: usize) -> Alignment {
+    alignments.get(column).copied().unwrap_or(Alignment::Left)
+}
+
+/// Pad `cell` to `width` cells according to `alignment`.
+fn pad_cell(cell: &str, width: usize, alignment: Alignment) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    let pad = width.saturating_sub(cell.width());
+    match alignment {
+        Alignment::Left => format!("{cell}{}", " ".repeat(pad)),
+        Alignment::Right => format!("{}{cell}", " ".repeat(pad)),
+        Alignment::Center => {
+            let left = pad / 2;
+            format!("{}{cell}{}", " ".repeat(left), " ".repeat(pad - left))
+        }
+    }
+}
+
+/// Wrap one cell to `width` cells, breaking at spaces where possible and
+/// mid-word only for a word that cannot fit at all.
+fn wrap_cell(cell: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if cell.width() <= width {
+        return vec![cell.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in cell.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_string()
+        } else {
+            format!("{line} {word}")
+        };
+        if candidate.width() <= width {
+            line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        // A single word wider than the column: hard-break it, because leaving
+        // it whole would push the table past the measure it was budgeted for.
+        let mut rest = word;
+        while rest.width() > width {
+            let split = rest
+                .char_indices()
+                .take_while(|(index, _)| rest[..*index].width() < width)
+                .last()
+                .map(|(index, _)| index)
+                .unwrap_or(rest.len());
+            let split = split.max(rest.chars().next().map_or(1, char::len_utf8));
+            lines.push(rest[..split].to_string());
+            rest = &rest[split..];
+        }
+        line = rest.to_string();
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Drop the leading run of spaces from a line's first span.
@@ -1070,67 +1932,31 @@ fn strip_leading_indent(
     spans
 }
 
-/// Drop the leading terminal quote-bar span from a quoted line.
+/// Drop the *outermost* terminal quote bar from a quoted line.
+///
+/// The desktop draws the outer quote as a real rule down the block's left edge,
+/// so keeping its `│` as well would mark the quote twice. Bars for deeper
+/// nesting are kept: the block carries only one rule, so a quote inside a quote
+/// would otherwise render identically to the quote around it, and "who is being
+/// quoted here" is the whole content of that distinction.
 fn strip_quote_bar(spans: &[jcode_render_core::StyledSpan]) -> Vec<jcode_render_core::StyledSpan> {
     let mut spans = spans.to_vec();
     if spans
         .first()
-        .is_some_and(|first| first.text.contains('\u{2502}'))
+        .is_some_and(|first| first.text.starts_with('\u{2502}'))
     {
         let first = &mut spans[0];
-        first.text = first.text.trim_start_matches(['\u{2502}', ' ']).to_string();
-        if first.text.is_empty() {
+        // Exactly one bar: render-core emits the whole gutter (`│ │ `) as a
+        // single span, and trimming all of them would flatten a nested quote
+        // onto the outer one.
+        let rest = first.text.strip_prefix('\u{2502}').unwrap_or(&first.text);
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        first.text = rest.to_string();
+        if first.text.is_empty() && spans.len() > 1 {
             spans.remove(0);
         }
     }
     spans
-}
-
-/// Lay a GFM table out as aligned columns.
-///
-/// The app is a monospace stack throughout, so padding each cell to the widest
-/// in its column produces true columns. A naive `join` would put every row's
-/// second cell at a different x, which reads worse than the markdown source.
-fn table_lines(rows: &[Vec<String>]) -> Vec<StyledLine> {
-    use jcode_render_core::{StyledSpan, TextAttrs};
-    use unicode_width::UnicodeWidthStr;
-
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let widths: Vec<usize> = (0..columns)
-        .map(|column| {
-            rows.iter()
-                .filter_map(|row| row.get(column))
-                .map(|cell| cell.width())
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-
-    rows.iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let mut text = String::new();
-            for (column, width) in widths.iter().enumerate() {
-                let cell = row.get(column).map(String::as_str).unwrap_or("");
-                text.push_str(cell);
-                // No trailing padding on the last column: invisible, and it
-                // makes the line measure wider than its ink.
-                if column + 1 < columns {
-                    text.push_str(&" ".repeat(width.saturating_sub(cell.width()) + 2));
-                }
-            }
-            let mut span = StyledSpan::plain(text);
-            // The header is the one piece of table structure worth carrying:
-            // it says which way to read the rest.
-            if index == 0 {
-                span = span.with_attrs(TextAttrs {
-                    bold: true,
-                    ..TextAttrs::none()
-                });
-            }
-            StyledLine::from_spans(vec![span])
-        })
-        .collect()
 }
 
 /// A span's byte range within the flattened source, plus its styling.
@@ -1522,6 +2348,107 @@ mod tests {
         assert_eq!(roles, vec![Role::Edit, Role::Tool]);
     }
 
+    /// A ticking task is one card that updates, not one row per tick: a build
+    /// that reports a hundred times must not push the conversation off screen.
+    #[test]
+    fn progress_ticks_refine_one_card() {
+        let mut transcript = Transcript::default();
+        transcript.set_progress("t1", "bash", "10% · compiling", Some(10.0));
+        transcript.set_progress("t1", "bash", "90% · linking", Some(90.0));
+        let cards: Vec<&Message> = transcript
+            .messages()
+            .iter()
+            .filter(|message| message.role == Role::Progress)
+            .collect();
+        assert_eq!(cards.len(), 1, "a tick added a row instead of updating one");
+        assert_eq!(cards[0].source, "bash · 90% · linking");
+        assert_eq!(cards[0].fraction(), Some(0.9));
+    }
+
+    /// Two tasks are two bars, in the order they started: collapsing them would
+    /// hide which of several waits is the slow one.
+    #[test]
+    fn several_tasks_keep_their_own_bars_in_start_order() {
+        let mut transcript = Transcript::default();
+        transcript.set_progress("first", "bash", "5%", Some(5.0));
+        transcript.set_progress("second", "swarm", "working", None);
+        transcript.set_progress("first", "bash", "50%", Some(50.0));
+        let ids: Vec<&str> = transcript
+            .messages()
+            .iter()
+            .filter(|message| message.role == Role::Progress)
+            .map(|message| message.call_id.as_deref().expect("a task id"))
+            .collect();
+        assert_eq!(ids, vec!["first", "second"]);
+        assert!(transcript.has_indeterminate_progress());
+    }
+
+    /// A finished task retires its own bar and only its own.
+    #[test]
+    fn a_finished_task_retires_only_its_own_bar() {
+        let mut transcript = Transcript::default();
+        transcript.set_progress("a", "bash", "50%", Some(50.0));
+        transcript.set_progress("b", "bash", "20%", Some(20.0));
+        assert!(transcript.clear_progress("a"));
+        assert!(
+            !transcript.clear_progress("a"),
+            "clearing a retired bar reported a change"
+        );
+        let ids: Vec<&str> = transcript
+            .messages()
+            .iter()
+            .filter(|message| message.role == Role::Progress)
+            .map(|message| message.call_id.as_deref().expect("a task id"))
+            .collect();
+        assert_eq!(ids, vec!["b"]);
+        assert!(transcript.has_progress());
+        assert!(!transcript.has_indeterminate_progress());
+        transcript.clear_all_progress();
+        assert!(!transcript.has_progress());
+    }
+
+    /// The tail band's order: streamed text above, then the live tool card,
+    /// then the bars, then anything the user queued. A bar that drifts into the
+    /// middle of the conversation would read as history.
+    #[test]
+    fn progress_cards_sit_between_the_tool_card_and_the_queue() {
+        let mut transcript = Transcript::default();
+        transcript.push(Message::user("go"));
+        transcript.set_live_tool("call_1", "wait for the build");
+        transcript.set_progress("t1", "bash", "40%", Some(40.0));
+        transcript.push(Message::queued("and then deploy"));
+        transcript.append_assistant("Building. ");
+        let roles: Vec<Role> = transcript.messages().iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::Progress,
+                Role::User,
+            ],
+            "the live status band came apart"
+        );
+    }
+
+    /// An out-of-range percentage is clamped rather than drawn past the track's
+    /// end: a task reporting 420% is a bug in the task, not licence to paint
+    /// over the message below.
+    #[test]
+    fn a_cards_fraction_is_clamped_to_the_track() {
+        let mut transcript = Transcript::default();
+        transcript.set_progress("t1", "bash", "over", Some(420.0));
+        transcript.set_progress("t2", "bash", "under", Some(-5.0));
+        let fractions: Vec<Option<f64>> = transcript
+            .messages()
+            .iter()
+            .filter(|message| message.role == Role::Progress)
+            .map(Message::fraction)
+            .collect();
+        assert_eq!(fractions, vec![Some(1.0), Some(0.0)]);
+    }
+
     /// Added and removed lines take their own ink, so a diff is read by
     /// scanning colour rather than by inspecting the first character of every
     /// line. Ink is checked at the span level, since that is what the layout
@@ -1529,13 +2456,120 @@ mod tests {
     #[test]
     fn diff_lines_take_their_side_s_ink() {
         let theme = theme();
-        let spans = super::diff_spans("10- old\n10+ new\n...\n", &theme);
+        // No language: every span falls back to the side's own ink, which is
+        // one span for the gutter and one for the code.
+        let spans = super::diff_spans("10- old\n10+ new\n… 2 more lines\n", None, &theme);
         let inks: Vec<Color> = spans.iter().map(|span| span.color.expect("ink")).collect();
         assert_eq!(
             inks,
-            vec![theme.removed, theme.added],
+            vec![
+                theme.removed,
+                theme.removed,
+                theme.added,
+                theme.added,
+                theme.muted
+            ],
             "a truncation marker must not be coloured as a change"
         );
+    }
+
+    /// With a language, the code is syntax-highlighted while the gutter keeps
+    /// the diff's own ink: a diff must stay scannable by side *and* readable
+    /// as the language it is written in.
+    #[test]
+    fn a_diff_is_highlighted_but_still_takes_sides() {
+        let theme = theme();
+        let source = "10+ let x = \"hi\";\n";
+        let spans = super::diff_spans(source, Some("rs"), &theme);
+        let gutter = spans.first().expect("a gutter span");
+        assert_eq!(gutter.range, 0..3, "the gutter is the digits and the sign");
+        assert_eq!(gutter.color, Some(theme.added));
+        // Some span past the gutter must differ from the plain added ink, or
+        // nothing was highlighted at all.
+        assert!(
+            spans
+                .iter()
+                .skip(1)
+                .any(|span| span.color != Some(theme.added)),
+            "the code was not highlighted"
+        );
+        // And every span must stay inside the line.
+        assert!(spans.iter().all(|span| span.range.end <= source.len()));
+    }
+
+    /// A long diff is summarised rather than pasted whole: the card is one
+    /// turn in a conversation, and the counts still report the full change.
+    #[test]
+    fn a_long_diff_is_truncated() {
+        let diff: String = (1..=200).map(|line| format!("{line}+ x\n")).collect();
+        let card = crate::edits::EditCard {
+            intent: None,
+            files: vec!["a.rs".into()],
+            diff,
+            added: 200,
+            removed: 0,
+        };
+        let source = super::edit_source(&card);
+        let rows = source
+            .lines()
+            .filter(|line| crate::edits::classify(line).is_some())
+            .count();
+        assert_eq!(rows, super::DIFF_ROW_LIMIT);
+        assert!(
+            source.contains(&format!("{} more lines", 200 - super::DIFF_ROW_LIMIT)),
+            "{source}"
+        );
+        assert!(
+            source.contains("+200 -0"),
+            "the counts report the whole change"
+        );
+    }
+
+    /// Line numbers are padded to one width, so both sides of a change start
+    /// at the same column and can actually be compared.
+    #[test]
+    fn diff_gutters_are_aligned() {
+        let card = crate::edits::EditCard {
+            intent: None,
+            files: vec!["a.rs".into()],
+            diff: "9- old\n10+ new\n".into(),
+            added: 1,
+            removed: 1,
+        };
+        let source = super::edit_source(&card);
+        let rows: Vec<&str> = source
+            .lines()
+            .filter(|line| crate::edits::classify(line).is_some())
+            .collect();
+        assert_eq!(rows, vec![" 9- old", "10+ new"]);
+    }
+
+    /// The fence carries the file's language, so the body goes through the
+    /// same highlighting path as any other fenced block.
+    #[test]
+    fn an_edit_card_names_its_language() {
+        let card = crate::edits::EditCard {
+            intent: None,
+            files: vec!["src/main.rs".into()],
+            diff: "1+ x\n".into(),
+            added: 1,
+            removed: 0,
+        };
+        assert!(super::edit_source(&card).contains("```rs\n"));
+    }
+
+    /// Only the part of a paired row that differs is marked, and the marks
+    /// are inside the two lines they belong to.
+    #[test]
+    fn only_the_changed_part_of_a_row_is_marked() {
+        let (old, new) =
+            super::changed_span("let alpha = 1;", "let fade = 1;").expect("a narrowed change");
+        assert_eq!(&"let alpha = 1;"[old], "alpha");
+        assert_eq!(&"let fade = 1;"[new], "fade");
+        // Identical lines have nothing to mark, and a wholly different line is
+        // not worth narrowing: the row band already says so.
+        assert_eq!(super::changed_span("same", "same"), None);
+        assert_eq!(super::changed_span("abc", "xyz"), None);
     }
 
     /// The card is a slot, not a log: the next call takes it over, and text
@@ -1953,7 +2987,8 @@ mod tests {
 
     /// Table cells line up into columns. A naive `join(" ")` adapter passes
     /// the test above while rendering an unreadable ragged block, so the
-    /// alignment itself has to be asserted.
+    /// alignment itself has to be asserted: every row's second column has to
+    /// start at the same cell.
     #[test]
     fn table_columns_are_aligned() {
         let rows = vec![
@@ -1961,27 +2996,319 @@ mod tests {
             vec!["hello".to_string(), "client".to_string()],
             vec!["a-much-longer-frame".to_string(), "server".to_string()],
         ];
-        let lines = table_lines(&rows);
-        let starts: Vec<usize> = lines
+        let lines = table_lines(&rows, &[], 80);
+        let seconds: Vec<usize> = lines
             .iter()
-            .map(|line| {
-                let text = line.plain_text();
-                text.find(|c: char| c != ' ')
-                    .map(|_| {
-                        // Column two starts after the padded first cell.
-                        text.len() - text.trim_start_matches(|c: char| c != ' ').len()
+            .map(|line| line.plain_text())
+            // The header rule is solid, so it has no column boundary to find.
+            .filter(|text| !text.starts_with('\u{2500}'))
+            .map(|text| {
+                text.find("  ")
+                    .map(|index| {
+                        text[index..].trim_start().as_ptr() as usize - text.as_ptr() as usize
                     })
                     .unwrap_or(0)
             })
             .collect();
-        let text: Vec<String> = lines.iter().map(|l| l.plain_text()).collect();
-        let second_column: Vec<usize> = text
-            .iter()
-            .map(|line| line.rfind("  ").map(|i| i + 2).unwrap_or(0))
-            .collect();
         assert!(
-            second_column.windows(2).all(|w| w[0] == w[1]),
-            "table columns did not align: {text:?} (starts {starts:?})"
+            seconds.windows(2).all(|pair| pair[0] == pair[1]),
+            "table columns did not align: {seconds:?}"
+        );
+    }
+
+    /// A table wider than its measure is squeezed to fit, not run off the page.
+    /// This is the failure a reader notices first: the right-hand columns of a
+    /// wide table were simply not on screen.
+    #[test]
+    fn wide_tables_fit_the_measure() {
+        use unicode_width::UnicodeWidthStr;
+
+        let rows = vec![
+            vec![
+                "a very wide heading indeed".to_string(),
+                "another wide heading here".to_string(),
+                "third wide heading again".to_string(),
+            ],
+            vec![
+                "lorem ipsum dolor sit amet consectetur adipiscing".to_string(),
+                "sed do eiusmod tempor incididunt ut labore".to_string(),
+                "magna aliqua ut enim ad minim veniam".to_string(),
+            ],
+        ];
+        let columns = 40;
+        for line in table_lines(&rows, &[], columns) {
+            let text = line.plain_text();
+            assert!(
+                text.width() <= columns,
+                "table line overflows the measure ({} > {columns}): {text:?}",
+                text.width()
+            );
+        }
+    }
+
+    /// A squeezed cell wraps inside its column instead of losing its tail: a
+    /// table is often the densest thing in a reply, so truncation hides the
+    /// answer.
+    #[test]
+    fn squeezed_cells_wrap_rather_than_truncate() {
+        let rows = vec![
+            vec!["h".to_string(), "heading".to_string()],
+            vec![
+                "one two three four five six seven".to_string(),
+                "x".to_string(),
+            ],
+        ];
+        let text: String = table_lines(&rows, &[], 24)
+            .iter()
+            .map(|line| line.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for word in ["one", "seven"] {
+            assert!(text.contains(word), "cell text lost {word:?}: {text:?}");
+        }
+    }
+
+    /// A delimiter row's alignment is honoured: a right-aligned numeric column
+    /// that renders left-aligned misreads what the author wrote.
+    #[test]
+    fn table_alignment_follows_the_delimiter_row() {
+        let document = parse_markdown(
+            "| n |
+|--:|
+| 1 |
+| 1000 |",
+        );
+        let table = document
+            .blocks
+            .iter()
+            .find(|block| block.kind == BlockKind::Table)
+            .expect("no table block");
+        assert_eq!(table.alignments.first().copied(), Some(Alignment::Right));
+        let lines = table_lines(&table.table, &table.alignments, 80);
+        let short = lines
+            .iter()
+            .map(|line| line.plain_text())
+            .find(|text| text.trim() == "1")
+            .expect("no short row");
+        assert!(
+            short.starts_with(' '),
+            "right-aligned cell was not padded on the left: {short:?}"
+        );
+    }
+
+    /// A table's header is separated from its body by a rule, so the table
+    /// reads as a table rather than as bold text sitting above some rows.
+    #[test]
+    fn tables_rule_off_their_header() {
+        let lines = table_lines(
+            &[
+                vec!["a".to_string(), "b".to_string()],
+                vec!["1".to_string(), "2".to_string()],
+            ],
+            &[],
+            80,
+        );
+        let second = lines[1].plain_text();
+        assert!(
+            second.chars().all(|glyph| glyph == '\u{2500}'),
+            "no header rule under the header row: {second:?}"
+        );
+    }
+
+    /// A fenced block written under a list item belongs to that item. Indenting
+    /// only the item pulled the code back to the margin, which broke the list
+    /// open around it.
+    #[test]
+    fn blocks_nested_in_a_list_keep_the_list_indent() {
+        let document = parse_markdown(
+            "1. step one
+
+   ```rust
+   let x = 1;
+   ```
+",
+        );
+        let code = document
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::CodeBlock { .. }))
+            .expect("no code block");
+        assert_eq!(code.list_depth, 1, "code block lost its list context");
+        assert!(
+            block_inset(code) > CODE_PAD_X,
+            "nested code block was not indented into its list item"
+        );
+    }
+
+    /// A table streams in one character at a time without panicking or losing
+    /// its columns. Half a delimiter row is not a table yet, and the block a
+    /// prefix parses into changes shape as the rows arrive, which is exactly
+    /// the case a width-dependent layout can get wrong.
+    #[test]
+    fn tables_survive_being_streamed() {
+        let source = "| a | bb |\n|:--|--:|\n| 1 | 2000 |\n| 3 | 4 |\n";
+        let mut text = TextSystem::default();
+        for end in source
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([source.len()])
+        {
+            let laid = lay_out_message(
+                &mut text,
+                &Message::assistant(&source[..end]),
+                600.0,
+                &theme(),
+                base(),
+                1.75,
+            );
+            assert!(laid.height >= 0.0);
+        }
+    }
+
+    /// Copying a table pastes usable text. The transcript's rule is "what you
+    /// see is what you paste", so the columns come along, but no line may carry
+    /// trailing padding: pasted into an editor that is what shows up as a
+    /// ragged block of invisible whitespace.
+    #[test]
+    fn copied_table_lines_carry_no_trailing_padding() {
+        let laid = laid("| a | bbbb |\n|---|---|\n| 1 | 2 |\n");
+        let table = laid
+            .blocks
+            .iter()
+            .find(|block| block.kind == BlockKind::Table)
+            .expect("no table block");
+        for line in table.source.lines() {
+            assert_eq!(
+                line.trim_end(),
+                line,
+                "copied table line carries trailing padding: {line:?}"
+            );
+        }
+    }
+
+    /// A table laid out to a narrow measure still fits it, and still has every
+    /// column. The squeeze is the only thing standing between a narrow window
+    /// and a table drawn off the page, so it is asserted through the real
+    /// layout rather than only through `table_lines`.
+    #[test]
+    fn narrow_windows_still_fit_their_tables() {
+        let mut text = TextSystem::default();
+        let source = "| field | meaning | bytes |\n|:--|:-:|--:|\n\
+                      | `kind` | which frame this is and how to read it | 1 |\n\
+                      | `payload` | length-prefixed line-delimited JSON | 4096 |\n";
+        for width in [220.0, 320.0, 600.0] {
+            let laid = lay_out_message(
+                &mut text,
+                &Message::assistant(source),
+                width,
+                &theme(),
+                base(),
+                1.75,
+            );
+            let table = laid
+                .blocks
+                .iter()
+                .find(|block| block.kind == BlockKind::Table)
+                .expect("no table block");
+            // Wrapping inside a cell is fine; wrapping the *row* is what the
+            // budget exists to prevent, because a wrapped row breaks the
+            // columns the reader is scanning down.
+            let rows = table.source.lines().count();
+            assert!(rows >= 4, "table lost rows at width {width}: {rows}");
+            for header in ["field", "meaning", "bytes"] {
+                assert!(
+                    table.source.contains(header),
+                    "table lost the {header:?} column at width {width}"
+                );
+            }
+        }
+    }
+
+    /// A nested block's furniture starts at the block's edge, which is inside
+    /// the list indent it inherited. Drawing the wash from the message margin
+    /// left it visibly detached from the text it is supposed to wrap.
+    #[test]
+    fn nested_block_furniture_follows_its_indent() {
+        let laid = laid("1. step one\n\n   ```rust\n   let x = 1;\n   ```\n");
+        let code = laid
+            .blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::CodeBlock { .. }))
+            .expect("no code block");
+        assert!(
+            code.edge() >= LIST_INDENT,
+            "nested code wash sat at the margin (edge {})",
+            code.edge()
+        );
+        assert!(
+            (code.inset - code.edge() - CODE_PAD_X).abs() < f64::EPSILON,
+            "wash and text disagree about the block's padding"
+        );
+    }
+
+    /// A loose item's continuation paragraph hangs under the item's text. Left
+    /// at the margin it read as a new paragraph that had escaped the list.
+    #[test]
+    fn list_continuation_paragraphs_hang_under_their_item() {
+        let document = parse_markdown("1. step one\n\n   then dispatch on it.\n");
+        let items: Vec<&Block> = document
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::ListItem { .. }))
+            .collect();
+        assert_eq!(items.len(), 2, "expected the item and its continuation");
+        assert!(
+            block_inset(items[1]) > block_inset(items[0]),
+            "continuation paragraph was not indented under its item"
+        );
+    }
+
+    /// A task list renders as checkboxes. `[x]` on screen is markdown source
+    /// sitting next to a bullet that *was* rendered.
+    #[test]
+    fn task_lists_render_as_checkboxes() {
+        let document = parse_markdown(
+            "- [ ] todo
+- [x] done",
+        );
+        let text: String = document
+            .blocks
+            .iter()
+            .flat_map(|block| block_lines(block, || 80))
+            .map(|line| line.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("[ ]") && !text.contains("[x]"),
+            "raw task markers survived: {text:?}"
+        );
+        assert!(
+            text.contains('\u{2610}') && text.contains('\u{2611}'),
+            "no checkboxes drawn: {text:?}"
+        );
+    }
+
+    /// A quote inside a quote stays visibly deeper. The block carries one drawn
+    /// rule, so stripping *every* bar flattened the inner quote onto the outer
+    /// one, and "who is being quoted here" is the whole point of the nesting.
+    #[test]
+    fn nested_quotes_keep_their_inner_bars() {
+        let document = parse_markdown("> outer\n> > inner\n");
+        let quote = document
+            .blocks
+            .iter()
+            .find(|block| block.kind == BlockKind::BlockQuote)
+            .expect("no quote block");
+        let lines = block_lines(quote, || 80);
+        let text: Vec<String> = lines.iter().map(StyledLine::plain_text).collect();
+        assert!(
+            text.iter().any(|line| line.trim() == "outer"),
+            "outer quote kept its bar: {text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains('\u{2502}') && line.contains("inner")),
+            "nested quote lost its depth: {text:?}"
         );
     }
 
@@ -1995,7 +3322,7 @@ mod tests {
             .iter()
             .find(|block| block.kind == BlockKind::BlockQuote)
             .expect("no quote block");
-        let lines = block_lines(quote);
+        let lines = block_lines(quote, || 80);
         for line in &lines {
             assert!(
                 !line.plain_text().contains('\u{2502}'),
@@ -2121,7 +3448,7 @@ mod tests {
     #[test]
     fn a_link_is_underlined() {
         let document = parse_markdown("see [the docs](https://example.com) for more");
-        let lines = block_lines(&document.blocks[0]);
+        let lines = block_lines(&document.blocks[0], || 80);
         let (_, spans) = flatten(&lines);
         assert!(
             spans

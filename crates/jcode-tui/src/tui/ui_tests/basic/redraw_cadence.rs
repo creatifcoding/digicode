@@ -114,6 +114,7 @@ fn a_status_notice_still_requires_periodic_frames() {
 /// here we only require that the donut still animates.
 #[test]
 fn an_idle_empty_session_still_animates_smoothly() {
+    let _idle_animation = IdleAnimationEnvGuard::enable();
     // Pin the tier: the auto-detected one depends on host load, and a
     // Reduced/Minimal host legitimately disables the decorative animation.
     crate::perf::pin_full_profile_for_tests();
@@ -156,6 +157,7 @@ fn active_typing_backs_the_decorative_animation_off() {
 /// animation: the backoff is about active typing, not about having text.
 #[test]
 fn a_paused_draft_lets_the_animation_recover() {
+    let _idle_animation = IdleAnimationEnvGuard::enable();
     // Pin the tier: the auto-detected one depends on host load, and a
     // Reduced/Minimal host legitimately disables the decorative animation.
     crate::perf::pin_full_profile_for_tests();
@@ -183,6 +185,7 @@ fn a_paused_draft_lets_the_animation_recover() {
 /// decoration is the difference the user felt as "spawning a new one still lags".
 #[test]
 fn the_decorative_animation_is_capped_below_the_configured_animation_rate() {
+    let _idle_animation = IdleAnimationEnvGuard::enable();
     // Pin the tier: the auto-detected one depends on host load, and a
     // Reduced/Minimal host legitimately disables the decorative animation.
     crate::perf::pin_full_profile_for_tests();
@@ -213,6 +216,7 @@ fn the_decorative_animation_is_capped_below_the_configured_animation_rate() {
 /// ceiling, not an override.
 #[test]
 fn a_lower_configured_animation_rate_is_respected() {
+    let _idle_animation = IdleAnimationEnvGuard::enable();
     // Pin the tier: the auto-detected one depends on host load, and a
     // Reduced/Minimal host legitimately disables the decorative animation.
     crate::perf::pin_full_profile_for_tests();
@@ -226,5 +230,77 @@ fn a_lower_configured_animation_rate_is_respected() {
         crate::tui::redraw_interval_with_policy(&idle, &policy),
         Duration::from_millis(100),
         "a configured 10fps must not be raised by the decorative cap"
+    );
+}
+
+/// The post-onboarding notice screen: the transcript holds only system
+/// notices ("Here are a few things you can try", the login summary), the user
+/// pressed a key moments ago, and no stream has ever run in this process.
+///
+/// `time_since_activity()` reports "past the deep-idle threshold" for any
+/// non-empty never-streamed transcript, which is meant for *restored dormant*
+/// sessions. Treating this screen as dormant parked the donut and the redraw
+/// loop at the 5s crawl the instant onboarding finished, so the decorative
+/// animation never ran on the exact screen it was designed for. A recent
+/// keystroke is proof the session is not dormant.
+fn just_touched_notice_screen() -> TestState {
+    TestState {
+        display_messages: vec![DisplayMessage {
+            role: "system".to_string(),
+            content: "Here are a few things you can try: ...".to_string(),
+            tool_calls: vec![],
+            duration_secs: None,
+            title: None,
+            tool_data: None,
+        }],
+        status: ProcessingStatus::Idle,
+        // What `time_since_activity()` actually reports for a non-empty
+        // transcript that has never streamed: already past deep idle.
+        time_since_activity: Some(crate::tui::REDRAW_DEEP_IDLE_AFTER + Duration::from_secs(1)),
+        // The user pressed a key two seconds ago (long enough that the
+        // typing backoff has expired, far from dormant).
+        time_since_user_interaction: Some(Duration::from_secs(2)),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_recent_keystroke_keeps_the_notice_screen_out_of_deep_idle() {
+    let _idle_animation = IdleAnimationEnvGuard::enable();
+    crate::perf::pin_full_profile_for_tests();
+    let policy = full_tier_policy();
+
+    let state = just_touched_notice_screen();
+    assert!(
+        crate::tui::idle_donut_active(&state),
+        "a notice-only screen the user just touched wants the donut"
+    );
+    let interval = crate::tui::redraw_interval_with_policy(&state, &policy);
+    assert!(
+        interval < crate::tui::REDRAW_IDLE && interval <= Duration::from_millis(40),
+        "the animation must actually be paced, not parked at deep idle (got {interval:?})"
+    );
+}
+
+/// The flip side: once the user walks away for the deep-idle window, the same
+/// screen must still fall back to the crawl. The fix is about *recent*
+/// interaction, not about disabling deep idle for notice screens.
+#[test]
+fn a_notice_screen_left_alone_still_reaches_deep_idle() {
+    let _idle_animation = IdleAnimationEnvGuard::enable();
+    crate::perf::pin_full_profile_for_tests();
+    let policy = full_tier_policy();
+
+    let mut state = just_touched_notice_screen();
+    state.time_since_user_interaction =
+        Some(crate::tui::REDRAW_DEEP_IDLE_AFTER + Duration::from_secs(1));
+    assert!(
+        !crate::tui::idle_donut_active(&state),
+        "a dormant notice screen must not keep the donut spinning"
+    );
+    assert_eq!(
+        crate::tui::redraw_interval_with_policy(&state, &policy),
+        crate::tui::REDRAW_DEEP_IDLE,
+        "a dormant notice screen must tick at the deep-idle crawl"
     );
 }

@@ -34,15 +34,20 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("reasoning_streaming", reasoning_streaming),
     ("reasoning_paragraphs", reasoning_paragraphs),
     ("tool_progress", tool_progress),
+    ("background_progress", background_progress),
+    ("background_progress_many", background_progress_many),
     ("edit_card", edit_card),
     ("edit_cards_many", edit_cards_many),
+    ("edit_card_large", edit_card_large),
     ("working", working),
+    ("message_sent", message_sent),
     ("queued_message", queued_message),
     ("turn_done", turn_done),
     ("transcript_selection", transcript_selection),
     ("scrolled_back", scrolled_back),
     ("markdown", markdown),
     ("markdown_typography", markdown_typography),
+    ("markdown_structure", markdown_structure),
     ("latex", latex),
     ("code_block", code_block),
     ("session_strip", session_strip),
@@ -54,6 +59,8 @@ pub const NODES: &[(&str, NodeBuilder)] = &[
     ("overview_preview", overview_preview),
     ("overview_single_session", overview_single_session),
     ("overview_many_sessions", overview_many_sessions),
+    ("settings_panel", settings_panel),
+    ("settings_panel_hover", settings_panel_hover),
     ("notice", notice),
     ("error", error),
     ("offline", offline),
@@ -139,9 +146,21 @@ fn connecting() -> Model {
         // Pinned off: a live RAM figure would make every capture depend on
         // the machine and moment it ran on.
         mem: None,
+        // No bars on screen by default, so nothing animates: a node that wants
+        // one sets it (see `background_progress`).
+        progress_clock: None,
         // Settled: a node renders the window after the boot reveal, so every
         // existing capture is unchanged by it. The reveal has its own nodes.
         boot: crate::boot::Boot::default(),
+        // Pinned, not loaded: a capture must not depend on the developer's own
+        // saved preferences. The panel is shut, so every existing node is
+        // pixel-identical; `settings_panel` is the node that opens it.
+        settings: crate::settings::Settings {
+            theme: crate::theme::ThemeMode::Light,
+            reasoning: crate::reasoning::ReasoningMode::Current,
+            motion: true,
+        },
+        panel: crate::settings::Panel::default(),
     }
 }
 
@@ -250,9 +269,21 @@ fn attached_empty() -> Model {
         // Pinned off: a live RAM figure would make every capture depend on
         // the machine and moment it ran on.
         mem: None,
+        // No bars on screen by default, so nothing animates: a node that wants
+        // one sets it (see `background_progress`).
+        progress_clock: None,
         // Settled: a node renders the window after the boot reveal, so every
         // existing capture is unchanged by it. The reveal has its own nodes.
         boot: crate::boot::Boot::default(),
+        // Pinned, not loaded: a capture must not depend on the developer's own
+        // saved preferences. The panel is shut, so every existing node is
+        // pixel-identical; `settings_panel` is the node that opens it.
+        settings: crate::settings::Settings {
+            theme: crate::theme::ThemeMode::Light,
+            reasoning: crate::reasoning::ReasoningMode::Current,
+            motion: true,
+        },
+        panel: crate::settings::Panel::default(),
     }
 }
 
@@ -660,6 +691,34 @@ fn overview_preview() -> Model {
     }
 }
 
+/// The settings panel, open on an empty session: the state a user lands in
+/// the moment they click the gear.
+fn settings_panel() -> Model {
+    let mut panel = crate::settings::Panel::default();
+    panel.open();
+    Model {
+        panel,
+        ..attached_empty()
+    }
+}
+
+/// The same panel with a row highlighted, so the hover band is a capture
+/// rather than something only visible with a mouse in hand.
+fn settings_panel_hover() -> Model {
+    let mut panel = crate::settings::Panel::default();
+    panel.open();
+    panel.set_hover(Some(1));
+    Model {
+        panel,
+        settings: crate::settings::Settings {
+            theme: crate::theme::ThemeMode::Light,
+            reasoning: crate::reasoning::ReasoningMode::Full,
+            motion: false,
+        },
+        ..attached_empty()
+    }
+}
+
 fn notice() -> Model {
     Model {
         editor: editor_with("undo me", None),
@@ -765,6 +824,65 @@ fn tool_progress() -> Model {
     }
 }
 
+/// Waiting on a background task, with its bar on the page. This is the state a
+/// spinner cannot express: the agent is blocked on work that *does* know how
+/// far along it is, and a window that only says "still working" throws that
+/// away.
+fn background_progress() -> Model {
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("run the whole workspace test suite"));
+    transcript.set_live_tool("call_1", "wait for the test sweep");
+    transcript.set_progress(
+        "224715dw29",
+        "bash",
+        "62% · Running jcode-desktop2 tests",
+        Some(62.0),
+    );
+    Model {
+        transcript,
+        busy: true,
+        activity: crate::activity::Activity::pinned(
+            2,
+            std::time::Duration::from_secs(94),
+            Some("wait for the test sweep"),
+        ),
+        // Pinned to the render clock's own instant, so the indeterminate bar in
+        // `background_progress_many` draws at phase zero rather than wherever
+        // the wall clock happens to be.
+        progress_clock: None,
+        ..attached_empty()
+    }
+}
+
+/// Several tasks at once, one of them unable to report a percentage. Bars do
+/// not collapse into one line: a turn waiting on three things has to show which
+/// of them is the one that is stuck.
+fn background_progress_many() -> Model {
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("build, test, and deploy the preview"));
+    transcript.set_progress(
+        "build-1",
+        "bash",
+        "88% · Compiling jcode-app-core",
+        Some(88.0),
+    );
+    transcript.set_progress("test-1", "bash", "12/96 crates", Some(12.5));
+    transcript.set_progress("swarm-1", "swarm", "working · waiting on 3 workers", None);
+    transcript.set_live_tool("call_4", "wait for the plan to resolve");
+    Model {
+        transcript,
+        busy: true,
+        activity: crate::activity::Activity::pinned(
+            6,
+            std::time::Duration::from_secs(212),
+            Some("wait for the plan to resolve"),
+        ),
+        ..attached_empty()
+    }
+}
+
 /// A finished edit, kept in the transcript. This is the state the live tool
 /// card cannot express: the call is over, but what it *did* to the user's files
 /// has to stay readable, so the intent, the file, and the changed lines stand as
@@ -829,6 +947,33 @@ fn edit_cards_many() -> Model {
     }
 }
 
+/// A rewrite big enough that the card cannot show all of it, over a file whose
+/// language is not one the highlighter knows. Both are the cases where a diff
+/// card most easily goes wrong: it either swallows the page or renders as a
+/// wall of one colour.
+fn edit_card_large() -> Model {
+    use crate::edits::EditCard;
+    use crate::transcript::{Message, Transcript};
+    let mut transcript = Transcript::default();
+    transcript.push(Message::user("port the config loader to the new schema"));
+    let mut diff = String::new();
+    for line in 1..=60usize {
+        diff.push_str(&format!("{line}- old_key_{line} = \"value {line}\"\n"));
+        diff.push_str(&format!("{line}+ new.key.{line} = \"value {line}\"\n"));
+    }
+    transcript.push_edit(&EditCard {
+        intent: Some("move every key under the new namespace".into()),
+        files: vec!["config/defaults.toml".into()],
+        diff,
+        added: 60,
+        removed: 60,
+    });
+    Model {
+        transcript,
+        ..attached_empty()
+    }
+}
+
 fn streaming() -> Model {
     Model {
         transcript: conversation(vec![(
@@ -861,6 +1006,24 @@ fn working() -> Model {
             std::time::Duration::from_secs(42),
             Some("running the desktop2 test suite"),
         ),
+        ..attached_empty()
+    }
+}
+
+/// The first frame after Enter: the message is on the page and out the socket,
+/// but nothing has confirmed it landed. This is the longest-lived state of the
+/// send lifecycle on a slow link, and the one where the user is most likely to
+/// be staring at their own words, so it gets a node of its own: the tone here
+/// is what made a prompt unreadable in dark mode.
+fn message_sent() -> Model {
+    let mut transcript = crate::transcript::Transcript::default();
+    transcript.push(crate::transcript::Message::sent(
+        "explain the harness API handshake",
+    ));
+    Model {
+        transcript,
+        busy: true,
+        activity: crate::activity::Activity::pinned(0, std::time::Duration::ZERO, None),
         ..attached_empty()
     }
 }
@@ -983,6 +1146,43 @@ fn markdown_typography() -> Model {
                 "tail, so the total is\n\n",
                 "$$\\sum_{i=1}^{n} c_i \\leq n \\cdot \\max_i c_i$$\n\n",
                 "which is why streaming stays flat. Use `--stream-bench` to check it.\n",
+            )
+            .into(),
+        )]),
+        ..attached_empty()
+    }
+}
+
+/// The structural end of markdown: a wide aligned table, a task list, and a
+/// list with a fenced block and a quote written *inside* its items.
+///
+/// These are the cases that read as broken rather than merely plain when the
+/// front-end ignores them: a table that runs off the measure loses its right
+/// columns, `[x]` renders as source next to a rendered bullet, and a fenced
+/// block indented back to the margin breaks its list open.
+fn markdown_structure() -> Model {
+    Model {
+        transcript: conversation(vec![(
+            "what changed in the wire format".into(),
+            concat!(
+                "| field | meaning | bytes |\n",
+                "|:--|:-:|--:|\n",
+                "| `kind` | which frame this is, and how to read the rest of it | 1 |\n",
+                "| `session` | the session the frame belongs to | 16 |\n",
+                "| `payload` | length-prefixed body, encoded as line-delimited JSON | 4096 |\n\n",
+                "Migration:\n\n",
+                "- [x] carry the alignments through the model\n",
+                "- [x] budget the columns against the measure\n",
+                "- [ ] version the header\n\n",
+                "1. read the header\n\n",
+                "   ```rust\n",
+                "   let kind = Kind::from_u8(bytes[0])?;\n",
+                "   ```\n\n",
+                "   then dispatch on it.\n\n",
+                "2. read the payload\n\n",
+                "   > A short frame is a protocol error, never a partial read.\n",
+                "   >\n",
+                "   > > and a long one is a bug in the sender.\n",
             )
             .into(),
         )]),

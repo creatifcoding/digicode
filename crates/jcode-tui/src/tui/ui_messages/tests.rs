@@ -2116,15 +2116,9 @@ fn discovery_message(content: &str, input: serde_json::Value) -> DisplayMessage 
     }
 }
 
-fn first_discovery_message(content: &str, input: serde_json::Value) -> DisplayMessage {
-    let mut message = discovery_message(content, input);
-    message.title = Some(crate::sponsors::DISCOVERY_DISCLOSURE_TAG.to_string());
-    message
-}
-
 #[test]
 fn render_tool_message_shows_discovery_browse_results_and_rationale() {
-    let msg = first_discovery_message(
+    let msg = discovery_message(
         "Discoverable tools in 'payments' (Jcode tool directory; recommendations must be based only on fit; details: https://jcode.sh/discovery-tools):\n\n- agentcard: prepaid virtual Visa cards for AI agents (https://agentcard.sh/?via=jcode-discovery)\n\nBrowse request ID: `11111111-2222-4333-8444-555555555555`",
         serde_json::json!({
             "action": "browse",
@@ -2139,22 +2133,26 @@ fn render_tool_message_shows_discovery_browse_results_and_rationale() {
         .map(extract_line_text)
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(plain.contains("1 integration · payments"), "{plain}");
-    assert!(plain.contains("why: the task needs test-mode"), "{plain}");
     assert!(plain.contains("agentcard"), "{plain}");
-    assert!(plain.contains("prepaid virtual Visa cards"), "{plain}");
-    assert!(plain.contains("agentcard.sh"), "{plain}");
     assert!(
-        plain.contains("Listings are vetted by Jcode maintainers"),
-        "{plain}"
+        !plain.contains("1 integration"),
+        "single-result browse shows only the entry name: {plain}"
     );
     assert!(
-        without_whitespace(&plain).contains("SomeproviderssharerevenuewithJcode"),
-        "the revenue-share disclosure must stay user-visible: {plain}"
+        !plain.contains("why:"),
+        "browse results stay to a single line without rationale: {plain}"
     );
     assert!(
-        without_whitespace(&plain).contains("Learnmore:https://jcode.sh/discovery-tools"),
-        "{plain}"
+        !plain.contains("prepaid virtual Visa cards"),
+        "browse results must not render descriptions: {plain}"
+    );
+    assert!(
+        !plain.contains("agentcard.sh"),
+        "browse results must not render URLs: {plain}"
+    );
+    assert!(
+        !plain.contains("Listings are vetted"),
+        "discovery results must not render the disclosure notice: {plain}"
     );
     assert!(!plain.contains("sponsored result"), "{plain}");
     assert!(
@@ -2179,13 +2177,13 @@ fn render_tool_message_shows_discovery_browse_results_and_rationale() {
 }
 
 #[test]
-fn batched_discovery_renders_first_use_disclosure_inline_once() {
+fn batched_discovery_renders_without_disclosure_notice() {
     let msg = DisplayMessage {
         role: "tool".to_string(),
         content: "--- [1] discover_tools ---\nDiscoverable tools in 'payments' (Jcode tool directory; recommendations must be based only on fit; details: https://jcode.sh/discovery-tools):\n\n- agentcard: prepaid virtual Visa cards for AI agents (https://agentcard.sh/?via=jcode-discovery)\n\nBrowse request ID: `11111111-2222-4333-8444-555555555555`\n\nCompleted: 1 succeeded, 0 failed".to_string(),
         tool_calls: Vec::new(),
         duration_secs: None,
-        title: Some(crate::sponsors::DISCOVERY_DISCLOSURE_TAG.to_string()),
+        title: None,
         tool_data: Some(crate::message::ToolCall {
             id: "call_batch_discovery".to_string(),
             name: "batch".to_string(),
@@ -2212,13 +2210,14 @@ fn batched_discovery_renders_first_use_disclosure_inline_once() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(plain.contains("1 integration · payments"), "{plain}");
-    assert_eq!(
-        plain
-            .matches("Listings are vetted by Jcode maintainers")
-            .count(),
-        1,
-        "the batched first-use notice must render exactly once: {plain}"
+    assert!(plain.contains("agentcard"), "{plain}");
+    assert!(
+        !plain.contains("1 integration"),
+        "single-result browse shows only the entry name: {plain}"
+    );
+    assert!(
+        !plain.contains("Listings are vetted"),
+        "batched discovery must not render the disclosure notice: {plain}"
     );
     assert!(
         !plain
@@ -2257,7 +2256,7 @@ fn render_tool_message_shows_selected_discovery_setup() {
     assert!(plain.contains("agentcard-mcp@1.2.3"), "{plain}");
     assert!(
         !plain.contains("Listings are vetted"),
-        "later discovery results must not repeat the first-use notice: {plain}"
+        "discovery results must not render the disclosure notice: {plain}"
     );
 }
 
