@@ -49,16 +49,25 @@ static ACTIVE_CANDIDATE_CANCELLATIONS: LazyLock<
     StdMutex<HashMap<String, ActiveCandidateCancellation>>,
 > = LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-fn register_cancellation(operation_id: &str, session_id: &str, cancellation: &CancellationToken) {
-    if let Ok(mut active) = ACTIVE_CANDIDATE_CANCELLATIONS.lock() {
-        active.insert(
-            operation_id.to_string(),
-            ActiveCandidateCancellation {
-                session_id: session_id.to_string(),
-                token: cancellation.clone(),
-            },
-        );
+fn register_cancellation(
+    operation_id: &str,
+    session_id: &str,
+    cancellation: &CancellationToken,
+) -> bool {
+    let Ok(mut active) = ACTIVE_CANDIDATE_CANCELLATIONS.lock() else {
+        return false;
+    };
+    if active.contains_key(operation_id) {
+        return false;
     }
+    active.insert(
+        operation_id.to_string(),
+        ActiveCandidateCancellation {
+            session_id: session_id.to_string(),
+            token: cancellation.clone(),
+        },
+    );
+    true
 }
 
 fn unregister_cancellation(operation_id: &str) {
@@ -193,7 +202,11 @@ impl ServerCandidateLaneHost {
         let job = CandidateLaneJob::from_request(request)?;
         let operation_id = job.operation_id.clone();
         let execution_cancellation = CancellationToken::new();
-        register_cancellation(&operation_id, &job.session_id, &execution_cancellation);
+        if !register_cancellation(&operation_id, &job.session_id, &execution_cancellation) {
+            bail!(
+                "candidate execution operation is already active or cancellation registry is unavailable"
+            );
+        }
         let relay = {
             let execution_cancellation = execution_cancellation.clone();
             tokio::spawn(async move {
@@ -607,7 +620,11 @@ mod tests {
     #[test]
     fn cancellation_rejects_a_different_originating_session() {
         let cancellation = CancellationToken::new();
-        register_cancellation("candidate-op-authority", "session-a", &cancellation);
+        assert!(register_cancellation(
+            "candidate-op-authority",
+            "session-a",
+            &cancellation
+        ));
         assert!(!cancel_operation("session-b", "candidate-op-authority"));
         assert!(!cancellation.is_cancelled());
         assert!(cancel_operation("session-a", "candidate-op-authority"));
