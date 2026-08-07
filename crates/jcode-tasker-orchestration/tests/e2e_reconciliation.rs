@@ -435,7 +435,7 @@ fn mutation_policy_rejects_canonical_conflict_and_admits_valid_speculation() {
 }
 
 #[test]
-fn promotion_recovery_rolls_back_prepared_and_finalizes_ref_updated_intents() {
+fn promotion_recovery_retries_prepared_and_finalizes_ref_updated_intents() {
     let rollback = selected_pipeline();
     let mut reconciler = rollback.fixture.promotion();
     let prepared = reconciler
@@ -449,9 +449,9 @@ fn promotion_recovery_rolls_back_prepared_and_finalizes_ref_updated_intents() {
         .expect("recover intent after crash before ref update");
     assert_eq!(
         recovered.action,
-        jcode_tasker_pi::PromotionRecoveryAction::Rollback
+        jcode_tasker_pi::PromotionRecoveryAction::Retry
     );
-    assert_eq!(recovered.intent["state"], "aborted");
+    assert_eq!(recovered.intent["state"], "prepared");
     assert_eq!(
         git(&rollback.fixture.repository, &["rev-parse", CANONICAL_REF]),
         rollback.fixture.base_commit
@@ -460,7 +460,7 @@ fn promotion_recovery_rolls_back_prepared_and_finalizes_ref_updated_intents() {
         restarted
             .git()
             .list_candidate_ref_names()
-            .expect("list refs after rollback")
+            .expect("list refs after retry")
             .len(),
         3
     );
