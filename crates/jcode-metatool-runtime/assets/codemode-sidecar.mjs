@@ -381,13 +381,22 @@ try {
 	  const reconciliationKinds = [
 	    "batch", "plan", "feature_plan", "create", "update", "set_state", "add_dependency", "add_note",
 	    "task_index", "create_feature", "feature_update", "resolve_feature_gate", "set_dependencies",
-	    "set_feature_dependencies", "link", "unlink", "create_candidate_set", "register_candidate",
-	    "submit_candidate", "set_candidate_set_state", "record_round", "record_ballot", "prepare_promotion",
-	    "mark_promotion_ref_updated", "finalize_promotion", "abort_promotion", "rollback_promotion",
-	    "recover_promotion", "resume_promotion", "execute_candidate_lanes",
+	    "set_feature_dependencies", "link", "unlink",
 	  ];
-	  const reconcile = async (kind, payload) => {
+	  const concurrencyLifecycleKinds = new Set([
+	    "create_candidate_set", "register_candidate", "submit_candidate", "set_candidate_set_state",
+	    "record_round", "record_ballot", "prepare_promotion", "mark_promotion_ref_updated",
+	    "finalize_promotion", "abort_promotion", "rollback_promotion", "recover_promotion",
+	    "resume_promotion", "execute_candidate_lanes",
+	  ]);
+	  const unavailableTaskerExecutor = (name) => {
+	    throw new Error("mt.tasker." + name + " failed closed: host_executor_unavailable");
+	  };
+  const reconcile = async (kind, payload) => {
 	    if (reconciled) throw new Error("mt.tasker permits one atomic reconciliation per evaluation");
+	    if (concurrencyLifecycleKinds.has(kind)) {
+	      throw new Error("mt.tasker.reconcile rejects concurrency lifecycle kind: " + kind);
+	    }
 	    if (!reconciliationKinds.includes(kind)) {
 	      throw new Error("unsupported Tasker reconciliation kind: " + kind);
 	    }
@@ -499,23 +508,12 @@ try {
 	    setFeatureDependencies: async (input) => reconcile("set_feature_dependencies", input),
 	    link: async (taskId, featureId) => reconcile("link", { taskId, featureId }),
 	    unlink: async (taskId) => reconcile("unlink", { taskId }),
-	    reconcileConcurrency: async (kind, payload) => reconcile(kind, payload),
-    executeCandidateLanes: async (request) => reconcile("execute_candidate_lanes", request),
-	    createCandidateSet: async (candidateSet, expectedRevision) => reconcile("create_candidate_set", { candidateSet, expectedRevision }),
-	    registerCandidate: async (candidate, expectedRevision) => reconcile("register_candidate", { candidate, expectedRevision }),
-	    submitCandidate: async (candidate, evidence, expectedRevision) => reconcile("submit_candidate", { candidate, evidence, expectedRevision }),
-	    setCandidateSetState: async (candidateSetId, state, expectedRevision) => reconcile("set_candidate_set_state", { candidateSetId, state, expectedRevision }),
-	    recordRound: async (round, expectedRevision) => reconcile("record_round", { round, expectedRevision }),
-	    recordBallot: async (ballot, expectedRevision) => reconcile("record_ballot", { ballot, expectedRevision }),
-	    preparePromotion: async (intent, expectedRevision) => reconcile("prepare_promotion", { intent, expectedRevision }),
-	    markPromotionRefUpdated: async (intentId, observedCommit, expectedRevision) => reconcile("mark_promotion_ref_updated", { intentId, observedCommit, expectedRevision }),
-	    finalizePromotion: async (intentId, expectedRevision) => reconcile("finalize_promotion", { intentId, expectedRevision }),
-	    abortPromotion: async (intentId, reason, expectedRevision) => reconcile("abort_promotion", { intentId, reason, expectedRevision }),
-	    rollbackPromotion: async (intentId, reason, expectedRevision) => reconcile("rollback_promotion", { intentId, reason, expectedRevision }),
-	    recoverPromotion: async (intentId, observedCommit, expectedRevision) => reconcile("recover_promotion", { intentId, observedCommit, expectedRevision }),
-	    resumePromotion: async (intentId, observedCommit, expectedRevision) => reconcile("resume_promotion", { intentId, observedCommit, expectedRevision }),
+	    executeWork: async () => unavailableTaskerExecutor("executeWork"),
+	    adjudicateCandidateSet: async () => unavailableTaskerExecutor("adjudicateCandidateSet"),
+	    promoteCandidate: async () => unavailableTaskerExecutor("promoteCandidate"),
+	    recoverPromotion: async () => unavailableTaskerExecutor("recoverPromotion"),
 	  });
-	}
+}
 
 export async function run(request) {
   const consoleLines = [];

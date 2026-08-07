@@ -5,9 +5,9 @@
     "read/write/sh/exec operate on the GUEST filesystem (cwd /data, the durable workspace store mount), not the host repo.",
     "Store data should include _meta: { summary } for catalog discipline.",
     "The checked-in Tasker parity manifest is docs/TASKER_PARITY_MANIFEST.json; it records the measured Pi method/action counts and the codemode, public-tool-only, and internal-only boundary.",
-    "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot, including ordinary Tasker topology and concurrency projections, and may emit one atomic reconciliation effect; guest code never receives a database or agent-spawning handle.",
-    "Candidate lane execution is a declarative host effect. executeCandidateLanes(request) validates only guest-safe bounded speculative/ensemble intent; plan returns a blocked descriptor and issues the normal receipt, while apply fails with host_executor_unavailable until the server installs its headless/inline CandidateExecutor. The orchestration foundation owns isolated worktrees, host-run validators, and host-derived commit/digest/evidence. The guest receives no session, process, worktree, or database authority.",
-    "Use tasker_mode plan before apply when inspecting a new reconciliation. Plan executes the same ordinary or concurrency mutation semantics against isolated in-memory SQLite forks, returns a normalized stable simulation, and issues a time-bounded host receipt without changing canonical state. Apply requires tasker_receipt and verifies its project, selected concurrency project, snapshot, exact change-set digest, and expiry before mutating canonical state.",
+    "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot, including ordinary Tasker topology and concurrency projections, and may emit one atomic ordinary reconciliation effect; guest code never receives a database or agent-spawning handle.",
+    "Generic tasker.reconcile is ordinary-only. Concurrency lifecycle writers are rejected, and executeWork, adjudicateCandidateSet, promoteCandidate, and recoverPromotion fail closed with host_executor_unavailable until their typed host executors are installed. Candidate-lane execution remains a host-side compatibility path, not the public all-policy API.",
+    "Use tasker_mode plan before apply when inspecting a new ordinary reconciliation. Plan executes the same ordinary mutation semantics against an isolated in-memory SQLite fork, returns a normalized stable simulation, and issues a time-bounded host receipt without changing canonical state. Apply requires tasker_receipt and verifies its project, snapshot, exact change-set digest, and expiry before mutating canonical state.",
     "mt.artifacts is present only when the host grants artifact_mode apply. It exposes a bounded read-only catalog and candidates list, and admitBundle(bundle) emits exactly one host-admitted artifacts.admit_bundle effect; guest code never receives artifact-store filesystem or database authority."
   ],
   "undeclared": [
@@ -393,64 +393,27 @@
         "signature": "async (taskId) -> ReconciliationReceipt"
       },
       {
-        "name": "tasker.executeCandidateLanes",
-        "signature": "async (request) -> bounded host execution plan or host_executor_unavailable block"
+        "name": "tasker.executeWork",
+        "signature": "async (request) -> host_executor_unavailable"
       },
       {
-        "name": "tasker.reconcileConcurrency",
-        "signature": "async (kind, payload) -> ReconciliationReceipt"
+        "name": "tasker.adjudicateCandidateSet",
+        "signature": "async (request) -> host_executor_unavailable"
       },
       {
-        "name": "tasker.createCandidateSet",
-        "signature": "async (candidateSet, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.registerCandidate",
-        "signature": "async (candidate, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.submitCandidate",
-        "signature": "async (candidate, evidence, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.setCandidateSetState",
-        "signature": "async (candidateSetId, state, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.recordRound",
-        "signature": "async (round, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.recordBallot",
-        "signature": "async (ballot, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.preparePromotion",
-        "signature": "async (intent, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.markPromotionRefUpdated",
-        "signature": "async (intentId, observedCommit, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.finalizePromotion",
-        "signature": "async (intentId, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.abortPromotion",
-        "signature": "async (intentId, reason, expectedRevision) -> ReconciliationReceipt"
-      },
-      {
-        "name": "tasker.rollbackPromotion",
-        "signature": "async (intentId, reason, expectedRevision) -> ReconciliationReceipt"
+        "name": "tasker.promoteCandidate",
+        "signature": "async (request) -> host_executor_unavailable"
       },
       {
         "name": "tasker.recoverPromotion",
-        "signature": "async (intentId, observedCommit, expectedRevision) -> ReconciliationReceipt"
-      },
+        "signature": "async (request) -> host_executor_unavailable"
+      }
+    ],
+    "tasker-compatibility": [
       {
-        "name": "tasker.resumePromotion",
-        "signature": "async (intentId, observedCommit, expectedRevision) -> ReconciliationReceipt"
+        "name": "tasker.executeCandidateLanes",
+        "classification": "internal_compatibility_deprecated",
+        "signature": "host-side compatibility effect; not a public mt.tasker method"
       }
     ],
     "artifacts-capability": [

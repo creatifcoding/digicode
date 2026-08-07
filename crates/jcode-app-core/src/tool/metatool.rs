@@ -22,9 +22,8 @@ use jcode_metatool_types::{
 };
 use jcode_tasker_orchestration::{CandidateExecutionReport, CandidateLaneLaunchRequest};
 use jcode_tasker_pi::{
-    BatchOperation, ConcurrencyStore, CreateFeature, CreateTask, FeaturePlanFeature,
-    FeaturePlanInput, NoteInput, PiTaskerStore, PlanTask, ProjectPartition, ResolveFeatureGate,
-    UpdateFeature, UpdateTask,
+    BatchOperation, CreateFeature, CreateTask, FeaturePlanFeature, FeaturePlanInput, NoteInput,
+    PiTaskerStore, PlanTask, ProjectPartition, ResolveFeatureGate, UpdateFeature, UpdateTask,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -56,6 +55,40 @@ const TASKER_RECEIPT_TTL_SECONDS: u64 = 30 * 60;
 const TASKER_RECEIPT_PREFIX: &str = "tpr_";
 const ARTIFACT_CATALOG_LIMIT: usize = 200;
 const ARTIFACT_MAX_TEXT_BYTES: usize = 1024 * 1024;
+const ORDINARY_TASKER_RECONCILIATION_KINDS: &[&str] = &[
+    "batch",
+    "plan",
+    "feature_plan",
+    "create",
+    "update",
+    "set_state",
+    "add_dependency",
+    "add_note",
+    "task_index",
+    "create_feature",
+    "feature_update",
+    "resolve_feature_gate",
+    "set_dependencies",
+    "set_feature_dependencies",
+    "link",
+    "unlink",
+];
+const CONCURRENCY_LIFECYCLE_KINDS: &[&str] = &[
+    "create_candidate_set",
+    "register_candidate",
+    "submit_candidate",
+    "set_candidate_set_state",
+    "record_round",
+    "record_ballot",
+    "prepare_promotion",
+    "mark_promotion_ref_updated",
+    "finalize_promotion",
+    "abort_promotion",
+    "rollback_promotion",
+    "recover_promotion",
+    "resume_promotion",
+];
+const CANDIDATE_LANE_COMPATIBILITY_KIND: &str = "execute_candidate_lanes";
 
 static CANDIDATE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -788,7 +821,7 @@ fn prepare_candidate_lane_apply(
         ));
     }
     let mut input: TaskerEffectInput = serde_json::from_value(effect.input.clone())?;
-    if input.kind != "execute_candidate_lanes" || input.mode != TaskerMode::Apply {
+    if input.kind != CANDIDATE_LANE_COMPATIBILITY_KIND || input.mode != TaskerMode::Apply {
         return Err(anyhow!(
             "candidate host callback received a non-apply effect"
         ));
@@ -1060,21 +1093,19 @@ fn reconcile_tasker_effects(
     if input.expected_snapshot_hash.as_deref() != Some(initial_snapshot_hash) {
         return Err(anyhow!("Tasker capability snapshot identity mismatch"));
     }
+    if is_concurrency_kind(&input.kind) {
+        return Err(concurrency_lifecycle_rejected(&input.kind));
+    }
 
     if requested_mode == TaskerMode::Plan {
         if requested_receipt.is_some() {
             return Err(anyhow!("tasker_receipt is valid only for apply mode"));
         }
         let mut simulation = store.fork_in_memory()?;
-        let mut concurrency_simulation = if is_concurrency_kind(&input.kind) {
-            Some(store.open_concurrency_store()?.fork_in_memory()?)
-        } else {
-            None
-        };
-        let simulated = if input.kind == "execute_candidate_lanes" {
+        let simulated = if input.kind == CANDIDATE_LANE_COMPATIBILITY_KIND {
             candidate_lane_blocked_descriptor(&input.payload)?
         } else {
-            execute_tasker_reconciliation(&mut simulation, &input, concurrency_simulation.as_mut())?
+            execute_tasker_reconciliation(&mut simulation, &input)?
         };
         let simulated = normalize_tasker_simulation(&input, &simulated);
         let receipt = issue_tasker_receipt(receipt_root, store, initial_snapshot_hash, &input)?;
@@ -1114,19 +1145,14 @@ fn reconcile_tasker_effects(
         ));
     }
 
-    if input.kind == "execute_candidate_lanes" {
+    if input.kind == CANDIDATE_LANE_COMPATIBILITY_KIND {
         let _ = candidate_lane_blocked_descriptor(&input.payload)?;
         return Err(anyhow::Error::new(
             CandidateLaneExecutionBlocked::HostExecutorUnavailable,
         ));
     }
 
-    let mut concurrency_store = if is_concurrency_kind(&input.kind) {
-        Some(store.open_concurrency_store()?)
-    } else {
-        None
-    };
-    let applied = execute_tasker_reconciliation(store, &input, concurrency_store.as_mut())?;
+    let applied = execute_tasker_reconciliation(store, &input)?;
     Ok(json!({
         "mode": requested_mode,
         "status": "applied",
@@ -1172,43 +1198,29 @@ fn payload_usize(payload: &Value, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| anyhow!("Tasker reconciliation field {name} is too large"))
 }
 
-fn payload_revision(payload: &Value) -> Result<u64> {
-    payload_field(payload, "expectedRevision")?
-        .as_u64()
-        .ok_or_else(|| anyhow!("Tasker concurrency mutations require expectedRevision"))
-}
-
-fn concurrency_store_mut(
-    concurrency: Option<&mut ConcurrencyStore>,
-) -> Result<&mut ConcurrencyStore> {
-    concurrency.ok_or_else(|| anyhow!("Tasker concurrency operation is unavailable"))
-}
-
 fn is_concurrency_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "create_candidate_set"
-            | "register_candidate"
-            | "submit_candidate"
-            | "set_candidate_set_state"
-            | "record_round"
-            | "record_ballot"
-            | "prepare_promotion"
-            | "mark_promotion_ref_updated"
-            | "finalize_promotion"
-            | "abort_promotion"
-            | "rollback_promotion"
-            | "recover_promotion"
-            | "resume_promotion"
-            | "execute_candidate_lanes"
-    )
+    CONCURRENCY_LIFECYCLE_KINDS.contains(&kind)
+}
+
+fn concurrency_lifecycle_rejected(kind: &str) -> anyhow::Error {
+    anyhow!("Tasker generic ordinary reconcile rejects concurrency lifecycle kind: {kind}")
 }
 
 fn execute_tasker_reconciliation(
     store: &mut PiTaskerStore,
     input: &TaskerEffectInput,
-    concurrency: Option<&mut ConcurrencyStore>,
 ) -> Result<Value> {
+    if is_concurrency_kind(&input.kind) {
+        return Err(concurrency_lifecycle_rejected(&input.kind));
+    }
+    if !ORDINARY_TASKER_RECONCILIATION_KINDS.contains(&input.kind.as_str())
+        && input.kind != CANDIDATE_LANE_COMPATIBILITY_KIND
+    {
+        return Err(anyhow!(
+            "unsupported Tasker reconciliation kind: {}",
+            input.kind
+        ));
+    }
     match input.kind.as_str() {
         "batch" => {
             let operations: Vec<BatchOperation> =
@@ -1461,101 +1473,7 @@ fn execute_tasker_reconciliation(
             store.unlink_task(&task_id)?;
             Ok(json!({"task": store.list_tasks(None)?.into_iter().find(|task| task.id == task_id)}))
         }
-        "create_candidate_set" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            let candidate_set = payload_field(&input.payload, "candidateSet")?;
-            Ok(serde_json::to_value(concurrency.create_candidate_set(
-                candidate_set,
-                payload_revision(&input.payload)?,
-            )?)?)
-        }
-        "register_candidate" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            let candidate = payload_field(&input.payload, "candidate")?;
-            Ok(serde_json::to_value(concurrency.register_candidate(
-                candidate,
-                payload_revision(&input.payload)?,
-            )?)?)
-        }
-        "submit_candidate" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            let candidate = payload_field(&input.payload, "candidate")?;
-            let evidence = payload_field(&input.payload, "evidence")?
-                .as_array()
-                .ok_or_else(|| anyhow!("submit_candidate evidence must be an array"))?;
-            Ok(serde_json::to_value(concurrency.submit_candidate(
-                candidate,
-                evidence,
-                payload_revision(&input.payload)?,
-            )?)?)
-        }
-        "set_candidate_set_state" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            Ok(serde_json::to_value(concurrency.set_candidate_set_state(
-                &payload_string(&input.payload, "candidateSetId")?,
-                &payload_string(&input.payload, "state")?,
-                payload_revision(&input.payload)?,
-            )?)?)
-        }
-        "record_round" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            Ok(serde_json::to_value(
-                concurrency.record_adjudication_round(
-                    payload_field(&input.payload, "round")?,
-                    payload_revision(&input.payload)?,
-                )?,
-            )?)
-        }
-        "record_ballot" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            Ok(serde_json::to_value(
-                concurrency.record_adjudication_ballot(
-                    payload_field(&input.payload, "ballot")?,
-                    payload_revision(&input.payload)?,
-                )?,
-            )?)
-        }
-        "prepare_promotion" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            Ok(serde_json::to_value(concurrency.prepare_promotion(
-                payload_field(&input.payload, "intent")?,
-                payload_revision(&input.payload)?,
-            )?)?)
-        }
-        "mark_promotion_ref_updated" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            Ok(serde_json::to_value(
-                concurrency.mark_promotion_ref_updated(
-                    &payload_string(&input.payload, "intentId")?,
-                    &payload_string(&input.payload, "observedCommit")?,
-                    payload_revision(&input.payload)?,
-                )?,
-            )?)
-        }
-        "finalize_promotion" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            Ok(serde_json::to_value(concurrency.finalize_promotion(
-                &payload_string(&input.payload, "intentId")?,
-                payload_revision(&input.payload)?,
-            )?)?)
-        }
-        "abort_promotion" | "rollback_promotion" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            Ok(serde_json::to_value(concurrency.rollback_promotion(
-                &payload_string(&input.payload, "intentId")?,
-                &payload_string(&input.payload, "reason")?,
-                payload_revision(&input.payload)?,
-            )?)?)
-        }
-        "recover_promotion" | "resume_promotion" => {
-            let concurrency = concurrency_store_mut(concurrency)?;
-            Ok(serde_json::to_value(concurrency.recover_promotion(
-                &payload_string(&input.payload, "intentId")?,
-                &payload_string(&input.payload, "observedCommit")?,
-                payload_revision(&input.payload)?,
-            )?)?)
-        }
-        "execute_candidate_lanes" => {
+        CANDIDATE_LANE_COMPATIBILITY_KIND => {
             let _ = candidate_lane_blocked_descriptor(&input.payload)?;
             Err(anyhow::Error::new(
                 CandidateLaneExecutionBlocked::HostExecutorUnavailable,
@@ -1644,7 +1562,7 @@ fn normalize_tasker_simulation(input: &TaskerEffectInput, result: &Value) -> Val
             "featureId": result["featureId"],
             "gates": result["gates"].clone(),
         }),
-        "execute_candidate_lanes" => result.clone(),
+        CANDIDATE_LANE_COMPATIBILITY_KIND => result.clone(),
         kind if is_concurrency_kind(kind) => json!({
             "id": result["id"],
             "revision": result["revision"],
@@ -1997,7 +1915,7 @@ impl Tool for MetaTool {
                         let requested_receipt = params.tasker_receipt.clone();
                         let is_candidate_apply = mode == TaskerMode::Apply
                             && effects.len() == 1
-                            && effects[0].input["kind"] == "execute_candidate_lanes";
+                            && effects[0].input["kind"] == CANDIDATE_LANE_COMPATIBILITY_KIND;
                         if is_candidate_apply {
                             let (proposal, receipt, canonical_snapshot_hash) =
                                 tokio::task::spawn_blocking({
@@ -2067,7 +1985,7 @@ impl Tool for MetaTool {
                             json!({
                                 "mode": mode,
                                 "status": "applied",
-                                "kind": "execute_candidate_lanes",
+                                "kind": CANDIDATE_LANE_COMPATIBILITY_KIND,
                                 "snapshot_hash": canonical_snapshot_hash,
                                 "receipt": {
                                     "id": receipt.id,
@@ -2200,22 +2118,114 @@ mod tests {
     }
 
     #[test]
-    fn guide_manifest_parses_and_covers_the_measured_surface() {
+    fn guide_manifest_exposes_exact_canonical_tasker_method_set() {
         let guide: Value = serde_json::from_str(GUIDE_SOURCE).expect("embedded guide JSON");
         let sections = guide["sections"].as_object().expect("guide sections");
-        let method_count: usize = sections
-            .values()
-            .filter_map(|section| section.as_array())
-            .map(|methods| methods.len())
-            .sum();
-        assert!(
-            method_count >= 39,
-            "guide should document the measured live surface, found {method_count}"
-        );
         assert!(guide["notes"].is_array());
-        assert!(sections["tasker-capability"].is_array());
+        let tasker_methods = sections["tasker-capability"]
+            .as_array()
+            .expect("public tasker capability methods")
+            .iter()
+            .map(|method| method["name"].as_str().expect("tasker method name"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tasker_methods,
+            vec![
+                "tasker.status",
+                "tasker.snapshot",
+                "tasker.list",
+                "tasker.show",
+                "tasker.search",
+                "tasker.ready",
+                "tasker.features",
+                "tasker.feature",
+                "tasker.dependencies",
+                "tasker.featureDependencies",
+                "tasker.notes",
+                "tasker.taskGraph",
+                "tasker.taskStructure",
+                "tasker.topologySummary",
+                "tasker.topologyAnomalies",
+                "tasker.topologyPaths",
+                "tasker.topologyFrontier",
+                "tasker.featureChildren",
+                "tasker.taskNeighbors",
+                "tasker.featureTree",
+                "tasker.resolveTask",
+                "tasker.resolveFeature",
+                "tasker.featureGates",
+                "tasker.featureGate",
+                "tasker.lifecycle",
+                "tasker.policy",
+                "tasker.concurrency",
+                "tasker.candidateSets",
+                "tasker.candidates",
+                "tasker.rounds",
+                "tasker.promotions",
+                "tasker.candidateSet",
+                "tasker.candidate",
+                "tasker.round",
+                "tasker.promotion",
+                "tasker.reconcile",
+                "tasker.batch",
+                "tasker.plan",
+                "tasker.featurePlan",
+                "tasker.create",
+                "tasker.update",
+                "tasker.setState",
+                "tasker.addDependency",
+                "tasker.addNote",
+                "tasker.taskIndex",
+                "tasker.createFeature",
+                "tasker.updateFeature",
+                "tasker.resolveFeatureGate",
+                "tasker.setDependencies",
+                "tasker.setFeatureDependencies",
+                "tasker.link",
+                "tasker.unlink",
+                "tasker.executeWork",
+                "tasker.adjudicateCandidateSet",
+                "tasker.promoteCandidate",
+                "tasker.recoverPromotion",
+            ]
+        );
+        let compatibility_methods = sections["tasker-compatibility"]
+            .as_array()
+            .expect("tasker compatibility methods")
+            .iter()
+            .map(|method| method["name"].as_str().expect("compatibility method name"))
+            .collect::<Vec<_>>();
+        assert_eq!(compatibility_methods, vec!["tasker.executeCandidateLanes"]);
+        assert!(
+            sections["tasker-capability"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|method| method["classification"].is_null())
+        );
         assert!(sections["artifacts-capability"].is_array());
-        assert_eq!(sections["tasker-capability"].as_array().unwrap().len(), 67);
+        for method in [
+            "reconcileConcurrency",
+            "createCandidateSet",
+            "registerCandidate",
+            "submitCandidate",
+            "setCandidateSetState",
+            "recordRound",
+            "recordBallot",
+            "preparePromotion",
+            "markPromotionRefUpdated",
+            "finalizePromotion",
+            "abortPromotion",
+            "rollbackPromotion",
+            "resumePromotion",
+        ] {
+            assert!(!SIDECAR_SOURCE.contains(&format!("{method}:")));
+        }
+        assert!(SIDECAR_SOURCE.contains("executeWork: async"));
+        assert!(SIDECAR_SOURCE.contains("adjudicateCandidateSet: async"));
+        assert!(SIDECAR_SOURCE.contains("promoteCandidate: async"));
+        assert!(SIDECAR_SOURCE.contains("recoverPromotion: async"));
+        assert!(SIDECAR_SOURCE.contains("host_executor_unavailable"));
     }
 
     #[test]
@@ -2224,8 +2234,8 @@ mod tests {
             .expect("checked-in Tasker parity manifest JSON");
         assert_eq!(manifest["audit"]["pi_tasker_store_methods"], 57);
         assert_eq!(manifest["audit"]["public_tasker_actions"], 37);
-        assert_eq!(manifest["audit"]["live_mt_tasker_methods_before_slice"], 8);
-        assert_eq!(manifest["audit"]["live_mt_tasker_methods_after_slice"], 67);
+        assert_eq!(manifest["audit"]["live_mt_tasker_methods_before_slice"], 67);
+        assert_eq!(manifest["audit"]["live_mt_tasker_methods_after_slice"], 56);
 
         let store_methods = manifest["pi_tasker_store_methods"]
             .as_array()
@@ -2236,15 +2246,116 @@ mod tests {
         let store_names = store_methods
             .iter()
             .filter_map(|entry| entry["name"].as_str())
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<Vec<_>>();
         let action_names = actions
             .iter()
             .filter_map(|entry| entry["name"].as_str())
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<Vec<_>>();
         assert_eq!(store_methods.len(), 57);
-        assert_eq!(store_names.len(), 57);
-        assert_eq!(actions.len(), 37);
-        assert_eq!(action_names.len(), 37);
+        assert_eq!(
+            store_names,
+            vec![
+                "open",
+                "fork_in_memory",
+                "partition",
+                "schema_fingerprint",
+                "preflight",
+                "snapshot",
+                "list_meta",
+                "ensure_list_meta",
+                "list_tasks",
+                "list_features",
+                "list_dependencies",
+                "list_feature_dependencies",
+                "list_task_notes",
+                "list_feature_notes",
+                "task_graph_projection",
+                "task_structure_projection",
+                "topology_summary_projection",
+                "topology_anomalies_projection",
+                "topology_paths_projection",
+                "topology_frontier_projection",
+                "feature_children_projection",
+                "task_neighbors_projection",
+                "feature_tree_projection",
+                "create_visual_artifact",
+                "list_visual_artifacts",
+                "resolve_task_id",
+                "resolve_feature_id",
+                "ready_tasks",
+                "search_tasks",
+                "evaluate_mutation_policy",
+                "claim_task",
+                "release_claim",
+                "get_working_set",
+                "enqueue_next_work_unit",
+                "create_task",
+                "update_task",
+                "set_task_indexes",
+                "add_task_indexes",
+                "remove_task_indexes",
+                "batch_execute",
+                "plan_import",
+                "feature_plan_import",
+                "create_feature",
+                "update_feature",
+                "feature_gates",
+                "feature_gate",
+                "pending_executable_gate_indexes",
+                "resolve_feature_gate",
+                "apply_feature_gate_check",
+                "apply_feature_gate_checks",
+                "set_dependencies",
+                "set_feature_dependencies",
+                "link_task",
+                "unlink_task",
+                "append_task_note",
+                "append_feature_note",
+                "open_concurrency_store",
+            ]
+        );
+        assert_eq!(
+            action_names,
+            vec![
+                "status",
+                "ready",
+                "show",
+                "create_feature",
+                "create",
+                "add_dependency",
+                "set_state",
+                "list",
+                "search",
+                "update",
+                "add_note",
+                "task_index",
+                "feature_list",
+                "feature_update",
+                "feature_status",
+                "link",
+                "unlink",
+                "batch",
+                "plan",
+                "feature_plan",
+                "claim",
+                "release",
+                "working_set",
+                "next_work_unit",
+                "feature_gate",
+                "task_artifact_create",
+                "task_artifacts",
+                "task_stage_report",
+                "task_graph",
+                "task_structure",
+                "topology_summary",
+                "topology_anomalies",
+                "topology_paths",
+                "topology_frontier",
+                "feature_children",
+                "task_neighbors",
+                "feature_tree",
+            ]
+        );
 
         let store_counts = store_methods.iter().fold(
             std::collections::BTreeMap::<&str, usize>::new(),
@@ -2273,6 +2384,61 @@ mod tests {
         assert_eq!(
             manifest["concurrency_surface"]["agent_spawning"],
             "host_owned_bounded_headless_inline"
+        );
+        assert_eq!(
+            manifest["concurrency_surface"]["generic_reconcile"],
+            "ordinary_only_rejects_concurrency_lifecycle"
+        );
+        assert_eq!(
+            manifest["concurrency_surface"]["ordinary_reconciliation_kinds"],
+            json!(ORDINARY_TASKER_RECONCILIATION_KINDS)
+        );
+        assert_eq!(
+            manifest["concurrency_surface"]["ordinary_receipt_methods"],
+            json!([
+                "reconcile",
+                "batch",
+                "plan",
+                "featurePlan",
+                "create",
+                "update",
+                "setState",
+                "addDependency",
+                "addNote",
+                "taskIndex",
+                "createFeature",
+                "updateFeature",
+                "resolveFeatureGate",
+                "setDependencies",
+                "setFeatureDependencies",
+                "link",
+                "unlink"
+            ])
+        );
+        assert_eq!(
+            manifest["concurrency_surface"]["blocked_lifecycle_kinds"],
+            json!(CONCURRENCY_LIFECYCLE_KINDS)
+        );
+        assert_eq!(
+            manifest["concurrency_surface"]["typed_high_level_methods"],
+            json!([
+                {"name": "executeWork", "status": "host_executor_unavailable"},
+                {"name": "adjudicateCandidateSet", "status": "host_executor_unavailable"},
+                {"name": "promoteCandidate", "status": "host_executor_unavailable"},
+                {"name": "recoverPromotion", "status": "host_executor_unavailable"}
+            ])
+        );
+        assert_eq!(
+            manifest["concurrency_surface"]["compatibility_methods"],
+            json!([{
+                "name": "executeCandidateLanes",
+                "status": "internal_compatibility_deprecated",
+                "public": false
+            }])
+        );
+        assert_eq!(
+            manifest["concurrency_surface"]["reconciliation_operations"],
+            json!([])
         );
     }
 
@@ -2445,7 +2611,7 @@ mod tests {
             capability: "tasker".into(),
             operation: "reconcile".into(),
             input: json!({
-                "kind": "execute_candidate_lanes",
+                "kind": CANDIDATE_LANE_COMPATIBILITY_KIND,
                 "mode": "plan",
                 "expected_snapshot_hash": snapshot_hash,
                 "payload": {
@@ -2559,7 +2725,7 @@ mod tests {
     }
 
     #[test]
-    fn tasker_reconciler_covers_ordinary_and_concurrency_mutations() {
+    fn tasker_reconciler_rejects_all_concurrency_lifecycle_kinds() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let database = workspace.path().join("tasks.db");
         super::super::tasker::tests::install_pi_schema(&database);
@@ -2570,139 +2736,39 @@ mod tests {
         let mut store = PiTaskerStore::open(partition).expect("open Pi-compatible Tasker store");
         let receipts = workspace.path().join("receipts");
 
-        let (_, snapshot_hash) = tasker_snapshot(&store).expect("initial Tasker snapshot");
-        let create_effect = ExecutionEffect {
-            capability: "tasker".into(),
-            operation: "reconcile".into(),
-            input: json!({
-                "kind": "create",
-                "mode": "plan",
-                "expected_snapshot_hash": snapshot_hash,
-                "payload": {
-                    "title": "Ordinary codemode task",
-                    "description": "created through the ordinary Tasker API",
-                    "dependsOn": [],
-                    "notes": []
-                }
-            }),
-        };
-        let planned = reconcile_tasker_effects(
-            &mut store,
-            std::slice::from_ref(&create_effect),
-            TaskerMode::Plan,
-            &snapshot_hash,
-            &receipts,
-            None,
-        )
-        .expect("plan ordinary mutation");
-        assert_eq!(
-            planned["simulation"]["task"]["title"],
-            "Ordinary codemode task"
-        );
+        for &kind in CONCURRENCY_LIFECYCLE_KINDS {
+            let (_, snapshot_hash) = tasker_snapshot(&store).expect("Tasker snapshot");
+            let effect = ExecutionEffect {
+                capability: "tasker".into(),
+                operation: "reconcile".into(),
+                input: json!({
+                    "kind": kind,
+                    "mode": "plan",
+                    "expected_snapshot_hash": snapshot_hash,
+                    "payload": {}
+                }),
+            };
+            let error = reconcile_tasker_effects(
+                &mut store,
+                std::slice::from_ref(&effect),
+                TaskerMode::Plan,
+                &snapshot_hash,
+                &receipts,
+                None,
+            )
+            .expect_err("generic ordinary reconcile must reject concurrency lifecycle writes");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Tasker generic ordinary reconcile rejects concurrency lifecycle kind: {kind}"
+                )
+            );
+        }
         assert!(
             store
                 .list_tasks(None)
-                .expect("list after ordinary plan")
+                .expect("list after rejection")
                 .is_empty()
-        );
-
-        let receipt = planned["receipt"]["id"]
-            .as_str()
-            .expect("ordinary receipt id")
-            .to_owned();
-        let mut apply_create = create_effect;
-        apply_create.input["mode"] = json!("apply");
-        reconcile_tasker_effects(
-            &mut store,
-            &[apply_create],
-            TaskerMode::Apply,
-            &snapshot_hash,
-            &receipts,
-            Some(&receipt),
-        )
-        .expect("apply ordinary mutation");
-        let task = store
-            .list_tasks(None)
-            .expect("list after ordinary apply")
-            .into_iter()
-            .next()
-            .expect("created ordinary task");
-
-        let project_id = store.partition().list_id.clone();
-        let (_, concurrency_snapshot_hash) = tasker_snapshot(&store).expect("concurrency snapshot");
-        let candidate_set_effect = ExecutionEffect {
-            capability: "tasker".into(),
-            operation: "reconcile".into(),
-            input: json!({
-                "kind": "create_candidate_set",
-                "mode": "plan",
-                "project_id": project_id,
-                "expected_snapshot_hash": concurrency_snapshot_hash,
-                "payload": {
-                    "expectedRevision": 0,
-                    "candidateSet": {
-                        "id": "set-ordinary",
-                        "projectId": project_id,
-                        "taskId": task.id,
-                        "baseRevision": 0,
-                        "baseCommit": "base-commit",
-                        "acceptanceDigest": "acceptance-digest",
-                        "policy": {"kind": "exclusive"},
-                        "policyVersion": 1,
-                        "state": "open"
-                    }
-                }
-            }),
-        };
-        let concurrency_plan = reconcile_tasker_effects(
-            &mut store,
-            std::slice::from_ref(&candidate_set_effect),
-            TaskerMode::Plan,
-            &concurrency_snapshot_hash,
-            &receipts,
-            None,
-        )
-        .expect("plan concurrency mutation");
-        assert_eq!(concurrency_plan["simulation"]["id"], "set-ordinary");
-        assert_eq!(concurrency_plan["simulation"]["revision"], 1);
-        assert!(
-            store
-                .open_concurrency_store()
-                .expect("open concurrency store")
-                .candidate_set("set-ordinary")
-                .expect("read candidate set after plan")
-                .is_none()
-        );
-
-        let concurrency_receipt = concurrency_plan["receipt"]["id"]
-            .as_str()
-            .expect("concurrency receipt id")
-            .to_owned();
-        let mut apply_candidate_set = candidate_set_effect;
-        apply_candidate_set.input["mode"] = json!("apply");
-        reconcile_tasker_effects(
-            &mut store,
-            &[apply_candidate_set],
-            TaskerMode::Apply,
-            &concurrency_snapshot_hash,
-            &receipts,
-            Some(&concurrency_receipt),
-        )
-        .expect("apply concurrency mutation");
-        let concurrency = store
-            .open_concurrency_store()
-            .expect("open concurrency store after apply");
-        assert!(
-            concurrency
-                .candidate_set("set-ordinary")
-                .expect("read candidate set after apply")
-                .is_some()
-        );
-        assert_eq!(
-            concurrency
-                .current_revision(&project_id)
-                .expect("read concurrency revision"),
-            1
         );
     }
 

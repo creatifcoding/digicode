@@ -4,8 +4,8 @@
   "audit": {
     "pi_tasker_store_methods": 57,
     "public_tasker_actions": 37,
-    "live_mt_tasker_methods_before_slice": 8,
-    "live_mt_tasker_methods_after_slice": 67,
+    "live_mt_tasker_methods_before_slice": 67,
+    "live_mt_tasker_methods_after_slice": 56,
     "counting_note": "PiTaskerStore methods include the open_concurrency_store extension method. Public actions are the provider-safe tasker action enum, including topology actions."
   },
   "classifications": [
@@ -118,13 +118,26 @@
     "guest_authority": "declarative_effect_only",
     "candidate_execution": "foundation_ready_apply_blocked_host_executor_unavailable",
     "projection_methods": ["concurrency", "candidateSets", "candidates", "rounds", "promotions", "candidateSet", "candidate", "round", "promotion", "lifecycle"],
-    "reconciliation_operations": ["create_candidate_set", "register_candidate", "submit_candidate", "set_candidate_set_state", "record_round", "record_ballot", "prepare_promotion", "mark_promotion_ref_updated", "finalize_promotion", "abort_promotion", "rollback_promotion", "recover_promotion", "resume_promotion", "execute_candidate_lanes"],
-    "receipt_rule": "Concurrency mutations share the one-effect plan/apply Tasker receipt path."
+    "generic_reconcile": "ordinary_only_rejects_concurrency_lifecycle",
+    "ordinary_reconciliation_kinds": ["batch", "plan", "feature_plan", "create", "update", "set_state", "add_dependency", "add_note", "task_index", "create_feature", "feature_update", "resolve_feature_gate", "set_dependencies", "set_feature_dependencies", "link", "unlink"],
+    "ordinary_receipt_methods": ["reconcile", "batch", "plan", "featurePlan", "create", "update", "setState", "addDependency", "addNote", "taskIndex", "createFeature", "updateFeature", "resolveFeatureGate", "setDependencies", "setFeatureDependencies", "link", "unlink"],
+    "blocked_lifecycle_kinds": ["create_candidate_set", "register_candidate", "submit_candidate", "set_candidate_set_state", "record_round", "record_ballot", "prepare_promotion", "mark_promotion_ref_updated", "finalize_promotion", "abort_promotion", "rollback_promotion", "recover_promotion", "resume_promotion"],
+    "typed_high_level_methods": [
+      {"name": "executeWork", "status": "host_executor_unavailable"},
+      {"name": "adjudicateCandidateSet", "status": "host_executor_unavailable"},
+      {"name": "promoteCandidate", "status": "host_executor_unavailable"},
+      {"name": "recoverPromotion", "status": "host_executor_unavailable"}
+    ],
+    "compatibility_methods": [
+      {"name": "executeCandidateLanes", "status": "internal_compatibility_deprecated", "public": false}
+    ],
+    "reconciliation_operations": [],
+    "receipt_rule": "Only ordinary Tasker mutations share the one-effect plan/apply receipt path."
   },
   "remaining_gaps": [
     "Trusted claim/work-unit identity remains public-tool-only.",
     "Filesystem-backed visual artifacts remain on the dedicated artifact capability.",
     "Executable feature-gate resolvers and their evidence remain public-tool-only.",
-    "Candidate execution has a compile-tested host-owned bounded headless/inline foundation with detached-worktree finalization and host-derived evidence; MetaTool plan is receipt-backed but apply is explicitly blocked with host_executor_unavailable until the app-core session adapter is installed. Recovery after process loss remains follow-up work."
+    "Candidate execution has a compile-tested host-owned bounded headless/inline compatibility foundation with detached-worktree finalization and host-derived evidence; the public codemode surface now exposes only typed executor placeholders, which fail closed with host_executor_unavailable until their app-core executors are installed. Recovery after process loss remains follow-up work."
   ]
 }
