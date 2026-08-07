@@ -5,7 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
 jcode-tasker-git = { path = "../jcode-tasker-git" }
 jcode-tasker-pi = { path = "../jcode-tasker-pi" }
 jcode-tasker-rounds = { path = "../jcode-tasker-rounds" }
@@ -14,7 +16,10 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
+sha2 = "0.10"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "process", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 jcode-tasker-promotion = { path = "../jcode-tasker-promotion" }

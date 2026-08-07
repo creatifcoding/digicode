@@ -6,6 +6,7 @@
     "Store data should include _meta: { summary } for catalog discipline.",
     "The checked-in Tasker parity manifest is docs/TASKER_PARITY_MANIFEST.json; it records the measured Pi method/action counts and the codemode, public-tool-only, and internal-only boundary.",
     "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot, including ordinary Tasker topology and concurrency projections, and may emit one atomic reconciliation effect; guest code never receives a database or agent-spawning handle.",
+    "Candidate lane execution is a declarative host effect. executeCandidateLanes(request) validates only guest-safe bounded speculative/ensemble intent; plan returns a blocked descriptor and issues the normal receipt, while apply fails with host_executor_unavailable until the server installs its headless/inline CandidateExecutor. The orchestration foundation owns isolated worktrees, host-run validators, and host-derived commit/digest/evidence. The guest receives no session, process, worktree, or database authority.",
     "Use tasker_mode plan before apply when inspecting a new reconciliation. Plan executes the same ordinary or concurrency mutation semantics against isolated in-memory SQLite forks, returns a normalized stable simulation, and issues a time-bounded host receipt without changing canonical state. Apply requires tasker_receipt and verifies its project, selected concurrency project, snapshot, exact change-set digest, and expiry before mutating canonical state.",
     "mt.artifacts is present only when the host grants artifact_mode apply. It exposes a bounded read-only catalog and candidates list, and admitBundle(bundle) emits exactly one host-admitted artifacts.admit_bundle effect; guest code never receives artifact-store filesystem or database authority."
   ],
@@ -281,7 +282,7 @@
       },
       {
         "name": "tasker.lifecycle",
-        "signature": "() -> {policies, agentSpawning, candidateAuthorship, promotion}"
+        "signature": "() -> {policies, agentSpawning, candidateAuthorship, candidateExecution, promotion}"
       },
       {
         "name": "tasker.policy",
@@ -390,6 +391,10 @@
       {
         "name": "tasker.unlink",
         "signature": "async (taskId) -> ReconciliationReceipt"
+      },
+      {
+        "name": "tasker.executeCandidateLanes",
+        "signature": "async (request) -> bounded host execution plan or host_executor_unavailable block"
       },
       {
         "name": "tasker.reconcileConcurrency",

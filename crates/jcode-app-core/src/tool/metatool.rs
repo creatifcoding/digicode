@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -15,6 +16,7 @@ use jcode_metatool_types::{
     ExecutionEffect, ExecutionId, ExecutionLimits, ExecutionProfile, ExecutionRequest,
     MetaToolError,
 };
+use jcode_tasker_orchestration::CandidateLaneLaunchRequest;
 use jcode_tasker_pi::{
     BatchOperation, ConcurrencyStore, CreateFeature, CreateTask, FeaturePlanFeature,
     FeaturePlanInput, NoteInput, PiTaskerStore, PlanTask, ProjectPartition, ResolveFeatureGate,
@@ -49,6 +51,27 @@ const TASKER_RECEIPT_TTL_SECONDS: u64 = 30 * 60;
 const TASKER_RECEIPT_PREFIX: &str = "tpr_";
 const ARTIFACT_CATALOG_LIMIT: usize = 200;
 const ARTIFACT_MAX_TEXT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateLaneExecutionBlocked {
+    HostExecutorUnavailable,
+}
+
+impl CandidateLaneExecutionBlocked {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::HostExecutorUnavailable => "host_executor_unavailable",
+        }
+    }
+}
+
+impl fmt::Display for CandidateLaneExecutionBlocked {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for CandidateLaneExecutionBlocked {}
 
 pub struct MetaTool {
     store_root_override: Option<PathBuf>,
@@ -769,14 +792,22 @@ fn tasker_snapshot_for_project(
             "candidateSets": candidate_sets,
             "policy": {
                 "supported": supported_policies,
-                "agentSpawning": "disabled",
+                "agentSpawning": "host_owned_bounded_headless_inline",
+                "candidateLane": {
+                    "maxLanes": 8,
+                    "maxLaneTimeoutMs": 1800000,
+                    "spawnMode": "headless_inline",
+                    "guestAuthority": "declarative_effect_only",
+                    "execution": "foundation_ready_apply_blocked_host_executor_unavailable"
+                },
                 "promotion": "single_writer"
             }
         },
         "lifecycle": {
             "policies": ["exclusive", "speculative", "ensemble"],
-            "agentSpawning": "disabled",
-            "candidateAuthorship": "metadata_only",
+            "agentSpawning": "host_owned_bounded_headless_inline",
+            "candidateAuthorship": "host_derived_submission_contract",
+            "candidateExecution": "foundation_ready_apply_blocked_host_executor_unavailable",
             "promotion": "single_writer"
         },
         "truncated": task_count > TASKER_SNAPSHOT_LIMIT
@@ -848,11 +879,11 @@ fn reconcile_tasker_effects(
         } else {
             None
         };
-        let simulated = execute_tasker_reconciliation(
-            &mut simulation,
-            &input,
-            concurrency_simulation.as_mut(),
-        )?;
+        let simulated = if input.kind == "execute_candidate_lanes" {
+            candidate_lane_blocked_descriptor(&input.payload)?
+        } else {
+            execute_tasker_reconciliation(&mut simulation, &input, concurrency_simulation.as_mut())?
+        };
         let simulated = normalize_tasker_simulation(&input, &simulated);
         let receipt = issue_tasker_receipt(receipt_root, store, initial_snapshot_hash, &input)?;
         return Ok(json!({
@@ -888,6 +919,13 @@ fn reconcile_tasker_effects(
     if current_hash != initial_snapshot_hash {
         return Err(anyhow!(
             "Tasker state changed during codemode evaluation; rerun to reconcile against the current snapshot"
+        ));
+    }
+
+    if input.kind == "execute_candidate_lanes" {
+        let _ = candidate_lane_blocked_descriptor(&input.payload)?;
+        return Err(anyhow::Error::new(
+            CandidateLaneExecutionBlocked::HostExecutorUnavailable,
         ));
     }
 
@@ -970,6 +1008,7 @@ fn is_concurrency_kind(kind: &str) -> bool {
             | "rollback_promotion"
             | "recover_promotion"
             | "resume_promotion"
+            | "execute_candidate_lanes"
     )
 }
 
@@ -1324,8 +1363,31 @@ fn execute_tasker_reconciliation(
                 payload_revision(&input.payload)?,
             )?)?)
         }
+        "execute_candidate_lanes" => {
+            let _ = candidate_lane_blocked_descriptor(&input.payload)?;
+            Err(anyhow::Error::new(
+                CandidateLaneExecutionBlocked::HostExecutorUnavailable,
+            ))
+        }
         other => Err(anyhow!("unsupported Tasker reconciliation kind: {other}")),
     }
+}
+
+fn candidate_lane_blocked_descriptor(payload: &Value) -> Result<Value> {
+    let request: CandidateLaneLaunchRequest = serde_json::from_value(payload.clone())?;
+    let limits = request
+        .validate()
+        .map_err(|error| anyhow!("candidate lane request rejected: {error}"))?;
+    Ok(json!({
+        "status": "blocked",
+        "blockedReason": CandidateLaneExecutionBlocked::HostExecutorUnavailable.code(),
+        "execution": "host_owned_bounded_headless_inline",
+        "guestAuthority": "declarative_effect_only",
+        "laneCount": request.lane_count,
+        "limits": limits,
+        "acceptanceDigest": request.acceptance.digest(),
+        "apply": "blocked_until_server_installs_host_executor",
+    }))
 }
 
 fn normalize_tasker_simulation(input: &TaskerEffectInput, result: &Value) -> Value {
@@ -1390,6 +1452,7 @@ fn normalize_tasker_simulation(input: &TaskerEffectInput, result: &Value) -> Val
             "featureId": result["featureId"],
             "gates": result["gates"].clone(),
         }),
+        "execute_candidate_lanes" => result.clone(),
         kind if is_concurrency_kind(kind) => json!({
             "id": result["id"],
             "revision": result["revision"],
@@ -1936,7 +1999,7 @@ mod tests {
         assert_eq!(action_counts.get("public_tool_only"), Some(&8));
         assert_eq!(
             manifest["concurrency_surface"]["agent_spawning"],
-            "not_exposed"
+            "host_owned_bounded_headless_inline"
         );
     }
 
@@ -2091,6 +2154,78 @@ mod tests {
         let tasks = store.list_tasks(None).expect("list after apply");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Created through mt.tasker");
+    }
+
+    #[test]
+    fn candidate_lane_apply_is_blocked_without_server_executor() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let database = workspace.path().join("tasks.db");
+        super::super::tasker::tests::install_pi_schema(&database);
+        let partition = ProjectPartition::with_db_path(
+            &database,
+            workspace.path().to_string_lossy().into_owned(),
+        );
+        let mut store = PiTaskerStore::open(partition).expect("open Pi-compatible Tasker store");
+        let receipts = workspace.path().join("receipts");
+        let (_, snapshot_hash) = tasker_snapshot(&store).expect("initial Tasker snapshot");
+        let effect = ExecutionEffect {
+            capability: "tasker".into(),
+            operation: "reconcile".into(),
+            input: json!({
+                "kind": "execute_candidate_lanes",
+                "mode": "plan",
+                "expected_snapshot_hash": snapshot_hash,
+                "payload": {
+                    "policy": {"kind": "speculative", "max_candidates": 2},
+                    "laneCount": 2,
+                    "acceptance": {
+                        "validationCommands": [{"program": "true", "args": []}],
+                        "acceptanceCriteria": "candidate must pass",
+                        "resourceIntents": []
+                    },
+                    "prompt": "Implement the bounded candidate task",
+                    "limits": {"maxLanes": 2, "laneTimeoutMs": 1000}
+                }
+            }),
+        };
+
+        let planned = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&effect),
+            TaskerMode::Plan,
+            &snapshot_hash,
+            &receipts,
+            None,
+        )
+        .expect("candidate-lane plan");
+        assert_eq!(planned["status"], "simulated");
+        assert_eq!(planned["simulation"]["status"], "blocked");
+        assert_eq!(
+            planned["simulation"]["blockedReason"],
+            "host_executor_unavailable"
+        );
+        assert!(planned["receipt"]["id"].is_string());
+        assert!(store.list_tasks(None).expect("list after plan").is_empty());
+
+        let receipt = planned["receipt"]["id"].as_str().expect("receipt id");
+        let mut apply_effect = effect;
+        apply_effect.input["mode"] = json!("apply");
+        let blocked = reconcile_tasker_effects(
+            &mut store,
+            &[apply_effect],
+            TaskerMode::Apply,
+            &snapshot_hash,
+            &receipts,
+            Some(receipt),
+        )
+        .expect_err("candidate apply must remain blocked");
+        assert!(blocked.to_string().contains("host_executor_unavailable"));
+        assert!(
+            store
+                .list_tasks(None)
+                .expect("list after blocked apply")
+                .is_empty()
+        );
     }
 
     #[test]

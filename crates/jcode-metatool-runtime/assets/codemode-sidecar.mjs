@@ -384,7 +384,7 @@ try {
 	    "set_feature_dependencies", "link", "unlink", "create_candidate_set", "register_candidate",
 	    "submit_candidate", "set_candidate_set_state", "record_round", "record_ballot", "prepare_promotion",
 	    "mark_promotion_ref_updated", "finalize_promotion", "abort_promotion", "rollback_promotion",
-	    "recover_promotion", "resume_promotion",
+	    "recover_promotion", "resume_promotion", "execute_candidate_lanes",
 	  ];
 	  const reconcile = async (kind, payload) => {
 	    if (reconciled) throw new Error("mt.tasker permits one atomic reconciliation per evaluation");
@@ -500,6 +500,7 @@ try {
 	    link: async (taskId, featureId) => reconcile("link", { taskId, featureId }),
 	    unlink: async (taskId) => reconcile("unlink", { taskId }),
 	    reconcileConcurrency: async (kind, payload) => reconcile(kind, payload),
+    executeCandidateLanes: async (request) => reconcile("execute_candidate_lanes", request),
 	    createCandidateSet: async (candidateSet, expectedRevision) => reconcile("create_candidate_set", { candidateSet, expectedRevision }),
 	    registerCandidate: async (candidate, expectedRevision) => reconcile("register_candidate", { candidate, expectedRevision }),
 	    submitCandidate: async (candidate, evidence, expectedRevision) => reconcile("submit_candidate", { candidate, evidence, expectedRevision }),

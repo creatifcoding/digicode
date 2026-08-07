@@ -1,9 +1,9 @@
 //! Composition layer for bounded Tasker candidate lanes.
 //!
-//! This crate owns the launch contract and lane lifecycle. It does not spawn
-//! agents or create worktrees. Instead, it emits typed lane descriptors for a
-//! downstream executor and persists the lane state beside the landed
-//! `ConcurrencyStore` records.
+//! This crate owns the host-bound launch contract, isolated worktree setup, and
+//! CAS-safe lane lifecycle. It exposes a guest-safe declarative request and a
+//! separate host-bound request for downstream headless/inline executors. It
+//! never grants an executor Tasker database or canonical-ref authority.
 
 use chrono::Utc;
 use jcode_tasker_git::{CandidateRef, CleanupReport, GitCandidateAdapter, IsolationProof};
@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+mod execution;
+pub use execution::*;
 
 const LANE_PROJECTION_LIMIT: usize = 500;
 const LANE_SCHEMA: &str = r#"
@@ -408,6 +411,19 @@ pub enum OrchestrationError {
     Store(#[from] ConcurrencyStoreError),
     #[error("round orchestration error: {0}")]
     Round(#[from] RoundError),
+    #[error("candidate execution for set {candidate_set_id} was cancelled at revision {revision}")]
+    ExecutionCancelled {
+        candidate_set_id: String,
+        revision: u64,
+    },
+    #[error(
+        "candidate {candidate_id} in set {candidate_set_id} did not terminate before cleanup deadline"
+    )]
+    ExecutionTerminationFailed {
+        candidate_set_id: String,
+        candidate_id: String,
+        revision: u64,
+    },
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("JSON error: {0}")]
@@ -817,6 +833,16 @@ impl CandidateOrchestrator {
         &self.git
     }
 
+    fn cleanup_lane_specs(&self, lanes: &[CandidateLaneSpec]) {
+        for lane in lanes {
+            if let Ok(candidate_ref) = CandidateRef::parse(&lane.candidate_ref) {
+                let _ = self
+                    .git
+                    .cleanup_candidate_worktree(&candidate_ref, &lane.worktree.path);
+            }
+        }
+    }
+
     /// Open a set and emit N isolated lane specs without spawning workers.
     pub fn open_candidate_set(
         &mut self,
@@ -831,10 +857,13 @@ impl CandidateOrchestrator {
         }
         request.acceptance.validate()?;
         let candidate_limit = request.policy.candidate_limit();
-        if request.lane_count == 0 || request.lane_count > candidate_limit {
+        if request.lane_count == 0
+            || request.lane_count > candidate_limit
+            || request.lane_count > MAX_CANDIDATE_LANES
+        {
             return Err(OrchestrationError::CandidateLimit {
                 requested: request.lane_count,
-                limit: candidate_limit,
+                limit: candidate_limit.min(MAX_CANDIDATE_LANES),
             });
         }
         if let ConcurrencyPolicy::Ensemble {
@@ -875,7 +904,6 @@ impl CandidateOrchestrator {
             updated_at: created_at,
         };
 
-        let mut candidate_refs = Vec::with_capacity(usize::from(request.lane_count));
         let mut lanes = Vec::with_capacity(usize::from(request.lane_count));
         for _ in 0..usize::from(request.lane_count) {
             let candidate_id = CandidateId::new();
@@ -886,34 +914,38 @@ impl CandidateOrchestrator {
             ) {
                 Ok(candidate_ref) => candidate_ref,
                 Err(error) => {
-                    for existing in &candidate_refs {
-                        let _ = self.git.cleanup_abandoned_candidate(existing);
-                    }
+                    self.cleanup_lane_specs(&lanes);
                     return Err(git_error(error));
                 }
             };
-            candidate_refs.push(candidate_ref.clone());
             let worktree = WorktreeDescriptor {
                 path: request.worktree_root.join(format!("lane-{candidate_id}")),
                 candidate_ref: candidate_ref.to_string(),
                 base_commit: request.base_commit.clone(),
                 candidate_id,
             };
-            lanes.push(CandidateLaneSpec {
+            let lane = CandidateLaneSpec {
                 candidate_id,
                 candidate_ref: candidate_ref.to_string(),
                 worktree,
                 acceptance: request.acceptance.clone(),
                 state: LaneState::Pending,
-            });
+            };
+            if let Err(error) = self
+                .git
+                .create_candidate_worktree(&candidate_ref, &lane.worktree.path)
+            {
+                let _ = self.git.cleanup_abandoned_candidate(&candidate_ref);
+                self.cleanup_lane_specs(&lanes);
+                return Err(git_error(error));
+            }
+            lanes.push(lane);
         }
 
         let isolation = match self.git.assert_isolated() {
             Ok(proof) => proof,
             Err(error) => {
-                for candidate_ref in &candidate_refs {
-                    let _ = self.git.cleanup_abandoned_candidate(candidate_ref);
-                }
+                self.cleanup_lane_specs(&lanes);
                 return Err(git_error(error));
             }
         };
@@ -925,9 +957,7 @@ impl CandidateOrchestrator {
         {
             Ok(mutation) => mutation.revision,
             Err(error) => {
-                for candidate_ref in &candidate_refs {
-                    let _ = self.git.cleanup_abandoned_candidate(candidate_ref);
-                }
+                self.cleanup_lane_specs(&lanes);
                 return Err(error.into());
             }
         };
@@ -954,9 +984,7 @@ impl CandidateOrchestrator {
             {
                 Ok(mutation) => revision = mutation.revision,
                 Err(error) => {
-                    for candidate_ref in &candidate_refs {
-                        let _ = self.git.cleanup_abandoned_candidate(candidate_ref);
-                    }
+                    self.cleanup_lane_specs(&lanes);
                     let _ = self.store.set_candidate_set_state(
                         &candidate_set_id.to_string(),
                         "cancelled",
@@ -967,9 +995,21 @@ impl CandidateOrchestrator {
             }
         }
 
-        revision = self
+        revision = match self
             .lanes
-            .create_lanes(&project_id, candidate_set_id, &lanes, revision)?;
+            .create_lanes(&project_id, candidate_set_id, &lanes, revision)
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                self.cleanup_lane_specs(&lanes);
+                let _ = self.store.set_candidate_set_state(
+                    &candidate_set_id.to_string(),
+                    "cancelled",
+                    self.store.current_revision(&project_id).unwrap_or(revision),
+                );
+                return Err(error);
+            }
+        };
         Ok(CandidateSetOpened {
             candidate_set,
             lanes,
@@ -1091,7 +1131,7 @@ impl CandidateOrchestrator {
         }
         let candidate_ref = CandidateRef::parse(&lane.candidate_ref).map_err(git_error)?;
         self.git
-            .cleanup_abandoned_candidate(&candidate_ref)
+            .cleanup_candidate_worktree(&candidate_ref, &lane.worktree.path)
             .map_err(git_error)
     }
 

@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result, bail};
 use jcode_tasker_types::{CandidateId, CandidateSetId};
+use sha2::{Digest, Sha256};
 use std::{
     ffi::OsStr,
     fmt,
@@ -263,6 +264,83 @@ impl GitCandidateAdapter {
         self.create_candidate_ref(candidate_set_id, candidate_id, base)
     }
 
+    /// Materialize one detached worktree for a candidate ref.
+    ///
+    /// Worktrees are deliberately created below the caller-owned lane root and
+    /// never use a branch name. The candidate ref remains the only mutable Git
+    /// identity, so a candidate cannot advance a canonical branch by accident.
+    pub fn create_candidate_worktree(
+        &self,
+        candidate_ref: &CandidateRef,
+        path: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        let path = path.as_ref();
+        if path == self.repo_path {
+            bail!("candidate worktree must not be the canonical repository path");
+        }
+        if path.exists() {
+            bail!("candidate worktree path already exists: {}", path.display());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("create candidate worktree parent {}", parent.display())
+            })?;
+        }
+        self.run_git_raw([
+            "worktree",
+            "add",
+            "--detach",
+            path.to_string_lossy().as_ref(),
+            candidate_ref.as_str(),
+        ])
+        .with_context(|| format!("create candidate worktree {}", path.display()))?;
+        if !path.is_dir() {
+            bail!(
+                "Git did not materialize candidate worktree {}",
+                path.display()
+            );
+        }
+        Ok(path.to_path_buf())
+    }
+
+    /// Remove a candidate worktree without touching any candidate refs.
+    ///
+    /// The operation is idempotent for an already-removed path, which lets
+    /// timeout and cancellation cleanup safely retry after a partial failure.
+    pub fn remove_candidate_worktree(&self, path: impl AsRef<Path>) -> Result<bool> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(false);
+        }
+        self.run_git_raw([
+            "worktree",
+            "remove",
+            "--force",
+            path.to_string_lossy().as_ref(),
+        ])
+        .with_context(|| format!("remove candidate worktree {}", path.display()))?;
+        if path.exists() {
+            bail!(
+                "candidate worktree remains after cleanup: {}",
+                path.display()
+            );
+        }
+        Ok(true)
+    }
+
+    /// Remove a candidate worktree and its reserved refs as one host cleanup
+    /// operation. Git ref deletion remains atomic; worktree removal is
+    /// idempotent and is performed first so no process can keep the checkout
+    /// alive after the lane becomes terminal.
+    pub fn cleanup_candidate_worktree(
+        &self,
+        candidate_ref: &CandidateRef,
+        path: impl AsRef<Path>,
+    ) -> Result<CleanupReport> {
+        self.remove_candidate_worktree(path)?;
+        self.delete_candidate_ref(candidate_ref)
+    }
+
     /// Read the base, tip, and changed paths for a candidate.
     pub fn read_candidate_metadata(
         &self,
@@ -285,6 +363,137 @@ impl GitCandidateAdapter {
             tip_oid,
             changed_paths,
         })
+    }
+
+    /// Finalize a detached candidate worktree into its reserved candidate ref.
+    ///
+    /// A detached worktree advances `HEAD`, not the ref named at checkout.
+    /// The host therefore performs the only ref update after verifying that
+    /// the worktree is clean, its tip is a descendant of the reserved base,
+    /// and the candidate ref still has the expected old tip.
+    pub fn finalize_candidate_worktree(
+        &self,
+        candidate_ref: &CandidateRef,
+        worktree_path: impl AsRef<Path>,
+    ) -> Result<CandidateMetadata> {
+        let worktree_path = worktree_path.as_ref();
+        let expected_root = std::fs::canonicalize(worktree_path).with_context(|| {
+            format!(
+                "canonicalize candidate worktree {}",
+                worktree_path.display()
+            )
+        })?;
+        let registered_root = self.registered_worktree_root(&expected_root)?;
+        if registered_root != expected_root {
+            bail!(
+                "candidate worktree {} is not the registered worktree",
+                expected_root.display()
+            );
+        }
+        let worktree_root = self.worktree_root(worktree_path)?;
+        if worktree_root != expected_root {
+            bail!(
+                "candidate worktree resolved to {}, expected {}",
+                worktree_root.display(),
+                expected_root.display()
+            );
+        }
+
+        let status = self.worktree_status(worktree_path)?;
+        if !status.trim().is_empty() {
+            bail!(
+                "candidate worktree {} has uncommitted changes: {}",
+                worktree_path.display(),
+                status.trim()
+            );
+        }
+        let worktree_tip = self.worktree_head(worktree_path)?;
+        let current_tip = self
+            .read_ref_oid(candidate_ref.as_str())?
+            .with_context(|| format!("candidate ref is missing: {candidate_ref}"))?;
+        let current_tip = self.resolve_commit(&current_tip)?;
+        let worktree_tip = self.resolve_commit(&worktree_tip)?;
+
+        let base_ref = candidate_ref.base_ref_name();
+        let base_oid = self
+            .read_ref_oid(&base_ref)?
+            .with_context(|| format!("candidate base ref is missing: {base_ref}"))?;
+        let base_oid = self.resolve_commit(&base_oid)?;
+        if !self.is_ancestor(&base_oid, &worktree_tip)? {
+            bail!(
+                "candidate worktree tip {} is not based on reserved base {}",
+                worktree_tip,
+                base_oid
+            );
+        }
+
+        if current_tip != worktree_tip {
+            self.compare_and_swap_candidate_ref(candidate_ref, &current_tip, &worktree_tip)?;
+        }
+
+        let metadata = self.read_candidate_metadata(candidate_ref)?;
+        if !self.is_ancestor(&metadata.base_oid, &metadata.tip_oid)? {
+            bail!(
+                "candidate tip {} is not based on reserved base {}",
+                metadata.tip_oid,
+                metadata.base_oid
+            );
+        }
+        Ok(metadata)
+    }
+
+    /// Derive a stable digest from the committed candidate diff.
+    pub fn candidate_diff_digest(&self, candidate_ref: &CandidateRef) -> Result<String> {
+        let metadata = self.read_candidate_metadata(candidate_ref)?;
+        let diff = self.git_output_bytes([
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-renames",
+            &metadata.base_oid,
+            &metadata.tip_oid,
+            "--",
+        ])?;
+        Ok(format!("sha256:{:x}", Sha256::digest(diff)))
+    }
+
+    /// Read the HEAD of the registered candidate worktree after validating
+    /// that the supplied path is the worktree Git registered for this repo.
+    pub fn read_worktree_head(&self, worktree_path: impl AsRef<Path>) -> Result<String> {
+        let worktree_path = worktree_path.as_ref();
+        let expected_root = std::fs::canonicalize(worktree_path).with_context(|| {
+            format!(
+                "canonicalize candidate worktree {}",
+                worktree_path.display()
+            )
+        })?;
+        self.registered_worktree_root(&expected_root)?;
+        let worktree_root = self.worktree_root(worktree_path)?;
+        if worktree_root != expected_root {
+            bail!(
+                "candidate worktree resolved to {}, expected {}",
+                worktree_root.display(),
+                expected_root.display()
+            );
+        }
+        self.worktree_head(worktree_path)
+    }
+
+    /// Verify that a candidate worktree has no staged, unstaged, or untracked
+    /// changes after host validation commands have run.
+    pub fn ensure_worktree_clean(&self, worktree_path: impl AsRef<Path>) -> Result<()> {
+        let worktree_path = worktree_path.as_ref();
+        let status = self.worktree_status(worktree_path)?;
+        if status.trim().is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "candidate worktree {} has uncommitted changes: {}",
+                worktree_path.display(),
+                status.trim()
+            )
+        }
     }
 
     /// Read metadata by candidate-set and candidate identity.
@@ -488,6 +697,61 @@ impl GitCandidateAdapter {
         Ok(paths)
     }
 
+    fn registered_worktree_root(&self, expected_root: &Path) -> Result<PathBuf> {
+        let output = self.git_stdout(["worktree", "list", "--porcelain"])?;
+        for line in output.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                let path = std::fs::canonicalize(path)?;
+                if path == expected_root {
+                    return Ok(expected_root.to_path_buf());
+                }
+            }
+        }
+        bail!(
+            "candidate worktree {} is not registered by Git",
+            expected_root.display()
+        )
+    }
+
+    fn worktree_root(&self, path: &Path) -> Result<PathBuf> {
+        let root = self.run_git_at(path, ["rev-parse", "--show-toplevel"])?;
+        Ok(std::fs::canonicalize(
+            String::from_utf8(root.stdout)
+                .context("candidate worktree returned non-UTF-8 root")?
+                .trim(),
+        )?)
+    }
+
+    fn worktree_head(&self, path: &Path) -> Result<String> {
+        let output = self.run_git_at(path, ["rev-parse", "--verify", "HEAD"])?;
+        Ok(String::from_utf8(output.stdout)
+            .context("candidate worktree returned non-UTF-8 HEAD")?
+            .trim()
+            .to_owned())
+    }
+
+    fn worktree_status(&self, path: &Path) -> Result<String> {
+        let output =
+            self.run_git_at(path, ["status", "--porcelain=v1", "--untracked-files=all"])?;
+        Ok(String::from_utf8(output.stdout)
+            .context("candidate worktree returned non-UTF-8 status")?)
+    }
+
+    fn is_ancestor(&self, base_oid: &str, tip_oid: &str) -> Result<bool> {
+        let output = self.run_git_raw(["merge-base", "--is-ancestor", base_oid, tip_oid])?;
+        if output.status.success() {
+            Ok(true)
+        } else if output.status.code() == Some(1) {
+            Ok(false)
+        } else {
+            bail!(
+                "git merge-base --is-ancestor failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+    }
+
     fn commit_tree(
         &self,
         tree_oid: &str,
@@ -612,6 +876,22 @@ impl GitCandidateAdapter {
         let mut command = Command::new("git");
         command.current_dir(&self.repo_path);
         command
+    }
+
+    fn run_git_at<I, S>(&self, path: &Path, args: I) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr> + Clone,
+    {
+        let args = args.into_iter().collect::<Vec<_>>();
+        let rendered = args
+            .iter()
+            .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut command = Command::new("git");
+        command.current_dir(path).args(&args);
+        self.run_command(command, &format!("git -C {} {rendered}", path.display()))
     }
 
     fn run_git_raw<I, S>(&self, args: I) -> Result<Output>
@@ -914,6 +1194,72 @@ mod tests {
         );
         assert_eq!(repo.worktree_state()?, before);
         assert_eq!(repo.head_refs()?, before_heads);
+        Ok(())
+    }
+
+    #[test]
+    fn finalizing_detached_worktree_advances_only_candidate_ref() -> Result<()> {
+        let repo = ScratchRepo::new()?;
+        let adapter = GitCandidateAdapter::try_new(&repo.path)?;
+        let base_oid = repo.base_oid()?;
+        let before_heads = repo.head_refs()?;
+        let candidate_ref =
+            adapter.create_candidate_ref(CandidateSetId::new(), CandidateId::new(), &base_oid)?;
+        let worktree = repo.path.join("candidate-worktree");
+        adapter.create_candidate_worktree(&candidate_ref, &worktree)?;
+
+        fs::write(worktree.join("candidate.txt"), "candidate\n")?;
+        run_git(&worktree, &["add", "candidate.txt"], None)?;
+        run_git(&worktree, &["commit", "--quiet", "-m", "candidate"], None)?;
+        let detached_head = run_git(&worktree, &["rev-parse", "HEAD"], None)?;
+        assert_eq!(
+            adapter.read_candidate_metadata(&candidate_ref)?.tip_oid,
+            base_oid
+        );
+
+        let metadata = adapter.finalize_candidate_worktree(&candidate_ref, &worktree)?;
+        assert_eq!(metadata.tip_oid, detached_head);
+        assert_eq!(metadata.base_oid, base_oid);
+        assert_eq!(metadata.changed_paths, vec!["candidate.txt"]);
+        assert!(
+            adapter
+                .candidate_diff_digest(&candidate_ref)?
+                .starts_with("sha256:")
+        );
+        assert_eq!(repo.head_refs()?, before_heads);
+        assert_eq!(run_git(&repo.path, &["rev-parse", "HEAD"], None)?, base_oid);
+        assert!(run_git(&worktree, &["status", "--porcelain"], None)?.is_empty());
+
+        adapter.cleanup_candidate_worktree(&candidate_ref, &worktree)?;
+        Ok(())
+    }
+
+    #[test]
+    fn divergent_detached_worktree_does_not_advance_candidate_ref() -> Result<()> {
+        let repo = ScratchRepo::new()?;
+        let adapter = GitCandidateAdapter::try_new(&repo.path)?;
+        let base_oid = repo.base_oid()?;
+        let candidate_ref =
+            adapter.create_candidate_ref(CandidateSetId::new(), CandidateId::new(), &base_oid)?;
+        let worktree = repo.path.join("divergent-worktree");
+        adapter.create_candidate_worktree(&candidate_ref, &worktree)?;
+
+        let tree_oid = run_git(&worktree, &["mktree"], Some(b""))?;
+        let orphan_oid = run_git(
+            &worktree,
+            &["commit-tree", &tree_oid, "-m", "orphan candidate"],
+            None,
+        )?;
+        run_git(&worktree, &["reset", "--hard", &orphan_oid], None)?;
+
+        let result = adapter.finalize_candidate_worktree(&candidate_ref, &worktree);
+        assert!(result.is_err());
+        assert_eq!(
+            adapter.read_candidate_metadata(&candidate_ref)?.tip_oid,
+            base_oid
+        );
+
+        adapter.cleanup_candidate_worktree(&candidate_ref, &worktree)?;
         Ok(())
     }
 

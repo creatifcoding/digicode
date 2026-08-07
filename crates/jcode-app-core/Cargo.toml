@@ -100,6 +100,7 @@ jcode-session-types = { path = "../jcode-session-types" }
 jcode-setup-hints = { path = "../jcode-setup-hints" }
 jcode-task-types = { path = "../jcode-task-types" }
 jcode-tasker-pi = { path = "../jcode-tasker-pi" }
+jcode-tasker-orchestration = { path = "../jcode-tasker-orchestration" }
 jcode-tasker-store = { path = "../jcode-tasker-store" }
 jcode-tasker-types = { path = "../jcode-tasker-types" }
 jcode-tool-core = { path = "../jcode-tool-core" }

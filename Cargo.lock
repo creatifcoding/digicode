@@ -3598,6 +3598,7 @@ dependencies = [
  "jcode-setup-hints",
  "jcode-swarm-core",
  "jcode-task-types",
+ "jcode-tasker-orchestration",
  "jcode-tasker-pi",
  "jcode-tasker-store",
  "jcode-tasker-types",
@@ -4476,13 +4477,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "jcode-tasker-types",
+ "sha2 0.10.9",
 ]
 
 [[package]]
 name = "jcode-tasker-orchestration"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "futures",
  "jcode-tasker-git",
  "jcode-tasker-pi",
  "jcode-tasker-promotion",
@@ -4492,8 +4496,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
