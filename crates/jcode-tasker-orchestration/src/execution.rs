@@ -406,7 +406,7 @@ enum LaneRunResult {
     Failed(String),
     Cancelled,
     TimedOut,
-    TerminationFailed,
+    TerminationFailed(String),
 }
 
 async fn run_lane<E: CandidateExecutor>(
@@ -420,8 +420,10 @@ async fn run_lane<E: CandidateExecutor>(
     tokio::select! {
         _ = cancellation.cancelled() => {
             lane_cancellation.cancel();
-            if executor.cancel(&execution).await.is_err() {
-                return LaneRunResult::TerminationFailed;
+            if let Err(error) = executor.cancel(&execution).await {
+                return LaneRunResult::TerminationFailed(format!(
+                    "candidate executor rejected cancellation: {error}"
+                ));
             }
             match timeout(
                 Duration::from_millis(CANDIDATE_TERMINATION_TIMEOUT_MS),
@@ -430,7 +432,10 @@ async fn run_lane<E: CandidateExecutor>(
             .await
             {
                 Ok(_) => LaneRunResult::Cancelled,
-                Err(_) => LaneRunResult::TerminationFailed,
+                Err(_) => LaneRunResult::TerminationFailed(
+                    "candidate executor did not acknowledge cancellation before the termination deadline"
+                        .into(),
+                ),
             }
         }
         result = timeout(execution.timeout, &mut execution_future) => {
@@ -440,8 +445,10 @@ async fn run_lane<E: CandidateExecutor>(
                 Ok(Err(CandidateExecutorError::Failed(reason))) => LaneRunResult::Failed(reason),
                 Err(_) => {
                     lane_cancellation.cancel();
-                    if executor.cancel(&execution).await.is_err() {
-                        return LaneRunResult::TerminationFailed;
+                    if let Err(error) = executor.cancel(&execution).await {
+                        return LaneRunResult::TerminationFailed(format!(
+                            "candidate executor rejected timeout termination: {error}"
+                        ));
                     }
                     match timeout(
                         Duration::from_millis(CANDIDATE_TERMINATION_TIMEOUT_MS),
@@ -450,7 +457,10 @@ async fn run_lane<E: CandidateExecutor>(
                     .await
                     {
                         Ok(_) => LaneRunResult::TimedOut,
-                        Err(_) => LaneRunResult::TerminationFailed,
+                        Err(_) => LaneRunResult::TerminationFailed(
+                            "candidate executor did not acknowledge timeout termination before the termination deadline"
+                                .into(),
+                        ),
                     }
                 }
             }
@@ -464,8 +474,10 @@ impl CandidateOrchestrator {
     /// Lane persistence remains synchronous and CAS-protected. Model work is
     /// fanned out within the host lane bound, then terminal results are
     /// reconciled in stable lane order so SQLite revisions cannot race. A
-    /// failed, cancelled, or timed-out lane is terminally recorded and cleaned
-    /// up before the report is returned.
+    /// failed, cancelled, or timed-out lane is terminally recorded and cleanup
+    /// is attempted before the report is returned. Unacknowledged termination
+    /// produces a quarantined outcome and retains its Git resources for
+    /// recovery instead of returning early.
     pub async fn execute_candidate_set<E: CandidateExecutor>(
         &mut self,
         request: BoundCandidateLaneLaunchRequest,
@@ -543,28 +555,27 @@ impl CandidateOrchestrator {
                                 }
                                 Err(error) => {
                                     let reason = error.to_string();
-                                    let failed = self.fail_and_cleanup_lane(
-                                        lane.candidate_id,
-                                        revision,
-                                        &reason,
-                                    )?;
-                                    revision = failed.transition.revision;
-                                    CandidateLaneOutcome {
-                                        candidate_id: lane.candidate_id,
-                                        state: LaneState::Failed,
-                                        submission: None,
-                                        failure: Some(CandidateLaneFailure {
-                                            candidate_id: lane.candidate_id,
-                                            state: LaneState::Failed,
-                                            reason,
-                                        }),
-                                    }
+                                    let (outcome, next_revision) =
+                                        self.failed_outcome(&lane, revision, reason)?;
+                                    revision = next_revision;
+                                    outcome
                                 }
                             }
                         }
                         Err(error) => {
-                            let (outcome, next_revision) =
-                                self.failed_outcome(&lane, revision, error.to_string())?;
+                            let (outcome, next_revision) = if matches!(
+                                &error,
+                                OrchestrationError::ExecutionCancelled { .. }
+                            ) {
+                                cancelled = true;
+                                self.abandoned_outcome(
+                                    &lane,
+                                    revision,
+                                    "candidate execution cancelled during acceptance validation",
+                                )?
+                            } else {
+                                self.failed_outcome(&lane, revision, error.to_string())?
+                            };
                             revision = next_revision;
                             outcome
                         }
@@ -587,26 +598,25 @@ impl CandidateOrchestrator {
                         "candidate lane exceeded {}ms timeout",
                         limits.lane_timeout_ms
                     );
-                    let timed_out =
-                        self.timeout_lane(lane.candidate_id, revision, reason.clone())?;
-                    revision = timed_out.transition.revision;
+                    let (outcome, next_revision) =
+                        self.timed_out_outcome(&lane, revision, reason)?;
+                    revision = next_revision;
+                    outcome
+                }
+                LaneRunResult::TerminationFailed(reason) => {
+                    let transition =
+                        self.quarantine_lane(lane.candidate_id, revision, reason.clone())?;
+                    revision = transition.revision;
                     CandidateLaneOutcome {
                         candidate_id: lane.candidate_id,
-                        state: LaneState::TimedOut,
+                        state: LaneState::Quarantined,
                         submission: None,
                         failure: Some(CandidateLaneFailure {
                             candidate_id: lane.candidate_id,
-                            state: LaneState::TimedOut,
+                            state: LaneState::Quarantined,
                             reason,
                         }),
                     }
-                }
-                LaneRunResult::TerminationFailed => {
-                    return Err(OrchestrationError::ExecutionTerminationFailed {
-                        candidate_set_id: opened.candidate_set.id.to_string(),
-                        candidate_id: lane.candidate_id.to_string(),
-                        revision,
-                    });
                 }
             };
             outcomes.push(outcome);
@@ -626,40 +636,13 @@ impl CandidateOrchestrator {
         })
     }
 
-    fn fail_and_cleanup_lane(
-        &mut self,
-        candidate_id: super::CandidateId,
-        expected_revision: u64,
-        reason: &str,
-    ) -> Result<super::LaneAbandoned, OrchestrationError> {
-        let transition = self.fail_lane(candidate_id, expected_revision, reason.to_owned())?;
-        let cleanup = self.cleanup_lane(candidate_id)?;
-        Ok(super::LaneAbandoned {
-            transition,
-            cleanup,
-        })
-    }
-
     fn failed_outcome(
         &mut self,
         lane: &CandidateLaneSpec,
         revision: u64,
         reason: String,
     ) -> Result<(CandidateLaneOutcome, u64), OrchestrationError> {
-        let receipt = self.fail_and_cleanup_lane(lane.candidate_id, revision, &reason)?;
-        Ok((
-            CandidateLaneOutcome {
-                candidate_id: lane.candidate_id,
-                state: LaneState::Failed,
-                submission: None,
-                failure: Some(CandidateLaneFailure {
-                    candidate_id: lane.candidate_id,
-                    state: LaneState::Failed,
-                    reason,
-                }),
-            },
-            receipt.transition.revision,
-        ))
+        self.terminal_cleanup_outcome(lane, revision, LaneState::Failed, reason)
     }
 
     fn abandoned_outcome(
@@ -668,20 +651,64 @@ impl CandidateOrchestrator {
         revision: u64,
         reason: &str,
     ) -> Result<(CandidateLaneOutcome, u64), OrchestrationError> {
-        let receipt = self.abandon_lane(lane.candidate_id, revision, reason.to_owned())?;
-        Ok((
-            CandidateLaneOutcome {
-                candidate_id: lane.candidate_id,
-                state: LaneState::Abandoned,
-                submission: None,
-                failure: Some(CandidateLaneFailure {
+        self.terminal_cleanup_outcome(lane, revision, LaneState::Abandoned, reason.to_owned())
+    }
+
+    fn timed_out_outcome(
+        &mut self,
+        lane: &CandidateLaneSpec,
+        revision: u64,
+        reason: String,
+    ) -> Result<(CandidateLaneOutcome, u64), OrchestrationError> {
+        self.terminal_cleanup_outcome(lane, revision, LaneState::TimedOut, reason)
+    }
+
+    fn terminal_cleanup_outcome(
+        &mut self,
+        lane: &CandidateLaneSpec,
+        revision: u64,
+        state: LaneState,
+        reason: String,
+    ) -> Result<(CandidateLaneOutcome, u64), OrchestrationError> {
+        debug_assert!(matches!(
+            state,
+            LaneState::Failed | LaneState::Abandoned | LaneState::TimedOut
+        ));
+        let transition =
+            self.transition(lane.candidate_id, revision, state, Some(reason.clone()))?;
+        match self.cleanup_lane(lane.candidate_id) {
+            Ok(_) => Ok((
+                CandidateLaneOutcome {
                     candidate_id: lane.candidate_id,
-                    state: LaneState::Abandoned,
-                    reason: reason.to_owned(),
-                }),
-            },
-            receipt.transition.revision,
-        ))
+                    state,
+                    submission: None,
+                    failure: Some(CandidateLaneFailure {
+                        candidate_id: lane.candidate_id,
+                        state,
+                        reason,
+                    }),
+                },
+                transition.revision,
+            )),
+            Err(cleanup_error) => {
+                let reason = format!("{reason}; cleanup retained for recovery: {cleanup_error}");
+                let quarantine =
+                    self.quarantine_lane(lane.candidate_id, transition.revision, reason.clone())?;
+                Ok((
+                    CandidateLaneOutcome {
+                        candidate_id: lane.candidate_id,
+                        state: LaneState::Quarantined,
+                        submission: None,
+                        failure: Some(CandidateLaneFailure {
+                            candidate_id: lane.candidate_id,
+                            state: LaneState::Quarantined,
+                            reason,
+                        }),
+                    },
+                    quarantine.revision,
+                ))
+            }
+        }
     }
 
     async fn host_validate_submission(
@@ -787,10 +814,20 @@ impl CandidateOrchestrator {
         lanes: &[CandidateLaneSpec],
         mut revision: u64,
     ) -> Result<u64, OrchestrationError> {
+        let mut errors = Vec::new();
         for lane in lanes {
-            let abandoned =
-                self.abandon_lane(lane.candidate_id, revision, "candidate execution cancelled")?;
-            revision = abandoned.transition.revision;
+            match self.abandoned_outcome(lane, revision, "candidate execution cancelled") {
+                Ok((_, next_revision)) => revision = next_revision,
+                Err(error) => errors.push(format!("{}: {error}", lane.candidate_id)),
+            }
+        }
+        if !errors.is_empty() {
+            return Err(OrchestrationError::Git {
+                message: format!(
+                    "aggregate cancellation cleanup failed: {}",
+                    errors.join("; ")
+                ),
+            });
         }
         Ok(revision)
     }
@@ -848,6 +885,11 @@ mod tests {
         released: Arc<Notify>,
     }
 
+    #[derive(Clone)]
+    struct NonAcknowledgingExecutor {
+        cancel_calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait]
     impl CandidateExecutor for CancellationAcknowledgingExecutor {
         async fn execute(
@@ -867,6 +909,27 @@ mod tests {
             self.cancel_calls.fetch_add(1, Ordering::SeqCst);
             self.released.notify_one();
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl CandidateExecutor for NonAcknowledgingExecutor {
+        async fn execute(
+            &self,
+            _request: CandidateLaneExecutionRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<CandidateAgentResult, CandidateExecutorError> {
+            std::future::pending().await
+        }
+
+        async fn cancel(
+            &self,
+            _request: &CandidateLaneExecutionRequest,
+        ) -> Result<(), CandidateExecutorError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            Err(CandidateExecutorError::Failed(
+                "provider termination is unacknowledged".into(),
+            ))
         }
     }
 
@@ -1019,6 +1082,15 @@ mod tests {
         })
         .expect("bind host candidate context");
         (orchestrator, request)
+    }
+
+    fn reopen_orchestrator(root: &TempDir) -> CandidateOrchestrator {
+        let repo = root.path().join("repo");
+        let db = root.path().join("tasker.sqlite");
+        let store = jcode_tasker_pi::ConcurrencyStore::open_path(&db, repo.to_string_lossy())
+            .expect("reopen store");
+        let git = jcode_tasker_git::GitCandidateAdapter::try_new(&repo).expect("reopen git");
+        CandidateOrchestrator::new(store, git).expect("reopen orchestrator")
     }
 
     fn fake_executor() -> FakeExecutor {
@@ -1251,6 +1323,97 @@ mod tests {
                 .list_candidate_ref_names()
                 .expect("refs")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unacknowledged_termination_quarantines_every_lane_and_recovers_after_restart() {
+        let root = TempDir::new().expect("temp root");
+        let (mut orchestrator, mut request) = request_for(&root, 2);
+        request.guest.limits.lane_timeout_ms = 1;
+        let executor = NonAcknowledgingExecutor {
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let report = orchestrator
+            .execute_candidate_set(
+                request,
+                root.path().join("lanes"),
+                &executor,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("unacknowledged termination is durably quarantined");
+        assert_eq!(report.outcomes.len(), 2);
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.state == LaneState::Quarantined)
+        );
+        assert_eq!(executor.cancel_calls.load(Ordering::SeqCst), 2);
+
+        let status = orchestrator
+            .status(report.candidate_set_id, 8)
+            .expect("quarantined status");
+        assert_eq!(status.counts.quarantined, 2);
+        let inventory = orchestrator
+            .recovery_inventory(8)
+            .expect("recovery inventory");
+        assert_eq!(inventory.lanes.len(), 2);
+        assert!(inventory.lanes.iter().all(|lane| {
+            lane.state == LaneState::Quarantined
+                && lane.cleanup_state == crate::LaneCleanupState::Pending
+                && lane.worktree.path.is_dir()
+        }));
+        assert_eq!(
+            orchestrator
+                .git()
+                .list_candidate_ref_names()
+                .expect("retained refs")
+                .len(),
+            2
+        );
+
+        let restarted = reopen_orchestrator(&root);
+        let recovered = restarted
+            .recovery_inventory(8)
+            .expect("recovery inventory survives restart");
+        assert_eq!(recovered.lanes.len(), 2);
+        let candidate_ids = recovered
+            .lanes
+            .iter()
+            .map(|lane| lane.candidate_id)
+            .collect::<Vec<_>>();
+        for candidate_id in &candidate_ids {
+            restarted
+                .cleanup_lane(*candidate_id)
+                .expect("recover quarantined lane");
+        }
+        for candidate_id in candidate_ids {
+            restarted
+                .cleanup_lane(candidate_id)
+                .expect("cleanup is idempotent after restart");
+        }
+        assert!(
+            restarted
+                .recovery_inventory(8)
+                .expect("empty recovery inventory")
+                .lanes
+                .is_empty()
+        );
+        assert!(
+            restarted
+                .git()
+                .list_candidate_ref_names()
+                .expect("cleaned refs")
+                .is_empty()
+        );
+        assert!(
+            recovered
+                .lanes
+                .iter()
+                .all(|lane| !lane.worktree.path.exists())
         );
     }
 }

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS orchestration_lanes (
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     candidate_ref TEXT NOT NULL,
     state TEXT NOT NULL,
+    cleanup_state TEXT NOT NULL DEFAULT 'not_required',
     reason TEXT,
     acceptance_json TEXT NOT NULL CHECK (json_valid(acceptance_json)),
     worktree_json TEXT NOT NULL CHECK (json_valid(worktree_json)),
@@ -173,6 +174,12 @@ pub enum LaneState {
     Failed,
     Abandoned,
     TimedOut,
+    /// Execution is terminal, but cleanup remains owned by a recovery worker.
+    ///
+    /// A lane enters this state when its executor did not acknowledge
+    /// cancellation or timeout termination. Its candidate refs and worktree
+    /// are deliberately retained until an explicit recovery cleanup succeeds.
+    Quarantined,
 }
 
 impl LaneState {
@@ -184,13 +191,21 @@ impl LaneState {
             Self::Failed => "failed",
             Self::Abandoned => "abandoned",
             Self::TimedOut => "timed_out",
+            Self::Quarantined => "quarantined",
         }
     }
 
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Submitted | Self::Failed | Self::Abandoned | Self::TimedOut
+            Self::Submitted | Self::Failed | Self::Abandoned | Self::TimedOut | Self::Quarantined
+        )
+    }
+
+    pub const fn owns_cleanup(self) -> bool {
+        matches!(
+            self,
+            Self::Failed | Self::Abandoned | Self::TimedOut | Self::Quarantined
         )
     }
 
@@ -200,10 +215,21 @@ impl LaneState {
                 (self, next),
                 (
                     Self::Pending,
-                    Self::InProgress | Self::Failed | Self::Abandoned | Self::TimedOut
+                    Self::InProgress
+                        | Self::Failed
+                        | Self::Abandoned
+                        | Self::TimedOut
+                        | Self::Quarantined
                 ) | (
                     Self::InProgress,
-                    Self::Submitted | Self::Failed | Self::Abandoned | Self::TimedOut
+                    Self::Submitted
+                        | Self::Failed
+                        | Self::Abandoned
+                        | Self::TimedOut
+                        | Self::Quarantined
+                ) | (
+                    Self::Failed | Self::Abandoned | Self::TimedOut,
+                    Self::Quarantined
                 )
             )
     }
@@ -220,7 +246,45 @@ impl std::str::FromStr for LaneState {
             "failed" => Ok(Self::Failed),
             "abandoned" => Ok(Self::Abandoned),
             "timed_out" => Ok(Self::TimedOut),
+            "quarantined" => Ok(Self::Quarantined),
             other => Err(OrchestrationError::InvalidLaneState(other.into())),
+        }
+    }
+}
+
+/// Durable ownership of cleanup for a lane's Git resources.
+///
+/// `LaneState::Quarantined` is terminal for execution, but it intentionally
+/// starts in `Pending` cleanup so a recovery worker can finish the side effect
+/// after a restart. This is separate from execution state because a lane can
+/// be terminal while its refs or worktree are still retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneCleanupState {
+    NotRequired,
+    Pending,
+    Complete,
+}
+
+impl LaneCleanupState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+impl std::str::FromStr for LaneCleanupState {
+    type Err = OrchestrationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "not_required" => Ok(Self::NotRequired),
+            "pending" => Ok(Self::Pending),
+            "complete" => Ok(Self::Complete),
+            other => Err(OrchestrationError::InvalidLaneCleanupState(other.into())),
         }
     }
 }
@@ -337,6 +401,7 @@ pub struct LaneCounts {
     pub failed: usize,
     pub abandoned: usize,
     pub timed_out: usize,
+    pub quarantined: usize,
 }
 
 /// A bounded status read model for coordinators.
@@ -348,6 +413,7 @@ pub struct LaneStatusProjection {
     pub worktree: WorktreeDescriptor,
     pub acceptance: AcceptanceContract,
     pub state: LaneState,
+    pub cleanup_state: LaneCleanupState,
     pub reason: Option<String>,
     pub updated_at: String,
 }
@@ -361,6 +427,29 @@ pub struct OrchestrationStatusProjection {
     pub lanes: Vec<LaneStatusProjection>,
     pub counts: LaneCounts,
     pub store_projection: Value,
+    pub limit: usize,
+    pub truncated: bool,
+}
+
+/// A lane whose cleanup side effect remains owned by recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneRecoveryEntry {
+    pub candidate_set_id: CandidateSetId,
+    pub candidate_id: CandidateId,
+    pub candidate_ref: String,
+    pub worktree: WorktreeDescriptor,
+    pub state: LaneState,
+    pub cleanup_state: LaneCleanupState,
+    pub reason: Option<String>,
+    pub updated_at: String,
+}
+
+/// Bounded recovery inventory for a project partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneRecoveryInventory {
+    pub lanes: Vec<LaneRecoveryEntry>,
     pub limit: usize,
     pub truncated: bool,
 }
@@ -384,6 +473,8 @@ pub enum OrchestrationError {
     InvalidContract(String),
     #[error("invalid lane state: {0}")]
     InvalidLaneState(String),
+    #[error("invalid lane cleanup state: {0}")]
+    InvalidLaneCleanupState(String),
     #[error("invalid lane transition from {from:?} to {to:?} for candidate {candidate_id}")]
     InvalidTransition {
         candidate_id: String,
@@ -442,6 +533,7 @@ struct LaneRow {
     candidate_id: CandidateId,
     candidate_ref: String,
     state: LaneState,
+    cleanup_state: LaneCleanupState,
     reason: Option<String>,
     acceptance: AcceptanceContract,
     worktree: WorktreeDescriptor,
@@ -456,6 +548,7 @@ impl LaneRow {
             worktree: self.worktree,
             acceptance: self.acceptance,
             state: self.state,
+            cleanup_state: self.cleanup_state,
             reason: self.reason,
             updated_at: self.updated_at,
         }
@@ -477,6 +570,32 @@ impl LaneStore {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.execute_batch(LANE_SCHEMA)?;
+        let cleanup_column: Option<String> = connection
+            .query_row(
+                "SELECT name FROM pragma_table_info('orchestration_lanes')
+                 WHERE name = 'cleanup_state'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if cleanup_column.is_none() {
+            connection.execute(
+                "ALTER TABLE orchestration_lanes
+                 ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'not_required'",
+                [],
+            )?;
+            connection.execute(
+                "UPDATE orchestration_lanes
+                 SET cleanup_state = 'pending'
+                 WHERE state IN ('failed', 'abandoned', 'timed_out', 'quarantined')",
+                [],
+            )?;
+        }
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS orchestration_lanes_recovery
+             ON orchestration_lanes(cleanup_state, updated_at, candidate_id)",
+            [],
+        )?;
         Ok(Self { connection })
     }
 
@@ -495,9 +614,9 @@ impl LaneStore {
         for (ordinal, lane) in lanes.iter().enumerate() {
             transaction.execute(
                 "INSERT INTO orchestration_lanes
-                    (candidate_set_id, candidate_id, ordinal, candidate_ref, state, reason,
-                     acceptance_json, worktree_json, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?8)",
+                    (candidate_set_id, candidate_id, ordinal, candidate_ref, state,
+                     cleanup_state, reason, acceptance_json, worktree_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?9)",
                 params![
                     candidate_set_id.to_string(),
                     lane.candidate_id.to_string(),
@@ -506,6 +625,7 @@ impl LaneStore {
                     })?,
                     lane.candidate_ref,
                     lane.state.as_str(),
+                    LaneCleanupState::NotRequired.as_str(),
                     serde_json::to_string(&lane.acceptance)?,
                     serde_json::to_string(&lane.worktree)?,
                     timestamp,
@@ -521,8 +641,8 @@ impl LaneStore {
         let row = self
             .connection
             .query_row(
-                "SELECT candidate_set_id, candidate_id, candidate_ref, state, reason,
-                        acceptance_json, worktree_json, updated_at
+                "SELECT candidate_set_id, candidate_id, candidate_ref, state, cleanup_state,
+                        reason, acceptance_json, worktree_json, updated_at
                  FROM orchestration_lanes WHERE candidate_id = ?1",
                 [candidate_id.to_string()],
                 lane_row,
@@ -547,8 +667,8 @@ impl LaneStore {
         let rows = self
             .connection
             .prepare(
-                "SELECT candidate_set_id, candidate_id, candidate_ref, state, reason,
-                        acceptance_json, worktree_json, updated_at
+                "SELECT candidate_set_id, candidate_id, candidate_ref, state, cleanup_state,
+                        reason, acceptance_json, worktree_json, updated_at
                  FROM orchestration_lanes
                  WHERE candidate_set_id = ?1 ORDER BY ordinal ASC, candidate_id ASC LIMIT ?2",
             )?
@@ -584,9 +704,56 @@ impl LaneStore {
                 LaneState::Failed => counts.failed = count,
                 LaneState::Abandoned => counts.abandoned = count,
                 LaneState::TimedOut => counts.timed_out = count,
+                LaneState::Quarantined => counts.quarantined = count,
             }
         }
         Ok(counts)
+    }
+
+    fn recovery_inventory(&self, limit: usize) -> Result<(Vec<LaneRow>, bool), OrchestrationError> {
+        let limit = limit.clamp(1, LANE_PROJECTION_LIMIT);
+        let total: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM orchestration_lanes WHERE cleanup_state = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        let rows = self
+            .connection
+            .prepare(
+                "SELECT candidate_set_id, candidate_id, candidate_ref, state, cleanup_state,
+                        reason, acceptance_json, worktree_json, updated_at
+                 FROM orchestration_lanes
+                 WHERE cleanup_state = 'pending'
+                 ORDER BY updated_at ASC, candidate_id ASC LIMIT ?1",
+            )?
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], lane_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((rows, total > i64::try_from(limit).unwrap_or(i64::MAX)))
+    }
+
+    fn mark_cleanup_complete(&self, candidate_id: CandidateId) -> Result<(), OrchestrationError> {
+        let changed = self.connection.execute(
+            "UPDATE orchestration_lanes
+             SET cleanup_state = 'complete', updated_at = ?1
+             WHERE candidate_id = ?2 AND cleanup_state != 'complete'",
+            params![Utc::now().to_rfc3339(), candidate_id.to_string()],
+        )?;
+        if changed == 0 {
+            let exists: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT 1 FROM orchestration_lanes WHERE candidate_id = ?1",
+                    [candidate_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Err(OrchestrationError::LaneNotFound {
+                    candidate_id: candidate_id.to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn transition(
@@ -603,17 +770,25 @@ impl LaneStore {
         ensure_revision(&transaction, project_id, expected_revision)?;
         let existing = transaction
             .query_row(
-                "SELECT candidate_set_id, state FROM orchestration_lanes WHERE candidate_id = ?1",
+                "SELECT candidate_set_id, state, cleanup_state
+                 FROM orchestration_lanes WHERE candidate_id = ?1",
                 [candidate_id.to_string()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((candidate_set_id, current_value)) = existing else {
+        let Some((candidate_set_id, current_value, current_cleanup_value)) = existing else {
             return Err(OrchestrationError::LaneNotFound {
                 candidate_id: candidate_id.to_string(),
             });
         };
         let current = current_value.parse::<LaneState>()?;
+        let current_cleanup = current_cleanup_value.parse::<LaneCleanupState>()?;
         if !current.can_transition_to(target) {
             return Err(OrchestrationError::InvalidTransition {
                 candidate_id: candidate_id.to_string(),
@@ -639,10 +814,24 @@ impl LaneStore {
             });
         }
         let timestamp = Utc::now().to_rfc3339();
+        let cleanup_state = if current == target {
+            current_cleanup
+        } else if target.owns_cleanup() {
+            LaneCleanupState::Pending
+        } else {
+            LaneCleanupState::NotRequired
+        };
         transaction.execute(
-            "UPDATE orchestration_lanes SET state = ?1, reason = ?2, updated_at = ?3
-             WHERE candidate_id = ?4",
-            params![target.as_str(), reason, timestamp, candidate_id.to_string()],
+            "UPDATE orchestration_lanes
+             SET state = ?1, cleanup_state = ?2, reason = ?3, updated_at = ?4
+             WHERE candidate_id = ?5",
+            params![
+                target.as_str(),
+                cleanup_state.as_str(),
+                reason,
+                timestamp,
+                candidate_id.to_string()
+            ],
         )?;
         let revision = bump_revision(&transaction, project_id, expected_revision)?;
         transaction.commit()?;
@@ -686,18 +875,28 @@ fn lane_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneRow> {
                 Box::new(error),
             )
         })?;
-    let acceptance = serde_json::from_str::<AcceptanceContract>(&row.get::<_, String>(5)?)
+    let cleanup_state = row
+        .get::<_, String>(4)?
+        .parse()
+        .map_err(|error: OrchestrationError| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let acceptance = serde_json::from_str::<AcceptanceContract>(&row.get::<_, String>(6)?)
         .map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                5,
+                6,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
         })?;
     let worktree =
-        serde_json::from_str::<WorktreeDescriptor>(&row.get::<_, String>(6)?).map_err(|error| {
+        serde_json::from_str::<WorktreeDescriptor>(&row.get::<_, String>(7)?).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                6,
+                7,
                 rusqlite::types::Type::Text,
                 Box::new(error),
             )
@@ -707,10 +906,11 @@ fn lane_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LaneRow> {
         candidate_id,
         candidate_ref: row.get(2)?,
         state,
-        reason: row.get(4)?,
+        cleanup_state,
+        reason: row.get(5)?,
         acceptance,
         worktree,
-        updated_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -724,6 +924,7 @@ fn canonical_candidate_state(state: LaneState) -> &'static str {
         // rejected candidate is the durable terminal equivalent; the exact
         // orchestration state remains in `orchestration_lanes.state`.
         LaneState::Abandoned => "rejected",
+        LaneState::Quarantined => "failed",
     }
 }
 
@@ -833,12 +1034,38 @@ impl CandidateOrchestrator {
         &self.git
     }
 
-    fn cleanup_lane_specs(&self, lanes: &[CandidateLaneSpec]) {
+    fn cleanup_lane_specs(&self, lanes: &[CandidateLaneSpec]) -> Vec<String> {
+        let mut errors = Vec::new();
         for lane in lanes {
-            if let Ok(candidate_ref) = CandidateRef::parse(&lane.candidate_ref) {
-                let _ = self
-                    .git
-                    .cleanup_candidate_worktree(&candidate_ref, &lane.worktree.path);
+            let candidate_ref = match CandidateRef::parse(&lane.candidate_ref) {
+                Ok(candidate_ref) => candidate_ref,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", lane.candidate_id));
+                    continue;
+                }
+            };
+            if let Err(error) = self
+                .git
+                .cleanup_candidate_worktree(&candidate_ref, &lane.worktree.path)
+            {
+                errors.push(format!("{}: {error}", lane.candidate_id));
+            }
+        }
+        errors
+    }
+
+    fn cleanup_error(
+        primary: impl std::fmt::Display,
+        cleanup_errors: &[String],
+    ) -> OrchestrationError {
+        if cleanup_errors.is_empty() {
+            git_error(primary)
+        } else {
+            OrchestrationError::Git {
+                message: format!(
+                    "{primary}; aggregate cleanup errors: {}",
+                    cleanup_errors.join("; ")
+                ),
             }
         }
     }
@@ -914,8 +1141,8 @@ impl CandidateOrchestrator {
             ) {
                 Ok(candidate_ref) => candidate_ref,
                 Err(error) => {
-                    self.cleanup_lane_specs(&lanes);
-                    return Err(git_error(error));
+                    let cleanup_errors = self.cleanup_lane_specs(&lanes);
+                    return Err(Self::cleanup_error(error, &cleanup_errors));
                 }
             };
             let worktree = WorktreeDescriptor {
@@ -935,9 +1162,12 @@ impl CandidateOrchestrator {
                 .git
                 .create_candidate_worktree(&candidate_ref, &lane.worktree.path)
             {
-                let _ = self.git.cleanup_abandoned_candidate(&candidate_ref);
-                self.cleanup_lane_specs(&lanes);
-                return Err(git_error(error));
+                let mut cleanup_errors = Vec::new();
+                if let Err(cleanup_error) = self.git.cleanup_abandoned_candidate(&candidate_ref) {
+                    cleanup_errors.push(format!("{}: {cleanup_error}", lane.candidate_id));
+                }
+                cleanup_errors.extend(self.cleanup_lane_specs(&lanes));
+                return Err(Self::cleanup_error(error, &cleanup_errors));
             }
             lanes.push(lane);
         }
@@ -945,8 +1175,8 @@ impl CandidateOrchestrator {
         let isolation = match self.git.assert_isolated() {
             Ok(proof) => proof,
             Err(error) => {
-                self.cleanup_lane_specs(&lanes);
-                return Err(git_error(error));
+                let cleanup_errors = self.cleanup_lane_specs(&lanes);
+                return Err(Self::cleanup_error(error, &cleanup_errors));
             }
         };
 
@@ -957,8 +1187,16 @@ impl CandidateOrchestrator {
         {
             Ok(mutation) => mutation.revision,
             Err(error) => {
-                self.cleanup_lane_specs(&lanes);
-                return Err(error.into());
+                let cleanup_errors = self.cleanup_lane_specs(&lanes);
+                if cleanup_errors.is_empty() {
+                    return Err(error.into());
+                }
+                return Err(OrchestrationError::Git {
+                    message: format!(
+                        "{error}; aggregate cleanup errors: {}",
+                        cleanup_errors.join("; ")
+                    ),
+                });
             }
         };
 
@@ -984,13 +1222,28 @@ impl CandidateOrchestrator {
             {
                 Ok(mutation) => revision = mutation.revision,
                 Err(error) => {
-                    self.cleanup_lane_specs(&lanes);
-                    let _ = self.store.set_candidate_set_state(
+                    let cleanup_errors = self.cleanup_lane_specs(&lanes);
+                    let cancellation_error = match self.store.set_candidate_set_state(
                         &candidate_set_id.to_string(),
                         "cancelled",
                         self.store.current_revision(&project_id).unwrap_or(revision),
-                    );
-                    return Err(error.into());
+                    ) {
+                        Ok(_) => None,
+                        Err(error) => Some(error.to_string()),
+                    };
+                    if cleanup_errors.is_empty() && cancellation_error.is_none() {
+                        return Err(error.into());
+                    }
+                    let mut details = cleanup_errors;
+                    if let Some(cancellation_error) = cancellation_error {
+                        details.push(format!("candidate-set cancellation: {cancellation_error}"));
+                    }
+                    return Err(OrchestrationError::Git {
+                        message: format!(
+                            "{error}; aggregate cleanup errors: {}",
+                            details.join("; ")
+                        ),
+                    });
                 }
             }
         }
@@ -1001,13 +1254,25 @@ impl CandidateOrchestrator {
         {
             Ok(revision) => revision,
             Err(error) => {
-                self.cleanup_lane_specs(&lanes);
-                let _ = self.store.set_candidate_set_state(
+                let cleanup_errors = self.cleanup_lane_specs(&lanes);
+                let cancellation_error = match self.store.set_candidate_set_state(
                     &candidate_set_id.to_string(),
                     "cancelled",
                     self.store.current_revision(&project_id).unwrap_or(revision),
-                );
-                return Err(error);
+                ) {
+                    Ok(_) => None,
+                    Err(error) => Some(error.to_string()),
+                };
+                if cleanup_errors.is_empty() && cancellation_error.is_none() {
+                    return Err(error);
+                }
+                let mut details = cleanup_errors;
+                if let Some(cancellation_error) = cancellation_error {
+                    details.push(format!("candidate-set cancellation: {cancellation_error}"));
+                }
+                return Err(OrchestrationError::Git {
+                    message: format!("{error}; aggregate cleanup errors: {}", details.join("; ")),
+                });
             }
         };
         Ok(CandidateSetOpened {
@@ -1062,6 +1327,22 @@ impl CandidateOrchestrator {
         reason: impl Into<String>,
     ) -> Result<LaneAbandoned, OrchestrationError> {
         self.abandon_or_timeout(candidate_id, expected_revision, LaneState::TimedOut, reason)
+    }
+
+    /// Persist a terminal quarantine when an executor did not acknowledge
+    /// termination. Quarantine deliberately does not touch Git resources.
+    pub fn quarantine_lane(
+        &mut self,
+        candidate_id: CandidateId,
+        expected_revision: u64,
+        reason: impl Into<String>,
+    ) -> Result<LaneTransitionReceipt, OrchestrationError> {
+        self.transition(
+            candidate_id,
+            expected_revision,
+            LaneState::Quarantined,
+            Some(reason.into()),
+        )
     }
 
     pub fn submit_lane(
@@ -1122,7 +1403,7 @@ impl CandidateOrchestrator {
         candidate_id: CandidateId,
     ) -> Result<CleanupReport, OrchestrationError> {
         let lane = self.lanes.get(candidate_id)?;
-        if !lane.state.is_terminal() || lane.state == LaneState::Submitted {
+        if !lane.state.owns_cleanup() {
             return Err(OrchestrationError::InvalidTransition {
                 candidate_id: candidate_id.to_string(),
                 from: lane.state,
@@ -1130,9 +1411,12 @@ impl CandidateOrchestrator {
             });
         }
         let candidate_ref = CandidateRef::parse(&lane.candidate_ref).map_err(git_error)?;
-        self.git
+        let report = self
+            .git
             .cleanup_candidate_worktree(&candidate_ref, &lane.worktree.path)
-            .map_err(git_error)
+            .map_err(git_error)?;
+        self.lanes.mark_cleanup_complete(candidate_id)?;
+        Ok(report)
     }
 
     /// Mark terminal failure/abandonment and then remove only candidate refs.
@@ -1146,7 +1430,22 @@ impl CandidateOrchestrator {
         debug_assert!(matches!(state, LaneState::Abandoned | LaneState::TimedOut));
         let transition =
             self.transition(candidate_id, expected_revision, state, Some(reason.into()))?;
-        let cleanup = self.cleanup_lane(candidate_id)?;
+        let cleanup = match self.cleanup_lane(candidate_id) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                let quarantine_reason = format!("cleanup failed after {}: {error}", state.as_str());
+                if let Err(quarantine_error) =
+                    self.quarantine_lane(candidate_id, transition.revision, quarantine_reason)
+                {
+                    return Err(OrchestrationError::Git {
+                        message: format!(
+                            "{error}; quarantine transition failed: {quarantine_error}"
+                        ),
+                    });
+                }
+                return Err(error);
+            }
+        };
         Ok(LaneAbandoned {
             transition,
             cleanup,
@@ -1214,6 +1513,36 @@ impl CandidateOrchestrator {
             store_projection,
             limit,
             truncated: lane_truncated || store_truncated,
+        })
+    }
+
+    /// Return every lane whose cleanup side effect remains pending.
+    ///
+    /// The inventory is backed by the orchestration table, so a fresh
+    /// `CandidateOrchestrator` opened after a process restart sees the same
+    /// quarantined refs and worktrees and can retry cleanup idempotently.
+    pub fn recovery_inventory(
+        &self,
+        limit: usize,
+    ) -> Result<LaneRecoveryInventory, OrchestrationError> {
+        let limit = limit.clamp(1, LANE_PROJECTION_LIMIT);
+        let (rows, truncated) = self.lanes.recovery_inventory(limit)?;
+        Ok(LaneRecoveryInventory {
+            lanes: rows
+                .into_iter()
+                .map(|row| LaneRecoveryEntry {
+                    candidate_set_id: row.candidate_set_id,
+                    candidate_id: row.candidate_id,
+                    candidate_ref: row.candidate_ref,
+                    worktree: row.worktree,
+                    state: row.state,
+                    cleanup_state: row.cleanup_state,
+                    reason: row.reason,
+                    updated_at: row.updated_at,
+                })
+                .collect(),
+            limit,
+            truncated,
         })
     }
 
