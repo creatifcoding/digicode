@@ -26,6 +26,45 @@ fn test_comm_propose_plan_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn test_tasker_candidate_execution_request_roundtrip() -> Result<()> {
+    let req = Request::TaskerCandidateExecute {
+        id: 77,
+        request: TaskerCandidateExecutionRequest {
+            operation_id: "candidate-op-1".into(),
+            session_id: "session-a".into(),
+            working_dir: "/workspace/project".into(),
+            expected_snapshot_hash: "sha256:snapshot".into(),
+            receipt_id: "tpr_abc".into(),
+            proposal: serde_json::json!({"laneCount": 2}),
+        },
+    };
+    let json = serde_json::to_string(&req)?;
+    assert!(json.contains("\"type\":\"tasker_candidate_execute\""));
+    assert!(json.contains("\"operation_id\":\"candidate-op-1\""));
+    let decoded = parse_request_json(&json)?;
+    assert_eq!(decoded.id(), 77);
+    let Request::TaskerCandidateExecute { request, .. } = decoded else {
+        return Err(anyhow!("expected candidate execution request"));
+    };
+    assert_eq!(request.receipt_id, "tpr_abc");
+    assert_eq!(request.proposal["laneCount"], 2);
+    Ok(())
+}
+
+#[test]
+fn test_tasker_candidate_cancel_roundtrip() -> Result<()> {
+    let req = Request::TaskerCandidateCancel {
+        id: 78,
+        session_id: "session-a".into(),
+        operation_id: "candidate-op-1".into(),
+    };
+    let decoded = parse_request_json(&serde_json::to_string(&req)?)?;
+    assert_eq!(decoded.id(), 78);
+    assert!(matches!(decoded, Request::TaskerCandidateCancel { .. }));
+    Ok(())
+}
+
+#[test]
 fn test_stdin_response_roundtrip() -> Result<()> {
     let req = Request::StdinResponse {
         id: 99,
@@ -496,7 +535,13 @@ fn test_comm_spawn_decodes_without_model_or_effort() -> Result<()> {
     // Older clients omit the model/effort fields entirely.
     let json = r#"{"type":"comm_spawn","id":60,"session_id":"sess_coord"}"#;
     let decoded = parse_request_json(json)?;
-    let Request::CommSpawn { model, effort, label, .. } = decoded else {
+    let Request::CommSpawn {
+        model,
+        effort,
+        label,
+        ..
+    } = decoded
+    else {
         return Err(anyhow!("expected CommSpawn"));
     };
     assert_eq!(model, None);

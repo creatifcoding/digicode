@@ -3598,6 +3598,7 @@ dependencies = [
  "jcode-setup-hints",
  "jcode-swarm-core",
  "jcode-task-types",
+ "jcode-tasker-git",
  "jcode-tasker-orchestration",
  "jcode-tasker-pi",
  "jcode-tasker-store",

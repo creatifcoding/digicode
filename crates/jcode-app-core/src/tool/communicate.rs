@@ -30,7 +30,7 @@ const REQUEST_ID: u64 = 1;
 const LIGHT_MODE_DEFAULT_CONCURRENCY: usize = 4;
 
 mod transport;
-use transport::{send_request, send_request_with_timeout};
+pub(crate) use transport::{send_request, send_request_with_timeout};
 
 fn fresh_spawn_request_nonce(ctx: &ToolContext) -> String {
     let now_ms = std::time::SystemTime::now()

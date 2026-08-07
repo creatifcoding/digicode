@@ -778,7 +778,12 @@ impl GitCandidateAdapter {
         Ok(commit_oid)
     }
 
-    fn resolve_commit(&self, value: &str) -> Result<String> {
+    /// Resolve a caller-supplied revision to its canonical commit object id.
+    ///
+    /// Candidate orchestration uses this only after the host has selected the
+    /// canonical repository and ref. It never accepts a guest-provided
+    /// candidate ref as the authority source.
+    pub fn resolve_commit(&self, value: &str) -> Result<String> {
         self.resolve_object(value, "commit")
     }
 

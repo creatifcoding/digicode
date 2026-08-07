@@ -5,7 +5,7 @@
     "pi_tasker_store_methods": 57,
     "public_tasker_actions": 37,
     "live_mt_tasker_methods_before_slice": 8,
-    "live_mt_tasker_methods_after_slice": 66,
+    "live_mt_tasker_methods_after_slice": 67,
     "counting_note": "PiTaskerStore methods include the open_concurrency_store extension method. Public actions are the provider-safe tasker action enum, including topology actions."
   },
   "classifications": [

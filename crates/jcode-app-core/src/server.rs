@@ -1,6 +1,7 @@
 mod available_models_dedup;
 mod await_members_state;
 mod background_tasks;
+mod candidate;
 mod client_actions;
 mod client_api;
 mod client_comm;
@@ -56,6 +57,7 @@ use self::background_tasks::{
     dispatch_swarm_runtime_status, dispatch_swarm_todo_progress, dispatch_swarm_tool_activity,
     dispatch_ui_activity,
 };
+pub(super) use self::candidate::ServerCandidateLaneHost;
 use self::debug::{ClientConnectionInfo, ClientDebugState};
 use self::debug_jobs::DebugJob;
 use self::headless::create_headless_session;

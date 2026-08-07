@@ -20,17 +20,19 @@ use super::comm_sync::{
 use super::session_discovery::handle_list_sessions_request;
 use super::{
     AwaitMembersRuntime, ChannelSubscriptions, ClientConnectionInfo, FileTouchService,
-    SessionAgents, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
-    SwarmMutationRuntime, VersionedPlan, format_structured_completion_report, truncate_detail,
-    update_member_status_with_report_tldr,
+    ServerCandidateLaneHost, SessionAgents, SessionInterruptQueues, SharedContext, SwarmEvent,
+    SwarmMember, SwarmMutationRuntime, VersionedPlan, format_structured_completion_report,
+    truncate_detail, update_member_status_with_report_tldr,
 };
 use crate::config::SwarmSpawnMode;
 use crate::protocol::{Request, ServerEvent};
 use crate::provider::Provider;
+use crate::tool::CandidateLaneHostRequest;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 
 pub(super) fn parse_swarm_spawn_mode(
     id: u64,
@@ -128,6 +130,63 @@ pub(super) async fn handle_lightweight_control_request(
     });
 
     match request {
+        Request::TaskerCandidateExecute { id, request } => {
+            let host = ServerCandidateLaneHost::new(
+                Arc::clone(provider_template),
+                Arc::clone(sessions),
+                Arc::clone(global_session_id),
+                Arc::clone(swarm_members),
+                Arc::clone(swarms_by_id),
+                Arc::clone(swarm_coordinators),
+                Arc::clone(swarm_plans),
+                soft_interrupt_queues.clone(),
+                Arc::clone(mcp_pool),
+            );
+            let host_request = CandidateLaneHostRequest {
+                id,
+                operation_id: request.operation_id,
+                session_id: request.session_id,
+                working_dir: request.working_dir,
+                expected_snapshot_hash: request.expected_snapshot_hash,
+                receipt_id: request.receipt_id,
+                proposal: request.proposal,
+            };
+            match host
+                .execute_request(host_request, CancellationToken::new())
+                .await
+            {
+                Ok(response) => {
+                    let _ = client_event_tx.send(ServerEvent::TaskerCandidateExecutionResponse {
+                        id,
+                        status: response.status,
+                        redacted: response.redacted,
+                        report: response.report,
+                    });
+                }
+                Err(error) => {
+                    let _ = client_event_tx.send(ServerEvent::Error {
+                        id,
+                        message: error.to_string(),
+                        retry_after_secs: None,
+                    });
+                }
+            }
+        }
+        Request::TaskerCandidateCancel {
+            id,
+            session_id,
+            operation_id,
+        } => {
+            if super::candidate::cancel_operation(&session_id, &operation_id) {
+                let _ = client_event_tx.send(ServerEvent::Done { id });
+            } else {
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id,
+                    message: "candidate execution is not active".to_string(),
+                    retry_after_secs: None,
+                });
+            }
+        }
         Request::ListSessions { id } => {
             handle_list_sessions_request(
                 id,

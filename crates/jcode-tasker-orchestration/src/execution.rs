@@ -84,6 +84,10 @@ impl CandidateLaneExecutionLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CandidateLaneLaunchRequest {
+    /// Guest-proposed task reference. The host resolves it against canonical
+    /// Tasker state and never treats it as an authority-bearing task id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_reference: Option<String>,
     pub policy: ConcurrencyPolicy,
     pub lane_count: u16,
     pub acceptance: AcceptanceContract,
@@ -121,7 +125,9 @@ impl CandidateLaneLaunchRequest {
     ) -> Result<BoundCandidateLaneLaunchRequest, OrchestrationError> {
         self.validate()?;
         host.validate()?;
-        Ok(BoundCandidateLaneLaunchRequest { guest: self, host })
+        let mut guest = self;
+        guest.acceptance.validation_commands = host.validation_commands.clone();
+        Ok(BoundCandidateLaneLaunchRequest { guest, host })
     }
 }
 
@@ -136,6 +142,9 @@ pub struct CandidateLaneHostContext {
     pub base_commit: String,
     pub provenance: ProvenanceTemplate,
     pub expected_revision: u64,
+    /// Validators are host-owned. Guest-proposed validators are replaced by
+    /// this validated, allowlisted set before the candidate set is opened.
+    pub validation_commands: Vec<ValidationCommand>,
 }
 
 impl CandidateLaneHostContext {
@@ -151,6 +160,14 @@ impl CandidateLaneHostContext {
             return Err(OrchestrationError::InvalidContract(
                 "host-resolved candidate provenance must identify the session and agent".into(),
             ));
+        }
+        if self.validation_commands.is_empty() {
+            return Err(OrchestrationError::InvalidContract(
+                "host-resolved candidate validators must not be empty".into(),
+            ));
+        }
+        for command in &self.validation_commands {
+            command.validate()?;
         }
         Ok(())
     }
@@ -793,7 +810,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
 
     #[derive(Clone)]
     struct FakeExecutor {
@@ -821,6 +838,35 @@ mod tests {
                     Err(next) => observed = next,
                 }
             }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CancellationAcknowledgingExecutor {
+        started: Arc<Notify>,
+        cancel_calls: Arc<AtomicUsize>,
+        released: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl CandidateExecutor for CancellationAcknowledgingExecutor {
+        async fn execute(
+            &self,
+            _request: CandidateLaneExecutionRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<CandidateAgentResult, CandidateExecutorError> {
+            self.started.notify_one();
+            self.released.notified().await;
+            Err(CandidateExecutorError::Cancelled)
+        }
+
+        async fn cancel(
+            &self,
+            _request: &CandidateLaneExecutionRequest,
+        ) -> Result<(), CandidateExecutorError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            self.released.notify_one();
+            Ok(())
         }
     }
 
@@ -949,6 +995,7 @@ mod tests {
         let git = jcode_tasker_git::GitCandidateAdapter::try_new(&repo).expect("git adapter");
         let orchestrator = CandidateOrchestrator::new(store, git).expect("orchestrator");
         let request = CandidateLaneLaunchRequest {
+            task_reference: None,
             policy: ConcurrencyPolicy::Speculative { max_candidates: 3 },
             lane_count,
             acceptance: AcceptanceContract::new(
@@ -968,6 +1015,7 @@ mod tests {
             base_commit,
             provenance: ProvenanceTemplate::new("session", "agent"),
             expected_revision: 0,
+            validation_commands: vec![ValidationCommand::new("true", std::iter::empty::<&str>())],
         })
         .expect("bind host candidate context");
         (orchestrator, request)
@@ -1147,6 +1195,37 @@ mod tests {
                 .expect("refs")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn in_flight_cancellation_requires_executor_acknowledgement() {
+        let root = TempDir::new().expect("temp root");
+        let (mut orchestrator, request) = request_for(&root, 1);
+        let cancellation = CancellationToken::new();
+        let executor = CancellationAcknowledgingExecutor {
+            started: Arc::new(Notify::new()),
+            cancel_calls: Arc::new(AtomicUsize::new(0)),
+            released: Arc::new(Notify::new()),
+        };
+        let started = Arc::clone(&executor.started);
+        let cancel_calls = Arc::clone(&executor.cancel_calls);
+        let execution = orchestrator.execute_candidate_set(
+            request,
+            root.path().join("lanes"),
+            &executor,
+            cancellation.clone(),
+        );
+        tokio::pin!(execution);
+        tokio::select! {
+            _ = started.notified() => cancellation.cancel(),
+            result = &mut execution => panic!("execution completed before cancellation: {result:?}"),
+        }
+        let error = execution.await.expect_err("cancelled execution");
+        assert!(matches!(
+            error,
+            OrchestrationError::ExecutionCancelled { .. }
+        ));
+        assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

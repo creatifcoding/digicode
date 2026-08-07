@@ -51,6 +51,10 @@ use tokio::sync::RwLock;
 pub(crate) use jcode_tool_core::intent_schema_property;
 pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMode};
 pub use jcode_tool_types::{ToolImage, ToolOutput};
+pub(crate) use metatool::{
+    CandidateLaneHost, CandidateLaneHostRequest, CandidateLaneHostResponse,
+    SocketCandidateLaneHost, tasker_snapshot_for_project,
+};
 pub(crate) use session_search::spawn_recent_index_warmup;
 
 #[derive(Clone, Debug, Default)]
@@ -235,7 +239,6 @@ impl Registry {
                 session_search::SessionSearchTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "memory", memory::MemoryTool::new);
-            Self::insert_tool_timed(&mut m, &mut timings, "mt", metatool::MetaTool::new);
             Self::insert_tool_timed(
                 &mut m,
                 &mut timings,
@@ -300,6 +303,9 @@ impl Registry {
             "conversation_search",
             conversation_search::ConversationSearchTool::new(compaction),
         );
+        // MetaTool is deliberately per-registry. The static base-tool cache
+        // must never retain a server/session callback or executor handle.
+        Self::insert_tool(&mut tools_map, "mt", metatool::MetaTool::new());
         // Sponsored discovery is on by default (opt-out); when disabled the
         // tool is never registered and no discovery endpoint is ever
         // contacted.
@@ -746,6 +752,20 @@ impl Registry {
     pub async fn register(&self, name: String, tool: Arc<dyn Tool>) {
         let mut tools = self.tools.write().await;
         tools.insert(name, tool);
+    }
+
+    /// Install a host-owned MetaTool callback for this registry only.
+    ///
+    /// Candidate execution authority is intentionally not carried by
+    /// ToolContext or the AgentOS guest. Replacing the registry's MetaTool
+    /// keeps the cached base tool stateless and makes child/session policy
+    /// explicit at construction time.
+    pub(crate) async fn install_candidate_lane_host(&self, host: Arc<dyn CandidateLaneHost>) {
+        self.register(
+            "mt".to_string(),
+            Arc::new(metatool::MetaTool::new().with_candidate_lane_host(host)) as Arc<dyn Tool>,
+        )
+        .await;
     }
 
     /// Register MCP tools (MCP management and server tools)

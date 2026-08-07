@@ -32,6 +32,21 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Host-routed candidate execution request emitted by a MetaTool session.
+///
+/// The proposal is intentionally opaque at this protocol layer. The server
+/// decodes it into the guest-safe Tasker candidate contract and resolves every
+/// authority-bearing field from its own live session and project state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskerCandidateExecutionRequest {
+    pub operation_id: String,
+    pub session_id: String,
+    pub working_dir: String,
+    pub expected_snapshot_hash: String,
+    pub receipt_id: String,
+    pub proposal: serde_json::Value,
+}
+
 /// Client request to server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -721,6 +736,24 @@ pub enum Request {
         #[serde(default = "default_true")]
         wake: bool,
     },
+
+    /// Execute a Tasker candidate set through the server-owned headless
+    /// executor. This is a lightweight request so MetaTool can use the same
+    /// socket transport as CommunicateTool without creating a visible client.
+    #[serde(rename = "tasker_candidate_execute")]
+    TaskerCandidateExecute {
+        id: u64,
+        #[serde(flatten)]
+        request: TaskerCandidateExecutionRequest,
+    },
+
+    /// Propagate cancellation to a server-owned candidate execution job.
+    #[serde(rename = "tasker_candidate_cancel")]
+    TaskerCandidateCancel {
+        id: u64,
+        session_id: String,
+        operation_id: String,
+    },
 }
 /// Server event sent to client
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -733,6 +766,15 @@ pub enum ServerEvent {
     /// Acknowledgment of request
     #[serde(rename = "ack")]
     Ack { id: u64 },
+
+    /// Structured, host-redacted result from Tasker candidate execution.
+    #[serde(rename = "tasker_candidate_execution_response")]
+    TaskerCandidateExecutionResponse {
+        id: u64,
+        status: String,
+        redacted: bool,
+        report: serde_json::Value,
+    },
 
     /// Lightweight resumable-session discovery response.
     #[serde(rename = "session_list")]

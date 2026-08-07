@@ -2,6 +2,10 @@ use std::{
     collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,7 +20,7 @@ use jcode_metatool_types::{
     ExecutionEffect, ExecutionId, ExecutionLimits, ExecutionProfile, ExecutionRequest,
     MetaToolError,
 };
-use jcode_tasker_orchestration::CandidateLaneLaunchRequest;
+use jcode_tasker_orchestration::{CandidateExecutionReport, CandidateLaneLaunchRequest};
 use jcode_tasker_pi::{
     BatchOperation, ConcurrencyStore, CreateFeature, CreateTask, FeaturePlanFeature,
     FeaturePlanInput, NoteInput, PiTaskerStore, PlanTask, ProjectPartition, ResolveFeatureGate,
@@ -25,6 +29,7 @@ use jcode_tasker_pi::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolContext, ToolOutput};
 
@@ -52,6 +57,104 @@ const TASKER_RECEIPT_PREFIX: &str = "tpr_";
 const ARTIFACT_CATALOG_LIMIT: usize = 200;
 const ARTIFACT_MAX_TEXT_BYTES: usize = 1024 * 1024;
 
+static CANDIDATE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_candidate_request_id() -> u64 {
+    CANDIDATE_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CandidateLaneHostRequest {
+    pub id: u64,
+    pub operation_id: String,
+    pub session_id: String,
+    pub working_dir: String,
+    pub expected_snapshot_hash: String,
+    pub receipt_id: String,
+    pub proposal: Value,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CandidateLaneHostResponse {
+    pub status: String,
+    pub redacted: bool,
+    pub report: Value,
+}
+
+#[async_trait]
+pub(crate) trait CandidateLaneHost: Send + Sync {
+    async fn execute_candidate_lanes(
+        &self,
+        request: CandidateLaneHostRequest,
+        cancellation: CancellationToken,
+    ) -> Result<CandidateLaneHostResponse>;
+}
+
+/// Socket-backed host callback used by live server registries. Keeping this
+/// callback on the registry, rather than in ToolContext or the guest runtime,
+/// preserves the static MetaTool/base-tool boundary while following the same
+/// request/response transport as CommunicateTool.
+pub(crate) struct SocketCandidateLaneHost;
+
+impl SocketCandidateLaneHost {
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl CandidateLaneHost for SocketCandidateLaneHost {
+    async fn execute_candidate_lanes(
+        &self,
+        request: CandidateLaneHostRequest,
+        cancellation: CancellationToken,
+    ) -> Result<CandidateLaneHostResponse> {
+        let wire_request = crate::protocol::Request::TaskerCandidateExecute {
+            id: request.id,
+            request: crate::protocol::TaskerCandidateExecutionRequest {
+                operation_id: request.operation_id.clone(),
+                session_id: request.session_id.clone(),
+                working_dir: request.working_dir.clone(),
+                expected_snapshot_hash: request.expected_snapshot_hash.clone(),
+                receipt_id: request.receipt_id.clone(),
+                proposal: request.proposal,
+            },
+        };
+        let response = tokio::select! {
+            response = super::communicate::send_request(wire_request) => response?,
+            _ = cancellation.cancelled() => {
+                let _ = super::communicate::send_request(
+                    crate::protocol::Request::TaskerCandidateCancel {
+                        id: next_candidate_request_id(),
+                        session_id: request.session_id,
+                        operation_id: request.operation_id,
+                    },
+                ).await;
+                anyhow::bail!("candidate execution cancellation requested")
+            }
+        };
+        match response {
+            crate::protocol::ServerEvent::TaskerCandidateExecutionResponse {
+                status,
+                redacted,
+                report,
+                ..
+            } => Ok(CandidateLaneHostResponse {
+                status,
+                redacted,
+                report,
+            }),
+            crate::protocol::ServerEvent::Error { message, .. } => {
+                anyhow::bail!("candidate execution request failed: {message}")
+            }
+            other => anyhow::bail!(
+                "unexpected candidate execution response: {}",
+                serde_json::to_string(&other).unwrap_or_else(|_| "unserializable".into())
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateLaneExecutionBlocked {
     HostExecutorUnavailable,
@@ -78,6 +181,7 @@ pub struct MetaTool {
     tasker_database_path_override: Option<PathBuf>,
     tasker_receipt_root_override: Option<PathBuf>,
     artifact_root_override: Option<PathBuf>,
+    candidate_lane_host: Option<Arc<dyn CandidateLaneHost>>,
 }
 
 impl MetaTool {
@@ -87,7 +191,13 @@ impl MetaTool {
             tasker_database_path_override: None,
             tasker_receipt_root_override: None,
             artifact_root_override: None,
+            candidate_lane_host: None,
         }
+    }
+
+    pub(crate) fn with_candidate_lane_host(mut self, host: Arc<dyn CandidateLaneHost>) -> Self {
+        self.candidate_lane_host = Some(host);
+        self
     }
 
     #[cfg(test)]
@@ -97,6 +207,7 @@ impl MetaTool {
             tasker_database_path_override: None,
             tasker_receipt_root_override: None,
             artifact_root_override: None,
+            candidate_lane_host: None,
         }
     }
 
@@ -108,6 +219,7 @@ impl MetaTool {
             tasker_database_path_override: Some(tasker_database_path),
             tasker_receipt_root_override: Some(tasker_receipt_root),
             artifact_root_override: None,
+            candidate_lane_host: None,
         }
     }
 
@@ -656,6 +768,86 @@ fn verify_tasker_receipt(
     Ok(receipt)
 }
 
+fn prepare_candidate_lane_apply(
+    store: &mut PiTaskerStore,
+    effects: &[ExecutionEffect],
+    receipt_root: &Path,
+    requested_receipt: Option<&str>,
+) -> Result<(CandidateLaneLaunchRequest, TaskerPlanReceipt, String)> {
+    if effects.len() != 1 {
+        return Err(anyhow!(
+            "Tasker candidate execution requires exactly one effect"
+        ));
+    }
+    let effect = &effects[0];
+    if effect.capability != "tasker" || effect.operation != "reconcile" {
+        return Err(anyhow!(
+            "unsupported MetaTool capability effect {}.{}",
+            effect.capability,
+            effect.operation
+        ));
+    }
+    let mut input: TaskerEffectInput = serde_json::from_value(effect.input.clone())?;
+    if input.kind != "execute_candidate_lanes" || input.mode != TaskerMode::Apply {
+        return Err(anyhow!(
+            "candidate host callback received a non-apply effect"
+        ));
+    }
+
+    // Candidate execution is always bound to the canonical project/list for
+    // this working directory. A guest-supplied project id is never used.
+    let canonical_project_id = store.partition().list_id.clone();
+    input.project_id = Some(canonical_project_id.clone());
+    let (_, canonical_snapshot_hash) = tasker_snapshot_for_project(store, &canonical_project_id)?;
+    if input.expected_snapshot_hash.as_deref() != Some(canonical_snapshot_hash.as_str()) {
+        return Err(anyhow!(
+            "Tasker candidate snapshot identity does not match canonical host state"
+        ));
+    }
+    let receipt_id = requested_receipt
+        .ok_or_else(|| anyhow!("tasker_receipt from a successful plan is required for apply"))?;
+    let receipt = verify_tasker_receipt(
+        receipt_root,
+        receipt_id,
+        store,
+        &canonical_snapshot_hash,
+        &input,
+    )?;
+    let proposal: CandidateLaneLaunchRequest = serde_json::from_value(input.payload)?;
+    proposal
+        .validate()
+        .map_err(|error| anyhow!("candidate lane request rejected: {error}"))?;
+    Ok((proposal, receipt, canonical_snapshot_hash))
+}
+
+fn validate_candidate_host_response(
+    response: &CandidateLaneHostResponse,
+) -> Result<CandidateExecutionReport> {
+    if response.status != "completed" || !response.redacted {
+        return Err(anyhow!(
+            "candidate host did not return an observed redacted completion"
+        ));
+    }
+    let report: CandidateExecutionReport = serde_json::from_value(response.report.clone())
+        .context("parse structured candidate execution report")?;
+    if report.outcomes.is_empty()
+        || report
+            .outcomes
+            .iter()
+            .any(|outcome| !outcome.state.is_terminal())
+    {
+        return Err(anyhow!(
+            "candidate host report did not terminally account for every lane"
+        ));
+    }
+    if report.submitted_count() == 0 {
+        return Err(anyhow!(
+            "candidate host report contains no submitted lane; metadata-only success is forbidden"
+        ));
+    }
+    Ok(report)
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum MetaToolAction {
@@ -679,7 +871,7 @@ fn tasker_snapshot(store: &PiTaskerStore) -> Result<(Value, String)> {
     tasker_snapshot_for_project(store, &project_id)
 }
 
-fn tasker_snapshot_for_project(
+pub(crate) fn tasker_snapshot_for_project(
     store: &PiTaskerStore,
     concurrency_project_id: &str,
 ) -> Result<(Value, String)> {
@@ -1794,7 +1986,7 @@ impl Tool for MetaTool {
                     ));
                 }
                 let reconciliation = match tasker_context {
-                    Some((_, snapshot_hash, _)) => {
+                    Some((_, snapshot_hash, _)) => Some({
                         let database_path = self.tasker_database_path();
                         let receipt_root = self.tasker_receipt_root()?;
                         let project_root = ctx.working_dir.clone().ok_or_else(|| {
@@ -1803,7 +1995,88 @@ impl Tool for MetaTool {
                         let effects = tasker_effects.clone();
                         let mode = params.tasker_mode;
                         let requested_receipt = params.tasker_receipt.clone();
-                        Some(
+                        let is_candidate_apply = mode == TaskerMode::Apply
+                            && effects.len() == 1
+                            && effects[0].input["kind"] == "execute_candidate_lanes";
+                        if is_candidate_apply {
+                            let (proposal, receipt, canonical_snapshot_hash) =
+                                tokio::task::spawn_blocking({
+                                    let database_path = database_path.clone();
+                                    let receipt_root = receipt_root.clone();
+                                    let project_root = project_root.clone();
+                                    let effects = effects.clone();
+                                    let requested_receipt = requested_receipt.clone();
+                                    move || {
+                                        let canonical = std::fs::canonicalize(&project_root)
+                                            .unwrap_or(project_root);
+                                        let mut store =
+                                            PiTaskerStore::open(ProjectPartition::with_db_path(
+                                                database_path,
+                                                canonical.to_string_lossy().into_owned(),
+                                            ))?;
+                                        prepare_candidate_lane_apply(
+                                            &mut store,
+                                            &effects,
+                                            &receipt_root,
+                                            requested_receipt.as_deref(),
+                                        )
+                                    }
+                                })
+                                .await
+                                .context("join candidate Tasker authority validation")??;
+                            let host = self.candidate_lane_host.clone().ok_or_else(|| {
+                                anyhow::Error::new(
+                                    CandidateLaneExecutionBlocked::HostExecutorUnavailable,
+                                )
+                            })?;
+                            let operation_id = format!(
+                                "candidate-{}-{}",
+                                ctx.session_id,
+                                next_candidate_request_id()
+                            );
+                            let host_request = CandidateLaneHostRequest {
+                                id: next_candidate_request_id(),
+                                operation_id,
+                                session_id: ctx.session_id.clone(),
+                                working_dir: project_root.to_string_lossy().into_owned(),
+                                expected_snapshot_hash: canonical_snapshot_hash.clone(),
+                                receipt_id: receipt.id.clone(),
+                                proposal: serde_json::to_value(proposal)?,
+                            };
+                            let cancellation = CancellationToken::new();
+                            let cancellation_watcher =
+                                ctx.graceful_shutdown_signal.clone().map(|signal| {
+                                    let cancellation = cancellation.clone();
+                                    tokio::spawn(async move {
+                                        if signal.is_set() {
+                                            cancellation.cancel();
+                                        } else {
+                                            signal.notified().await;
+                                            cancellation.cancel();
+                                        }
+                                    })
+                                });
+                            let response = host
+                                .execute_candidate_lanes(host_request, cancellation)
+                                .await;
+                            if let Some(watcher) = cancellation_watcher {
+                                watcher.abort();
+                            }
+                            let response = response?;
+                            let report = validate_candidate_host_response(&response)?;
+                            json!({
+                                "mode": mode,
+                                "status": "applied",
+                                "kind": "execute_candidate_lanes",
+                                "snapshot_hash": canonical_snapshot_hash,
+                                "receipt": {
+                                    "id": receipt.id,
+                                    "change_digest": receipt.change_digest,
+                                },
+                                "result": report,
+                                "redacted": true,
+                            })
+                        } else {
                             tokio::task::spawn_blocking(move || {
                                 let canonical =
                                     std::fs::canonicalize(&project_root).unwrap_or(project_root);
@@ -1822,9 +2095,9 @@ impl Tool for MetaTool {
                                 )
                             })
                             .await
-                            .context("join Tasker codemode reconciler")??,
-                        )
-                    }
+                            .context("join Tasker codemode reconciler")??
+                        }
+                    }),
                     None if tasker_effects.is_empty() => None,
                     None => {
                         return Err(anyhow!(
@@ -1942,7 +2215,7 @@ mod tests {
         assert!(guide["notes"].is_array());
         assert!(sections["tasker-capability"].is_array());
         assert!(sections["artifacts-capability"].is_array());
-        assert_eq!(sections["tasker-capability"].as_array().unwrap().len(), 66);
+        assert_eq!(sections["tasker-capability"].as_array().unwrap().len(), 67);
     }
 
     #[test]
@@ -1952,7 +2225,7 @@ mod tests {
         assert_eq!(manifest["audit"]["pi_tasker_store_methods"], 57);
         assert_eq!(manifest["audit"]["public_tasker_actions"], 37);
         assert_eq!(manifest["audit"]["live_mt_tasker_methods_before_slice"], 8);
-        assert_eq!(manifest["audit"]["live_mt_tasker_methods_after_slice"], 66);
+        assert_eq!(manifest["audit"]["live_mt_tasker_methods_after_slice"], 67);
 
         let store_methods = manifest["pi_tasker_store_methods"]
             .as_array()
@@ -2226,6 +2499,63 @@ mod tests {
                 .expect("list after blocked apply")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn candidate_host_response_requires_redacted_structured_submission() {
+        let submitted_report = json!({
+            "candidateSetId": format!("cset_{}", uuid::Uuid::new_v4()),
+            "revision": 7,
+            "outcomes": [{
+                "candidateId": format!("cand_{}", uuid::Uuid::new_v4()),
+                "state": "submitted",
+                "submission": {
+                    "resultCommit": "host-commit",
+                    "diffDigest": null,
+                    "summary": null,
+                    "evidence": []
+                },
+                "failure": null
+            }]
+        });
+        let response = CandidateLaneHostResponse {
+            status: "completed".into(),
+            redacted: true,
+            report: submitted_report,
+        };
+        assert_eq!(
+            validate_candidate_host_response(&response)
+                .expect("structured submitted report")
+                .submitted_count(),
+            1
+        );
+
+        let metadata_only = json!({
+            "candidateSetId": format!("cset_{}", uuid::Uuid::new_v4()),
+            "revision": 8,
+            "outcomes": [{
+                "candidateId": format!("cand_{}", uuid::Uuid::new_v4()),
+                "state": "abandoned",
+                "submission": null,
+                "failure": null
+            }]
+        });
+        let metadata_response = CandidateLaneHostResponse {
+            status: "completed".into(),
+            redacted: true,
+            report: metadata_only,
+        };
+        let error = validate_candidate_host_response(&metadata_response)
+            .expect_err("metadata-only success must be rejected");
+        assert!(error.to_string().contains("metadata-only success"));
+
+        let unredacted = CandidateLaneHostResponse {
+            redacted: false,
+            ..response
+        };
+        let error = validate_candidate_host_response(&unredacted)
+            .expect_err("unredacted host result must be rejected");
+        assert!(error.to_string().contains("redacted completion"));
     }
 
     #[test]

@@ -467,6 +467,9 @@ pub(super) async fn handle_client(
     let provider = provider_template.fork_for_new_session();
     let t0 = std::time::Instant::now();
     let registry = Registry::new(provider.clone()).await;
+    registry
+        .install_candidate_lane_host(Arc::new(crate::tool::SocketCandidateLaneHost::new()))
+        .await;
     let registry_ms = t0.elapsed().as_millis();
 
     let mut swarm_enabled = crate::config::config().features.swarm;
@@ -2713,6 +2716,20 @@ pub(super) async fn handle_client(
                     },
                 )
                 .await;
+            }
+
+            // Candidate execution and cancellation are accepted only through
+            // the lightweight pre-subscribe path. A stateful connection that
+            // reaches these variants is rejected rather than executing with a
+            // missing host authority context.
+            Request::TaskerCandidateExecute { id, .. }
+            | Request::TaskerCandidateCancel { id, .. } => {
+                let _ = client_event_tx.send(ServerEvent::Error {
+                    id,
+                    message: "candidate execution requests must use the lightweight server path"
+                        .to_string(),
+                    retry_after_secs: None,
+                });
             }
 
             // These are handled via channels, not direct requests from TUI
