@@ -733,8 +733,7 @@ impl GitCandidateAdapter {
     fn worktree_status(&self, path: &Path) -> Result<String> {
         let output =
             self.run_git_at(path, ["status", "--porcelain=v1", "--untracked-files=all"])?;
-        Ok(String::from_utf8(output.stdout)
-            .context("candidate worktree returned non-UTF-8 status")?)
+        String::from_utf8(output.stdout).context("candidate worktree returned non-UTF-8 status")
     }
 
     fn is_ancestor(&self, base_oid: &str, tip_oid: &str) -> Result<bool> {
