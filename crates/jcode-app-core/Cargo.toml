@@ -141,6 +141,8 @@ async-stream = "0.3"
 # *this* crate's own test target. Feature unification applies this only to
 # test/bench/example builds, not to a normal `cargo build`.
 jcode-base = { path = "../jcode-base", default-features = false, features = ["test-support"] }
+jcode-tasker-promotion = { path = "../jcode-tasker-promotion" }
+jcode-tasker-rounds = { path = "../jcode-tasker-rounds" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -3601,6 +3601,8 @@ dependencies = [
  "jcode-tasker-git",
  "jcode-tasker-orchestration",
  "jcode-tasker-pi",
+ "jcode-tasker-promotion",
+ "jcode-tasker-rounds",
  "jcode-tasker-store",
  "jcode-tasker-types",
  "jcode-terminal-image",

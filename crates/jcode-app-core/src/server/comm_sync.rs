@@ -648,6 +648,7 @@ pub(super) fn graph_read_payload(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_comm_graph_read(
     id: u64,
     req_session_id: String,

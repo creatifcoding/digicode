@@ -32,7 +32,7 @@ fn default_lane_timeout_ms() -> u64 {
     DEFAULT_CANDIDATE_LANE_TIMEOUT_MS
 }
 
-const CANDIDATE_TERMINATION_TIMEOUT_MS: u64 = 10_000;
+const CANDIDATE_TERMINATION_TIMEOUT_MS: u64 = 11_000;
 const CANDIDATE_VALIDATION_TIMEOUT_MS: u64 = 60_000;
 const MAX_VALIDATION_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -431,7 +431,10 @@ async fn run_lane<E: CandidateExecutor>(
             )
             .await
             {
-                Ok(_) => LaneRunResult::Cancelled,
+                Ok(Ok(_)) | Ok(Err(CandidateExecutorError::Cancelled)) => LaneRunResult::Cancelled,
+                Ok(Err(CandidateExecutorError::Failed(reason))) => {
+                    LaneRunResult::TerminationFailed(reason)
+                }
                 Err(_) => LaneRunResult::TerminationFailed(
                     "candidate executor did not acknowledge cancellation before the termination deadline"
                         .into(),
@@ -456,7 +459,10 @@ async fn run_lane<E: CandidateExecutor>(
                     )
                     .await
                     {
-                        Ok(_) => LaneRunResult::TimedOut,
+                        Ok(Ok(_)) | Ok(Err(CandidateExecutorError::Cancelled)) => LaneRunResult::TimedOut,
+                        Ok(Err(CandidateExecutorError::Failed(reason))) => {
+                            LaneRunResult::TerminationFailed(reason)
+                        }
                         Err(_) => LaneRunResult::TerminationFailed(
                             "candidate executor did not acknowledge timeout termination before the termination deadline"
                                 .into(),
