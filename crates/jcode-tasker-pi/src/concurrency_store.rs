@@ -2661,6 +2661,55 @@ mod tests {
     }
 
     #[test]
+    fn recovery_at_expected_commit_is_non_mutating_for_prepared_and_ref_updated_intents() {
+        let (mut store, path) = store();
+        store.create_candidate_set(candidate_set(), 0).unwrap();
+        store
+            .register_candidate(candidate("cand_1", "selected"), 1)
+            .unwrap();
+        let prepared = store.prepare_promotion(promotion(), 2).unwrap();
+
+        let retry = store
+            .recover_promotion("promote_1", "base-commit", prepared.revision)
+            .unwrap();
+        assert_eq!(retry.action, PromotionRecoveryAction::Retry);
+        assert_eq!(retry.intent["state"], "prepared");
+        assert_eq!(retry.revision, prepared.revision);
+        assert_eq!(store.current_revision("proj_1").unwrap(), prepared.revision);
+        assert!(
+            store
+                .incomplete_promotions("proj_1", 10)
+                .unwrap()
+                .iter()
+                .any(|intent| intent["id"] == "promote_1")
+        );
+
+        let ref_updated = store
+            .mark_promotion_ref_updated("promote_1", "result-cand_1", prepared.revision)
+            .unwrap();
+        drop(store);
+
+        let mut restarted = ConcurrencyStore::open_path(&path, "/repo/concurrency").unwrap();
+        let retry = restarted
+            .recover_promotion("promote_1", "base-commit", ref_updated.revision)
+            .unwrap();
+        assert_eq!(retry.action, PromotionRecoveryAction::Retry);
+        assert_eq!(retry.intent["state"], "ref_updated");
+        assert_eq!(retry.revision, ref_updated.revision);
+        assert_eq!(
+            restarted.current_revision("proj_1").unwrap(),
+            ref_updated.revision
+        );
+        assert!(
+            restarted
+                .incomplete_promotions("proj_1", 10)
+                .unwrap()
+                .iter()
+                .any(|intent| intent["id"] == "promote_1")
+        );
+    }
+
+    #[test]
     fn unexpected_canonical_commit_is_persisted_as_conflict_and_rollbackable() {
         let (mut store, _path) = store();
         store.create_candidate_set(candidate_set(), 0).unwrap();

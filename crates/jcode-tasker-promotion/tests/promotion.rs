@@ -246,7 +246,7 @@ fn stale_tasker_revision_is_typed_before_git_mutation() {
 }
 
 #[test]
-fn kill_after_intent_recovers_by_aborting_when_ref_did_not_move() {
+fn kill_after_intent_recovers_with_non_mutating_retry_when_ref_did_not_move() {
     let fixture = fixture();
     let mut reconciler = fixture.reconciler();
     let prepared = reconciler
@@ -266,9 +266,104 @@ fn kill_after_intent_recovers_by_aborting_when_ref_did_not_move() {
     let recovery = restarted
         .recover_promotion(&prepared.intent_id)
         .expect("recover prepared intent");
-    assert_eq!(recovery.action, PromotionRecoveryAction::Rollback);
-    assert_eq!(recovery.intent["state"], "aborted");
+    assert_eq!(recovery.action, PromotionRecoveryAction::Retry);
+    assert_eq!(recovery.intent["state"], "prepared");
+    assert_eq!(recovery.revision, prepared.revision);
+    assert_eq!(
+        restarted
+            .store()
+            .current_revision(&fixture.project_id)
+            .unwrap(),
+        prepared.revision
+    );
+    assert!(
+        restarted
+            .store()
+            .incomplete_promotions(&fixture.project_id, 10)
+            .unwrap()
+            .iter()
+            .any(|intent| intent["id"] == prepared.intent_id)
+    );
     assert_eq!(fixture.canonical_oid(), fixture.base_oid);
+
+    drop(restarted);
+    let mut reopened = fixture.reconciler();
+    let repeated = reopened
+        .resume_promotion(&prepared.intent_id)
+        .expect("repeat recovery of prepared intent");
+    assert_eq!(repeated.action, PromotionRecoveryAction::Retry);
+    assert_eq!(repeated.intent["state"], "prepared");
+    assert_eq!(repeated.revision, prepared.revision);
+    assert!(
+        reopened
+            .store()
+            .incomplete_promotions(&fixture.project_id, 10)
+            .unwrap()
+            .iter()
+            .any(|intent| intent["id"] == prepared.intent_id)
+    );
+
+    reopened
+        .compare_and_swap_canonical_ref(&prepared)
+        .expect("retry prepared promotion");
+    reopened
+        .mark_ref_updated(&prepared)
+        .expect("persist retried canonical ref update");
+    reopened
+        .finalize_promotion(&prepared)
+        .expect("complete retried promotion");
+    assert_eq!(
+        reopened
+            .store()
+            .promotion_intent(&prepared.intent_id)
+            .unwrap()
+            .unwrap()["state"],
+        "finalized"
+    );
+}
+
+#[test]
+fn ref_updated_intent_at_expected_base_recovers_with_non_mutating_retry() {
+    let fixture = fixture();
+    let mut reconciler = fixture.reconciler();
+    let prepared = reconciler
+        .prepare_promotion(&fixture.request())
+        .expect("record promotion intent");
+    reconciler
+        .compare_and_swap_canonical_ref(&prepared)
+        .expect("CAS canonical ref");
+    reconciler
+        .mark_ref_updated(&prepared)
+        .expect("persist canonical ref update");
+    update_ref(&fixture.repository, CANONICAL_REF, &fixture.base_oid);
+    let revision = reconciler
+        .store()
+        .current_revision(&fixture.project_id)
+        .unwrap();
+    drop(reconciler);
+
+    let mut restarted = fixture.reconciler();
+    let recovery = restarted
+        .recover_promotion(&prepared.intent_id)
+        .expect("recover ref-updated intent at expected base");
+    assert_eq!(recovery.action, PromotionRecoveryAction::Retry);
+    assert_eq!(recovery.intent["state"], "ref_updated");
+    assert_eq!(recovery.revision, revision);
+    assert_eq!(
+        restarted
+            .store()
+            .current_revision(&fixture.project_id)
+            .unwrap(),
+        revision
+    );
+    assert!(
+        restarted
+            .store()
+            .incomplete_promotions(&fixture.project_id, 10)
+            .unwrap()
+            .iter()
+            .any(|intent| intent["id"] == prepared.intent_id)
+    );
 }
 
 #[test]

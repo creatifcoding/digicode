@@ -649,23 +649,7 @@ impl PromotionReconciler {
             .map_err(|error| self.map_store_error(error))?;
 
         let action = match recovery.action {
-            PromotionRecoveryAction::Retry => {
-                let rollback_revision = self
-                    .store
-                    .current_revision(&project_id)
-                    .map_err(PromotionSagaError::Store)?;
-                self.store
-                    .rollback_promotion(
-                        intent_id,
-                        "canonical ref remained at the expected base during recovery",
-                        rollback_revision,
-                    )
-                    .map_err(|source| PromotionSagaError::RollbackFailed {
-                        intent_id: intent_id.to_owned(),
-                        source,
-                    })?;
-                PromotionRecoveryAction::Rollback
-            }
+            PromotionRecoveryAction::Retry => PromotionRecoveryAction::Retry,
             PromotionRecoveryAction::Conflict => {
                 let rollback_revision = self
                     .store
