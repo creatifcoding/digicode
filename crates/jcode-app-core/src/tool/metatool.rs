@@ -2189,13 +2189,7 @@ mod tests {
                 "tasker.recoverPromotion",
             ]
         );
-        let compatibility_methods = sections["tasker-compatibility"]
-            .as_array()
-            .expect("tasker compatibility methods")
-            .iter()
-            .map(|method| method["name"].as_str().expect("compatibility method name"))
-            .collect::<Vec<_>>();
-        assert_eq!(compatibility_methods, vec!["tasker.executeCandidateLanes"]);
+        assert!(sections.get("tasker-compatibility").is_none());
         assert!(
             sections["tasker-capability"]
                 .as_array()
@@ -2218,6 +2212,7 @@ mod tests {
             "abortPromotion",
             "rollbackPromotion",
             "resumePromotion",
+            "executeCandidateLanes",
         ] {
             assert!(!SIDECAR_SOURCE.contains(&format!("{method}:")));
         }

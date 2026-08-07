@@ -409,13 +409,6 @@
         "signature": "async (request) -> host_executor_unavailable"
       }
     ],
-    "tasker-compatibility": [
-      {
-        "name": "tasker.executeCandidateLanes",
-        "classification": "internal_compatibility_deprecated",
-        "signature": "host-side compatibility effect; not a public mt.tasker method"
-      }
-    ],
     "artifacts-capability": [
       {
         "name": "artifacts.status",
