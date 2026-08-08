@@ -746,6 +746,115 @@ pub fn admitted_release_line_head() -> Result<Option<String>> {
     Ok(None)
 }
 
+fn any_fork_admission_receipt_exists() -> Result<bool> {
+    let versions = builds_dir()?.join("versions");
+    if !versions.exists() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(versions)? {
+        if entry?.path().join("fork-admission.json").exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Adopt the single pre-governance fork build already pinned on this machine.
+///
+/// This is intentionally a one-time migration, not a general caller-selected
+/// admission path. It runs only before any admission receipt exists, requires
+/// every configured release-line channel to agree on one installed version,
+/// proves that binary's reported commit is an ancestor of the current clean
+/// canonical-fork checkout, and preserves the normal capability checks.
+pub fn bootstrap_legacy_fork_build(repo_dir: &Path) -> Result<Option<ForkBuildAdmission>> {
+    if any_fork_admission_receipt_exists()? {
+        return Ok(None);
+    }
+
+    let configured = [
+        read_current_version()?,
+        read_shared_server_version()?,
+        read_stable_version()?,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    .collect::<HashSet<_>>();
+
+    if configured.is_empty() {
+        return Ok(None);
+    }
+    if configured.len() != 1 {
+        anyhow::bail!(
+            "refusing legacy fork bootstrap: configured channels disagree: {}",
+            configured.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    let version = configured
+        .into_iter()
+        .next()
+        .expect("one configured version");
+
+    canonical_fork_remote(repo_dir)?;
+    let source = current_source_state(repo_dir)?;
+    if source.dirty {
+        anyhow::bail!("refusing legacy fork bootstrap from a dirty source checkout");
+    }
+
+    let binary = version_binary_path(&version)?;
+    if !binary.exists() {
+        anyhow::bail!(
+            "refusing legacy fork bootstrap: configured binary {} is missing",
+            binary.display()
+        );
+    }
+    let report = read_binary_version_report(&binary)?;
+    let reported_hash = report.git_hash.unwrap_or_default();
+    if !is_hex_commit(&reported_hash) {
+        anyhow::bail!("refusing legacy fork bootstrap: binary omitted a valid git hash");
+    }
+    let commit = git_output(
+        repo_dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &format!("{reported_hash}^{{commit}}"),
+        ],
+    )?;
+    if !git_is_ancestor(repo_dir, &commit, &source.full_hash)? {
+        anyhow::bail!(
+            "refusing legacy fork bootstrap: binary commit {commit} is not an ancestor of maintained fork head {}",
+            source.full_hash
+        );
+    }
+
+    let authority = format!("local-fork:{CANONICAL_FORK_REPOSITORY}:legacy-bootstrap");
+    validate_transition_metadata(
+        &version,
+        &authority,
+        &reported_hash,
+        &report.capabilities,
+        None,
+    )?;
+    let admission = ForkBuildAdmission {
+        version: version.clone(),
+        git_hash: reported_hash,
+        authority,
+        binary_sha256: binary_sha256(&binary)?,
+        predecessor: None,
+        source_fingerprint: source_fingerprint_for_binary(&binary)?,
+        source: None,
+        capabilities: report.capabilities,
+        admitted_at: Utc::now(),
+    };
+    storage::write_json(&build_admission_path(&version)?, &admission)?;
+    require_admitted_fork_build(&version)?;
+    Ok(Some(admission))
+}
+
 /// Manifest tracking build versions and their status
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BuildManifest {
@@ -1483,6 +1592,7 @@ pub fn publish_local_current_build_for_source(
     }
     validate_binary_version_matches_source_report(&installed_report, &versioned_path, source)?;
     write_immutable_source_metadata(&versioned_path, source)?;
+    bootstrap_legacy_fork_build(repo_dir)?;
     let predecessor = admitted_release_line_head()?;
     admit_installed_fork_build(
         &source.version_label,

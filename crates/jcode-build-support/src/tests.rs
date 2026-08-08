@@ -901,6 +901,62 @@ fn local_branch_cannot_impersonate_unfetched_canonical_release_ref() {
 
 #[cfg(unix)]
 #[test]
+fn legacy_fork_bootstrap_requires_one_consistent_ancestor_build() {
+    with_temp_jcode_home(|| {
+        let repo = tempfile::tempdir().expect("legacy bootstrap repo");
+        source_fixture_git(repo.path(), &["init", "-b", CANONICAL_FORK_RELEASE_BRANCH]);
+        source_fixture_git(repo.path(), &["config", "user.email", "test@example.com"]);
+        source_fixture_git(repo.path(), &["config", "user.name", "Test User"]);
+        source_fixture_git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "fork",
+                "git@github.com:creatifcoding/jcode.git",
+            ],
+        );
+        std::fs::write(repo.path().join("legacy.txt"), "legacy\n").expect("write legacy source");
+        source_fixture_git(repo.path(), &["add", "legacy.txt"]);
+        source_fixture_git(repo.path(), &["commit", "-m", "legacy fork build"]);
+        let legacy_commit = source_fixture_git(repo.path(), &["rev-parse", "HEAD"]);
+
+        std::fs::write(repo.path().join("current.txt"), "current\n").expect("write current source");
+        source_fixture_git(repo.path(), &["add", "current.txt"]);
+        source_fixture_git(repo.path(), &["commit", "-m", "current fork head"]);
+
+        let version = &legacy_commit[..9];
+        write_report_binary(version, version, &["mt", "tasker"]);
+        std::fs::write(current_version_file().expect("current marker"), version)
+            .expect("write current marker");
+        std::fs::write(
+            shared_server_version_file().expect("shared marker"),
+            version,
+        )
+        .expect("write shared marker");
+
+        let admission = bootstrap_legacy_fork_build(repo.path())
+            .expect("bootstrap legacy build")
+            .expect("bootstrap should create a receipt");
+        assert_eq!(admission.version, version);
+        assert_eq!(
+            admission.authority,
+            format!("local-fork:{CANONICAL_FORK_REPOSITORY}:legacy-bootstrap")
+        );
+        assert!(bootstrap_legacy_fork_build(repo.path()).unwrap().is_none());
+
+        std::fs::write(stable_version_file().expect("stable marker"), "conflicting")
+            .expect("write conflicting stable marker");
+        std::fs::remove_file(build_admission_path(version).expect("receipt path"))
+            .expect("remove receipt for conflict check");
+        let error = bootstrap_legacy_fork_build(repo.path())
+            .expect_err("conflicting legacy channels must fail closed");
+        assert!(error.to_string().contains("configured channels disagree"));
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn raw_upstream_source_build_cannot_be_admitted_or_advance_channel() {
     with_temp_jcode_home(|| {
         let (repo, _canonical, upstream, _merge) = canonical_source_fixture();
