@@ -200,13 +200,8 @@ fn canonical_release_ref(repo_dir: &Path, remote: &str) -> Result<String> {
         return Ok(remote_ref);
     }
 
-    let local_ref = format!("refs/heads/{CANONICAL_FORK_RELEASE_BRANCH}");
-    if git_ref_exists(repo_dir, &local_ref)? {
-        return Ok(local_ref);
-    }
-
     anyhow::bail!(
-        "refusing source build: canonical fork release branch {CANONICAL_FORK_RELEASE_BRANCH} is not present"
+        "refusing source build: fetched canonical fork release ref {remote_ref} is not present"
     )
 }
 

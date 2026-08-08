@@ -1339,9 +1339,13 @@ mod tests {
         validate_canonical_release_metadata(&canonical).expect("canonical release should pass");
 
         let upstream = release_metadata(
-            &format!("https://github.com/{build::UPSTREAM_SOURCE_REPOSITORY}/releases/tag/v0.69.0"),
             &format!(
-                "https://github.com/{build::UPSTREAM_SOURCE_REPOSITORY}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
+                "https://github.com/{}/releases/tag/v0.69.0",
+                build::UPSTREAM_SOURCE_REPOSITORY
+            ),
+            &format!(
+                "https://github.com/{}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz",
+                build::UPSTREAM_SOURCE_REPOSITORY
             ),
         );
         assert!(validate_canonical_release_metadata(&upstream).is_err());
@@ -1349,7 +1353,8 @@ mod tests {
         let mixed = release_metadata(
             &format!("https://github.com/{GITHUB_REPO}/releases/tag/v0.69.0"),
             &format!(
-                "https://github.com/{build::UPSTREAM_SOURCE_REPOSITORY}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
+                "https://github.com/{}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz",
+                build::UPSTREAM_SOURCE_REPOSITORY
             ),
         );
         assert!(validate_canonical_release_metadata(&mixed).is_err());

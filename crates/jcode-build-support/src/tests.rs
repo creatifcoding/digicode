@@ -835,6 +835,14 @@ fn canonical_source_fixture() -> (tempfile::TempDir, String, String, String) {
     source_fixture_git(repo.path(), &["add", "canonical.txt"]);
     source_fixture_git(repo.path(), &["commit", "-m", "canonical release"]);
     let canonical = source_fixture_git(repo.path(), &["rev-parse", "HEAD"]);
+    source_fixture_git(
+        repo.path(),
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{CANONICAL_FORK_RELEASE_BRANCH}"),
+            &canonical,
+        ],
+    );
 
     source_fixture_git(repo.path(), &["checkout", "-b", "intake"]);
     std::fs::write(repo.path().join("upstream.txt"), "upstream\n").expect("write upstream");
@@ -858,6 +866,37 @@ fn canonical_source_fixture() -> (tempfile::TempDir, String, String, String) {
     let merge = source_fixture_git(repo.path(), &["rev-parse", "HEAD"]);
 
     (repo, canonical, upstream, merge)
+}
+
+#[cfg(unix)]
+#[test]
+fn local_branch_cannot_impersonate_unfetched_canonical_release_ref() {
+    let repo = tempfile::tempdir().expect("source fixture tempdir");
+    source_fixture_git(repo.path(), &["init", "-b", CANONICAL_FORK_RELEASE_BRANCH]);
+    source_fixture_git(repo.path(), &["config", "user.email", "test@example.com"]);
+    source_fixture_git(repo.path(), &["config", "user.name", "Test User"]);
+    source_fixture_git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:creatifcoding/jcode.git",
+        ],
+    );
+    std::fs::write(repo.path().join("local-only.txt"), "local only\n")
+        .expect("write local-only source");
+    source_fixture_git(repo.path(), &["add", "local-only.txt"]);
+    source_fixture_git(repo.path(), &["commit", "-m", "local-only master"]);
+    let local_head = source_fixture_git(repo.path(), &["rev-parse", "HEAD"]);
+
+    let error = canonical_source_provenance(repo.path(), &local_head, None)
+        .expect_err("local master must not substitute for a fetched canonical remote ref");
+    assert!(
+        error
+            .to_string()
+            .contains("fetched canonical fork release ref")
+    );
 }
 
 #[cfg(unix)]
