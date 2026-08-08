@@ -85,6 +85,7 @@ fn test_binary_version_hash_mismatch_rejects_publish_candidate() {
     let report = BinaryVersionReport {
         version: Some("v0.0.0-dev (oldhash, dirty)".to_string()),
         git_hash: Some("oldhash".to_string()),
+        capabilities: vec!["mt".to_string(), "tasker".to_string()],
     };
 
     let error = validate_binary_version_matches_source_report(&report, Path::new("jcode"), &source)
@@ -196,9 +197,7 @@ fn test_client_update_candidate_prefers_dev_binary_for_selfdev() {
     jcode_core::env::set_var("JCODE_HOME", temp_home.path());
 
     let version = "test-current";
-    let version_binary =
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), version)
-            .expect("install test version");
+    let version_binary = install_test_admitted_binary(version).expect("install test version");
     update_current_symlink(version).expect("update current symlink");
 
     let candidate = client_update_candidate(true).expect("expected selfdev candidate");
@@ -228,9 +227,7 @@ fn launcher_dir_uses_sandbox_bin_when_jcode_home_is_set() {
 fn update_launcher_symlink_stays_inside_sandbox_home() {
     with_temp_jcode_home(|| {
         let version = "sandbox-current";
-        let version_binary =
-            install_binary_at_version(std::env::current_exe().as_ref().unwrap(), version)
-                .expect("install test version");
+        let version_binary = install_test_admitted_binary(version).expect("install test version");
         update_current_symlink(version).expect("update current symlink");
 
         let launcher = update_launcher_symlink_to_current().expect("update launcher");
@@ -278,10 +275,10 @@ fn pending_activation_can_complete_and_roll_back() {
     with_temp_jcode_home(|| {
         let current_version = "stable-prev";
         let shared_version = "shared-prev";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), current_version)
-            .expect("install previous version");
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), shared_version)
-            .expect("install previous shared version");
+        install_test_admitted_binary(current_version).expect("install previous version");
+        install_test_admitted_binary(shared_version).expect("install previous shared version");
+        install_test_admitted_binary("canary-next").expect("install canary next");
+        install_test_admitted_binary("canary-bad").expect("install canary bad");
         update_current_symlink(current_version).expect("publish previous current");
         update_shared_server_symlink(shared_version).expect("publish previous shared");
 
@@ -338,10 +335,8 @@ fn shared_server_candidate_prefers_approved_channel_over_current() {
     with_temp_jcode_home(|| {
         let approved_version = "shared-ok";
         let current_version = "current-dev";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), approved_version)
-            .expect("install approved version");
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), current_version)
-            .expect("install current version");
+        install_test_admitted_binary(approved_version).expect("install approved version");
+        install_test_admitted_binary(current_version).expect("install current version");
         update_shared_server_symlink(approved_version).expect("update shared server");
         update_current_symlink(current_version).expect("update current");
 
@@ -360,10 +355,8 @@ fn normal_shared_server_candidate_repairs_stale_shared_channel_to_stable() {
     with_temp_jcode_home(|| {
         let stale_version = "0.14.2";
         let installed_version = "0.17.0";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), stale_version)
-            .expect("install stale shared version");
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), installed_version)
-            .expect("install installed version");
+        install_test_admitted_binary(stale_version).expect("install stale shared version");
+        install_test_admitted_binary(installed_version).expect("install installed version");
         update_shared_server_symlink(stale_version).expect("update shared server");
         update_stable_symlink(installed_version).expect("update stable");
         update_current_symlink(installed_version).expect("update current");
@@ -382,8 +375,7 @@ fn normal_shared_server_candidate_repairs_stale_shared_channel_to_stable() {
 fn normal_shared_server_candidate_allows_shared_channel_matching_stable() {
     with_temp_jcode_home(|| {
         let installed_version = "0.17.0";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), installed_version)
-            .expect("install installed version");
+        install_test_admitted_binary(installed_version).expect("install installed version");
         update_shared_server_symlink(installed_version).expect("update shared server");
         update_stable_symlink(installed_version).expect("update stable");
 
@@ -398,10 +390,8 @@ fn normal_shared_server_candidate_ignores_shared_channel_with_missing_marker() {
     with_temp_jcode_home(|| {
         let shared_version = "0.14.2";
         let installed_version = "0.17.0";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), shared_version)
-            .expect("install shared version");
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), installed_version)
-            .expect("install installed version");
+        install_test_admitted_binary(shared_version).expect("install shared version");
+        install_test_admitted_binary(installed_version).expect("install installed version");
         update_shared_server_symlink(shared_version).expect("update shared server");
         std::fs::remove_file(shared_server_version_file().unwrap()).expect("remove marker");
         update_stable_symlink(installed_version).expect("update stable");
@@ -417,10 +407,8 @@ fn normal_shared_server_candidate_ignores_shared_channel_with_corrupt_marker() {
     with_temp_jcode_home(|| {
         let shared_version = "0.14.2";
         let installed_version = "0.17.0";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), shared_version)
-            .expect("install shared version");
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), installed_version)
-            .expect("install installed version");
+        install_test_admitted_binary(shared_version).expect("install shared version");
+        install_test_admitted_binary(installed_version).expect("install installed version");
         update_shared_server_symlink(shared_version).expect("update shared server");
         std::fs::write(
             shared_server_version_file().unwrap(),
@@ -493,10 +481,8 @@ fn advance_shared_server_carries_forward_when_tracking_stable() {
     with_temp_jcode_home(|| {
         let old = "0.17.0";
         let new = "0.18.0";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), old)
-            .expect("install old");
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), new)
-            .expect("install new");
+        install_test_admitted_binary(old).expect("install old");
+        install_test_admitted_binary(new).expect("install new");
         update_stable_symlink(old).expect("stable old");
         update_shared_server_symlink(old).expect("shared old");
 
@@ -516,12 +502,9 @@ fn advance_shared_server_preserves_pinned_selfdev_build() {
         let stable_old = "0.17.0";
         let selfdev = "56f43c3d-dirty-deadbeef";
         let update = "0.18.0";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), stable_old)
-            .expect("install stable");
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), selfdev)
-            .expect("install selfdev");
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), update)
-            .expect("install update");
+        install_test_admitted_binary(stable_old).expect("install stable");
+        install_test_admitted_binary(selfdev).expect("install selfdev");
+        install_test_admitted_binary(update).expect("install update");
         update_stable_symlink(stable_old).expect("stable");
         update_shared_server_symlink(selfdev).expect("shared selfdev");
 
@@ -540,8 +523,7 @@ fn advance_shared_server_preserves_pinned_selfdev_build() {
 /// I/O. This is the exact sequence: advance shared-server if tracking stable,
 /// then move stable/current/launcher to the freshly installed version.
 fn simulate_stable_update_channel_swap(new_version: &str) {
-    install_binary_at_version(std::env::current_exe().as_ref().unwrap(), new_version)
-        .expect("install update version");
+    install_test_admitted_binary(new_version).expect("install update version");
     // /update tries to carry the daemon's reload target forward, but only when
     // shared-server is tracking stable.
     advance_shared_server_if_tracking_stable(new_version).expect("advance shared-server");
@@ -582,12 +564,10 @@ fn update_leaves_daemon_reload_target_stale_when_shared_server_pinned_to_selfdev
     with_temp_jcode_home(|| {
         // Field state: client + server both on an old self-dev build.
         let old_selfdev = "3f160da1-dirty-e756d52efca9";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), old_selfdev)
-            .expect("install old selfdev");
+        install_test_admitted_binary(old_selfdev).expect("install old selfdev");
         // `stable` lags behind (a previously released version).
         let old_stable = "0.14.3";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), old_stable)
-            .expect("install old stable");
+        install_test_admitted_binary(old_stable).expect("install old stable");
         update_stable_symlink(old_stable).expect("stable");
         update_current_symlink(old_selfdev).expect("current selfdev");
         update_shared_server_symlink(old_selfdev).expect("shared-server selfdev");
@@ -629,8 +609,7 @@ fn update_leaves_daemon_reload_target_stale_when_shared_server_pinned_to_selfdev
 fn update_advances_daemon_reload_target_when_shared_server_tracks_stable() {
     with_temp_jcode_home(|| {
         let old_release = "0.14.3";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), old_release)
-            .expect("install old release");
+        install_test_admitted_binary(old_release).expect("install old release");
         update_stable_symlink(old_release).expect("stable");
         update_current_symlink(old_release).expect("current");
         update_shared_server_symlink(old_release).expect("shared-server tracks stable");
@@ -677,11 +656,9 @@ fn candidate_version(candidate: Option<(PathBuf, &'static str)>) -> Option<Strin
 fn selfdev_reload_target_diverges_from_update_probe_when_shared_server_pinned() {
     with_temp_jcode_home(|| {
         let old_selfdev = "3f160da1-dirty-e756d52efca9";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), old_selfdev)
-            .expect("install old selfdev");
+        install_test_admitted_binary(old_selfdev).expect("install old selfdev");
         let old_stable = "0.14.3";
-        install_binary_at_version(std::env::current_exe().as_ref().unwrap(), old_stable)
-            .expect("install old stable");
+        install_test_admitted_binary(old_stable).expect("install old stable");
         update_stable_symlink(old_stable).expect("stable");
         update_current_symlink(old_selfdev).expect("current selfdev");
         update_shared_server_symlink(old_selfdev).expect("shared-server pinned selfdev");
@@ -721,15 +698,316 @@ fn selfdev_reload_target_diverges_from_update_probe_when_shared_server_pinned() 
 /// explicit mtime so channel-repair mtime comparisons are deterministic
 /// (install_binary_at_version hard-links and would share an mtime).
 fn write_versioned_binary(version: &str, mtime: std::time::SystemTime) -> PathBuf {
+    #[cfg(unix)]
+    let path = write_report_binary(version, &format!("hash-{version}"), &["mt", "tasker"]);
+    #[cfg(not(unix))]
     let dir = builds_dir().unwrap().join("versions").join(version);
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&dir).expect("create version dir");
+    #[cfg(not(unix))]
     let path = dir.join(binary_name());
+    #[cfg(not(unix))]
     std::fs::write(&path, format!("bin {version}")).expect("write binary");
     std::fs::File::open(&path)
         .expect("open binary")
         .set_modified(mtime)
         .expect("set mtime");
+    write_test_admission(
+        version,
+        &format!("github:{CANONICAL_FORK_REPOSITORY}:test"),
+        None,
+        &["mt", "tasker"],
+    );
     path
+}
+
+fn install_test_admitted_binary(version: &str) -> Result<PathBuf> {
+    #[cfg(unix)]
+    let path = write_report_binary(version, &format!("hash-{version}"), &["mt", "tasker"]);
+    #[cfg(not(unix))]
+    let path = install_binary_at_version(std::env::current_exe().as_ref().unwrap(), version)
+        .expect("install test version");
+    write_test_admission(
+        version,
+        &format!("github:{CANONICAL_FORK_REPOSITORY}:test"),
+        None,
+        &["mt", "tasker"],
+    );
+    Ok(path)
+}
+
+fn write_test_admission(
+    version: &str,
+    authority: &str,
+    predecessor: Option<&str>,
+    capabilities: &[&str],
+) {
+    let binary = version_binary_path(version).expect("version path");
+    let git_hash = read_binary_version_report(&binary)
+        .ok()
+        .and_then(|report| report.git_hash)
+        .unwrap_or_else(|| format!("hash-{version}"));
+    let admission = ForkBuildAdmission {
+        version: version.to_string(),
+        git_hash,
+        authority: authority.to_string(),
+        binary_sha256: binary_sha256(&binary).expect("hash test binary"),
+        predecessor: predecessor.map(str::to_string),
+        source_fingerprint: None,
+        capabilities: capabilities
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        admitted_at: chrono::Utc::now(),
+    };
+    jcode_storage::write_json(
+        &build_admission_path(version).expect("admission path"),
+        &admission,
+    )
+    .expect("write admission");
+}
+
+#[cfg(unix)]
+fn write_report_binary(version: &str, git_hash: &str, capabilities: &[&str]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = version_binary_path(version).expect("version path");
+    std::fs::create_dir_all(path.parent().expect("version parent")).expect("version directory");
+    let report = serde_json::json!({
+        "version": format!("v{version} ({git_hash})"),
+        "git_hash": git_hash,
+        "capabilities": capabilities,
+    });
+    let report = serde_json::to_string(&report).expect("report json");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ] && [ \"$2\" = \"--json\" ]; then\nprintf '%s\\n' '{report}'\nexit 0\nfi\nexit 1\n"
+        ),
+    )
+    .expect("write report binary");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("report metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("make report binary executable");
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn higher_semver_non_descendant_and_upstream_builds_are_rejected() {
+    with_temp_jcode_home(|| {
+        let head = "0.68.1";
+        write_report_binary(head, "head", &["mt", "tasker"]);
+        write_test_admission(
+            head,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+            &["mt", "tasker"],
+        );
+        update_stable_symlink(head).expect("publish release-line head");
+
+        let unrelated = "0.68.2";
+        write_report_binary(unrelated, "unrelated", &["mt", "tasker"]);
+        write_test_admission(
+            unrelated,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+            &["mt", "tasker"],
+        );
+
+        let non_descendant = "0.69.0";
+        write_report_binary(non_descendant, "non-descendant", &["mt", "tasker"]);
+        let error = admit_installed_fork_build(
+            non_descendant,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            Some(unrelated),
+        )
+        .expect_err("higher semver build must extend the admitted head");
+        assert!(error.to_string().contains("release-line head"));
+        assert!(
+            read_build_admission(non_descendant)
+                .expect("read rejected receipt")
+                .is_none()
+        );
+
+        let upstream = "0.70.0";
+        write_report_binary(upstream, "upstream", &["mt", "tasker"]);
+        let error = admit_installed_fork_build(
+            upstream,
+            &format!("github:{UPSTREAM_SOURCE_REPOSITORY}:release"),
+            Some(head),
+        )
+        .expect_err("upstream release must never become a fork build");
+        assert!(error.to_string().contains("canonical fork"));
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn capability_losing_build_is_rejected() {
+    with_temp_jcode_home(|| {
+        let predecessor = "0.68.1";
+        write_report_binary(predecessor, "head", &["mt", "tasker"]);
+        write_test_admission(
+            predecessor,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+            &["mt", "tasker"],
+        );
+        update_stable_symlink(predecessor).expect("publish predecessor");
+
+        let candidate = "0.69.0";
+        write_report_binary(candidate, "candidate", &["mt"]);
+        let error = admit_installed_fork_build(
+            candidate,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            Some(predecessor),
+        )
+        .expect_err("capability loss must fail admission");
+        assert!(error.to_string().contains("tasker"));
+        assert!(
+            read_build_admission(candidate)
+                .expect("read rejected receipt")
+                .is_none()
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn admitted_descendant_is_accepted() {
+    with_temp_jcode_home(|| {
+        let predecessor = "0.68.1";
+        write_report_binary(predecessor, "head", &["mt", "tasker"]);
+        write_test_admission(
+            predecessor,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+            &["mt", "tasker"],
+        );
+        update_stable_symlink(predecessor).expect("publish predecessor");
+
+        let candidate = "0.69.0";
+        write_report_binary(candidate, "candidate", &["mt", "tasker"]);
+        let admission = admit_installed_fork_build(
+            candidate,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            Some(predecessor),
+        )
+        .expect("admitted descendant");
+        assert_eq!(admission.predecessor.as_deref(), Some(predecessor));
+        require_admitted_fork_build(candidate).expect("descendant remains admitted");
+    });
+}
+
+#[test]
+fn repair_cannot_repin_an_inadmissible_stable_build() {
+    with_temp_jcode_home(|| {
+        let previous = "0.68.1";
+        let invalid_stable = "0.69.0";
+        write_versioned_binary(previous, std::time::SystemTime::now());
+        update_shared_server_symlink(previous).expect("publish shared-server predecessor");
+
+        write_versioned_binary(invalid_stable, std::time::SystemTime::now());
+        write_test_admission(
+            invalid_stable,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+            &["mt"],
+        );
+        update_channel_symlink("stable", invalid_stable).expect("seed invalid stable channel");
+        std::fs::write(
+            stable_version_file().expect("stable marker"),
+            invalid_stable,
+        )
+        .expect("seed invalid stable marker");
+
+        assert_eq!(
+            repair_stale_shared_server_channel().expect("repair should fail closed"),
+            SharedServerRepair::AlreadyCurrent
+        );
+        assert_eq!(
+            read_shared_server_version()
+                .expect("shared marker")
+                .as_deref(),
+            Some(previous),
+            "repair must not repin shared-server to an inadmissible stable build"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn admitted_build_rejects_deleted_or_replaced_binary() {
+    with_temp_jcode_home(|| {
+        let version = "0.68.1";
+        let path = write_report_binary(version, "head", &["mt", "tasker"]);
+        write_test_admission(
+            version,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+            &["mt", "tasker"],
+        );
+        update_stable_symlink(version).expect("publish admitted build");
+        require_admitted_fork_build(version).expect("initial admission should verify");
+
+        std::fs::remove_file(path).expect("delete build payload");
+        assert!(require_admitted_fork_build(version).is_err());
+        assert!(
+            shared_server_update_candidate(false)
+                .map(|(_, label)| label != "stable")
+                .unwrap_or(true),
+            "deleted admitted build must not remain a startup candidate"
+        );
+    });
+}
+
+#[test]
+fn rollback_preflights_all_targets_before_mutating_channels() {
+    with_temp_jcode_home(|| {
+        let current = "rollback-current";
+        let invalid_shared = "rollback-invalid-shared";
+        install_test_admitted_binary(current).expect("install current");
+        install_test_admitted_binary(invalid_shared).expect("install invalid shared payload");
+        std::fs::remove_file(build_admission_path(invalid_shared).expect("admission path"))
+            .expect("remove invalid shared admission");
+        update_current_symlink(current).expect("publish current");
+        update_channel_symlink("shared-server", invalid_shared).expect("seed shared target");
+        std::fs::write(
+            shared_server_version_file().expect("shared marker"),
+            invalid_shared,
+        )
+        .expect("seed invalid shared marker");
+
+        let mut manifest = BuildManifest::default();
+        manifest
+            .set_pending_activation(PendingActivation {
+                session_id: "rollback-session".to_string(),
+                new_version: "rollback-new".to_string(),
+                previous_current_version: Some(current.to_string()),
+                previous_shared_server_version: Some(invalid_shared.to_string()),
+                source_fingerprint: None,
+                requested_at: Utc::now(),
+            })
+            .expect("set pending activation");
+
+        let error = rollback_pending_activation_for_session("rollback-session")
+            .expect_err("invalid shared target must fail before mutation");
+        assert!(error.to_string().contains("shared-server rollback target"));
+        assert_eq!(
+            read_current_version().expect("current marker").as_deref(),
+            Some(current),
+            "preflight must preserve current when shared-server rollback is invalid"
+        );
+        assert!(
+            BuildManifest::load()
+                .expect("load manifest")
+                .pending_activation
+                .is_none()
+        );
+    });
 }
 
 #[test]
@@ -743,6 +1021,12 @@ fn repair_repoints_stale_shared_server_to_newer_stable() {
         // release (the "current client, no-op /update, stale server" state).
         write_versioned_binary(old, base);
         write_versioned_binary(new, base + Duration::from_secs(60));
+        write_test_admission(
+            new,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+            &["mt", "tasker"],
+        );
         update_shared_server_symlink(old).expect("pin shared-server old");
         update_stable_symlink(new).expect("stable new");
 

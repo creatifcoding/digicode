@@ -30,6 +30,8 @@ use anyhow::Result;
 use chrono::Utc;
 use jcode_storage as storage;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +44,402 @@ pub use jcode_selfdev_types::{
     MigrationContext, PendingActivation, PublishedBuild, SelfDevBuildCommand, SelfDevBuildTarget,
     SourceState,
 };
+
+/// GitHub repository whose release artifacts are allowed to become executable
+/// channel builds. This is deliberately the maintained fork, not the upstream
+/// source repository.
+pub const CANONICAL_FORK_REPOSITORY: &str = "creatifcoding/jcode";
+/// Upstream is an input to source-update workflows only. It is never a valid
+/// release or local-fork binary authority.
+pub const UPSTREAM_SOURCE_REPOSITORY: &str = "1jehuang/jcode";
+pub const REQUIRED_FORK_CAPABILITIES: &[&str] = &["mt", "tasker"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkBuildAdmission {
+    pub version: String,
+    pub git_hash: String,
+    pub authority: String,
+    /// SHA-256 of the immutable binary payload admitted for this version.
+    pub binary_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<String>,
+    /// Source-state fingerprint for local/dirty builds. Release assets use
+    /// the canonical release metadata and therefore have no dirty fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint: Option<String>,
+    pub capabilities: Vec<String>,
+    pub admitted_at: chrono::DateTime<Utc>,
+}
+
+fn canonical_authority(authority: &str) -> bool {
+    authority.starts_with(&format!("github:{CANONICAL_FORK_REPOSITORY}:"))
+        || authority.starts_with(&format!("local-fork:{CANONICAL_FORK_REPOSITORY}:"))
+}
+
+fn release_version(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.trim().trim_start_matches('v');
+    let value = value.split([' ', '(', '-']).next()?;
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn binary_sha256(binary: &Path) -> Result<String> {
+    let payload = resolve_binary_payload(binary);
+    let bytes = std::fs::read(&payload).map_err(|error| {
+        anyhow::anyhow!(
+            "could not read build payload {}: {error}",
+            payload.display()
+        )
+    })?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("{digest:x}"))
+}
+
+fn source_fingerprint_for_binary(binary: &Path) -> Result<Option<String>> {
+    let path = binary_source_metadata_path(binary);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata: DevBinarySourceMetadata = storage::read_json(&path)?;
+    Ok(Some(metadata.source_fingerprint))
+}
+
+fn write_immutable_source_metadata(binary: &Path, source: &SourceState) -> Result<()> {
+    let path = binary_source_metadata_path(binary);
+    let metadata = DevBinarySourceMetadata::from(source);
+    if path.exists() {
+        let existing: DevBinarySourceMetadata = storage::read_json(&path)?;
+        if existing != metadata {
+            anyhow::bail!(
+                "refusing to replace immutable source identity for {}",
+                binary.display()
+            );
+        }
+        return Ok(());
+    }
+    storage::write_json(&path, &metadata)
+}
+
+fn missing_capabilities(capabilities: &[String]) -> Vec<&'static str> {
+    REQUIRED_FORK_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|required| !capabilities.iter().any(|value| value == required))
+        .collect()
+}
+
+fn capability_loss<'a>(candidate: &'a [String], predecessor: &'a [String]) -> Vec<&'a String> {
+    predecessor
+        .iter()
+        .filter(|capability| !candidate.iter().any(|value| value == *capability))
+        .collect()
+}
+
+fn validate_transition_metadata(
+    version: &str,
+    authority: &str,
+    git_hash: &str,
+    capabilities: &[String],
+    predecessor: Option<&ForkBuildAdmission>,
+) -> Result<()> {
+    if !canonical_authority(authority) {
+        anyhow::bail!(
+            "build authority {authority:?} is not the configured canonical fork {CANONICAL_FORK_REPOSITORY}"
+        );
+    }
+    if git_hash.trim().is_empty() || git_hash.trim() == "unknown" {
+        anyhow::bail!("refusing to admit fork build {version}: binary omitted git_hash");
+    }
+
+    let missing = missing_capabilities(capabilities);
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "refusing to admit fork build {version}: binary is missing required capabilities {}",
+            missing.join(", ")
+        );
+    }
+
+    if let Some(predecessor) = predecessor {
+        let lost = capability_loss(capabilities, &predecessor.capabilities);
+        if !lost.is_empty() {
+            let lost = lost
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "refusing to admit fork build {version}: capabilities lost from predecessor {}: {lost}",
+                predecessor.version
+            );
+        }
+
+        if let (Some(candidate), Some(previous)) = (
+            release_version(version),
+            release_version(&predecessor.version),
+        ) && candidate <= previous
+        {
+            anyhow::bail!(
+                "refusing to admit fork build {version}: release line does not advance admitted predecessor {}",
+                predecessor.version
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn build_admission_path(version: &str) -> Result<PathBuf> {
+    let binary = version_binary_path(version)?;
+    let directory = binary
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("version binary has no parent: {}", binary.display()))?;
+    Ok(directory.join("fork-admission.json"))
+}
+
+pub fn read_build_admission(version: &str) -> Result<Option<ForkBuildAdmission>> {
+    let path = build_admission_path(version)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(storage::read_json(&path)?))
+}
+
+pub fn admit_installed_fork_build(
+    version: &str,
+    authority: &str,
+    predecessor: Option<&str>,
+) -> Result<ForkBuildAdmission> {
+    let binary = version_binary_path(version)?;
+    let report = read_binary_version_report(&binary)?;
+    if let Some(expected) = release_version(version) {
+        let reported = report
+            .version
+            .as_deref()
+            .and_then(release_version)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "refusing to admit fork build {version}: binary omitted a parseable release version"
+                )
+            })?;
+        if reported != expected {
+            anyhow::bail!(
+                "refusing to admit fork build {version}: binary reports version {:?}",
+                report.version
+            );
+        }
+    }
+    let git_hash = report.git_hash.unwrap_or_default();
+    let predecessor_admission = predecessor
+        .map(require_admitted_fork_build)
+        .transpose()
+        .map_err(|error| {
+            anyhow::anyhow!("build {version} does not extend an admitted fork release: {error}")
+        })?;
+
+    // Once a release-line head exists, every new build must name that exact
+    // head. This prevents a higher-semver build from silently starting a new
+    // line from an upstream or unrelated admitted receipt.
+    if let Some(head) = admitted_release_line_head()?
+        && predecessor != Some(head.as_str())
+    {
+        anyhow::bail!(
+            "refusing to admit fork build {version}: predecessor {:?} is not the admitted release-line head {head}",
+            predecessor
+        );
+    }
+
+    validate_transition_metadata(
+        version,
+        authority,
+        &git_hash,
+        &report.capabilities,
+        predecessor_admission.as_ref(),
+    )?;
+
+    let binary_sha256 = binary_sha256(&binary)?;
+    let source_fingerprint = source_fingerprint_for_binary(&binary)?;
+
+    // Version directories and their admission receipts are immutable. A
+    // repeated install is idempotent only when every identity field matches.
+    if let Some(existing) = read_build_admission(version)? {
+        require_admitted_fork_build(version)?;
+        if existing.git_hash == git_hash
+            && existing.authority == authority
+            && existing.binary_sha256 == binary_sha256
+            && existing.predecessor.as_deref() == predecessor
+            && existing.source_fingerprint == source_fingerprint
+            && existing.capabilities == report.capabilities
+        {
+            return Ok(existing);
+        }
+        anyhow::bail!(
+            "refusing to repin immutable fork build {version}: admission identity differs"
+        );
+    }
+
+    let admission = ForkBuildAdmission {
+        version: version.to_string(),
+        git_hash,
+        authority: authority.to_string(),
+        binary_sha256,
+        predecessor: predecessor.map(str::to_string),
+        source_fingerprint,
+        capabilities: report.capabilities,
+        admitted_at: Utc::now(),
+    };
+    storage::write_json(&build_admission_path(version)?, &admission)?;
+    Ok(admission)
+}
+
+pub fn require_admitted_fork_build(version: &str) -> Result<ForkBuildAdmission> {
+    require_admitted_fork_build_inner(version, &mut HashSet::new())
+}
+
+fn require_admitted_fork_build_inner(
+    version: &str,
+    seen: &mut HashSet<String>,
+) -> Result<ForkBuildAdmission> {
+    if !seen.insert(version.to_string()) {
+        anyhow::bail!("fork admission predecessor cycle includes {version}");
+    }
+    let admission = read_build_admission(version)?
+        .ok_or_else(|| anyhow::anyhow!("build {version} has no fork admission receipt"))?;
+    if admission.version != version {
+        anyhow::bail!(
+            "fork admission version mismatch: receipt says {}, requested {version}",
+            admission.version
+        );
+    }
+    if !canonical_authority(&admission.authority) {
+        anyhow::bail!(
+            "fork admission for {version} has untrusted authority {:?}",
+            admission.authority
+        );
+    }
+    if admission.binary_sha256.trim().is_empty() {
+        anyhow::bail!("fork admission for {version} omitted immutable binary identity");
+    }
+    let binary = version_binary_path(version)?;
+    if !binary.exists() {
+        anyhow::bail!("admitted fork build {version} is missing its binary");
+    }
+    let actual_sha256 = binary_sha256(&binary)?;
+    if actual_sha256 != admission.binary_sha256 {
+        anyhow::bail!(
+            "admitted fork build {version} binary identity changed: receipt {}, actual {}",
+            admission.binary_sha256,
+            actual_sha256
+        );
+    }
+    if source_fingerprint_for_binary(&binary)? != admission.source_fingerprint {
+        anyhow::bail!("admitted fork build {version} source identity changed");
+    }
+
+    let report = read_binary_version_report(&binary)?;
+    if let Some(expected) = release_version(version) {
+        let reported = report
+            .version
+            .as_deref()
+            .and_then(release_version)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "admitted fork build {version} no longer reports a parseable release version"
+                )
+            })?;
+        if reported != expected {
+            anyhow::bail!(
+                "admitted fork build {version} reports a different version {:?}",
+                report.version
+            );
+        }
+    }
+    if report.git_hash.as_deref().unwrap_or_default() != admission.git_hash {
+        anyhow::bail!(
+            "admitted fork build {version} git identity changed: receipt {}, binary {:?}",
+            admission.git_hash,
+            report.git_hash
+        );
+    }
+    if report.capabilities != admission.capabilities {
+        anyhow::bail!(
+            "admitted fork build {version} capability manifest changed: receipt {:?}, binary {:?}",
+            admission.capabilities,
+            report.capabilities
+        );
+    }
+
+    let missing = missing_capabilities(&admission.capabilities);
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "fork admission for {version} is missing required capabilities {}",
+            missing.join(", ")
+        );
+    }
+
+    if let Some(predecessor) = admission.predecessor.as_deref() {
+        let predecessor = require_admitted_fork_build_inner(predecessor, seen)?;
+        validate_transition_metadata(
+            version,
+            &admission.authority,
+            &admission.git_hash,
+            &admission.capabilities,
+            Some(&predecessor),
+        )?;
+    } else {
+        validate_transition_metadata(
+            version,
+            &admission.authority,
+            &admission.git_hash,
+            &admission.capabilities,
+            None,
+        )?;
+    }
+    Ok(admission)
+}
+
+pub fn admitted_predecessor(version: Option<String>) -> Result<Option<String>> {
+    let Some(version) = version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+    require_admitted_fork_build(&version).map_err(|error| {
+        anyhow::anyhow!(
+            "existing release-line head {version} is not an admitted fork build: {error}"
+        )
+    })?;
+    Ok(Some(version))
+}
+
+pub fn admitted_release_line_head() -> Result<Option<String>> {
+    for version in [
+        read_current_version()?,
+        read_shared_server_version()?,
+        read_stable_version()?,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let version = version.trim();
+        if !version.is_empty() {
+            // A configured channel without a valid receipt is not an empty
+            // release line. Treat it as corruption so admission cannot use it
+            // as an implicit escape hatch from ancestry checks.
+            require_admitted_fork_build(version)?;
+            return Ok(Some(version.to_string()));
+        }
+    }
+    Ok(None)
+}
 
 /// Manifest tracking build versions and their status
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -172,6 +570,12 @@ pub fn complete_pending_activation_for_session(session_id: &str) -> Result<Optio
         return Ok(None);
     }
 
+    require_admitted_fork_build(&pending.new_version).map_err(|error| {
+        anyhow::anyhow!(
+            "cannot mark pending activation {} as passed: build is not admitted: {error}",
+            pending.new_version
+        )
+    })?;
     manifest.canary = Some(pending.new_version.clone());
     manifest.canary_session = Some(session_id.to_string());
     manifest.canary_status = Some(CanaryStatus::Passed);
@@ -190,16 +594,62 @@ pub fn rollback_pending_activation_for_session(session_id: &str) -> Result<Optio
         return Ok(None);
     }
 
-    if let Some(previous) = pending.previous_current_version.as_deref() {
-        update_current_symlink(previous)?;
-        update_launcher_symlink_to_current()?;
+    let mut rollback_error = None;
+    for (channel, previous) in [
+        ("current", pending.previous_current_version.as_deref()),
+        (
+            "shared-server",
+            pending.previous_shared_server_version.as_deref(),
+        ),
+    ] {
+        if let Some(previous) = previous
+            && let Err(error) = require_admitted_fork_build(previous)
+        {
+            rollback_error = Some(anyhow::anyhow!(
+                "{channel} rollback target {previous} is not an admitted fork build: {error}"
+            ));
+            break;
+        }
     }
-    if let Some(previous) = pending.previous_shared_server_version.as_deref() {
-        update_shared_server_symlink(previous)?;
+
+    // Validate every rollback target before changing either channel. This keeps
+    // a malformed secondary target from leaving current restored while the
+    // shared-server channel remains on the failed activation.
+    if let Some(error) = rollback_error.as_ref() {
+        manifest.canary_status = Some(CanaryStatus::Failed);
+        manifest.pending_activation = None;
+        manifest.save()?;
+        anyhow::bail!(
+            "rollback of pending activation {} refused: {error}",
+            pending.new_version
+        );
+    }
+
+    if let Some(previous) = pending.previous_current_version.as_deref() {
+        match update_current_to_admitted_fork_build(previous) {
+            Ok(_) => {
+                if let Err(error) = update_launcher_symlink_to_current() {
+                    rollback_error = Some(error);
+                }
+            }
+            Err(error) => rollback_error = Some(error),
+        }
+    }
+    if let Some(previous) = pending.previous_shared_server_version.as_deref()
+        && let Err(error) = update_shared_server_to_admitted_fork_build(previous)
+        && rollback_error.is_none()
+    {
+        rollback_error = Some(error);
     }
     manifest.canary_status = Some(CanaryStatus::Failed);
     manifest.pending_activation = None;
     manifest.save()?;
+    if let Some(error) = rollback_error {
+        anyhow::bail!(
+            "rollback of pending activation {} refused because the target was not an admitted fork build: {error}",
+            pending.new_version
+        );
+    }
     Ok(Some(pending.new_version))
 }
 
@@ -214,9 +664,19 @@ pub fn install_binary_at_version(source: &std::path::Path, version: &str) -> Res
 
     let dest = dest_dir.join(binary_name());
 
-    // Remove existing file first to avoid ETXTBSY when replacing a running binary.
+    // Version paths are immutable. Re-installing the exact same bytes is
+    // idempotent, but replacing a version with a different source would let a
+    // stale admission receipt authorize a different build.
     if dest.exists() {
-        std::fs::remove_file(&dest)?;
+        let existing_sha256 = binary_sha256(&dest)?;
+        let source_sha256 = binary_sha256(source)?;
+        if existing_sha256 == source_sha256 {
+            return Ok(dest);
+        }
+        anyhow::bail!(
+            "refusing to replace immutable build {} with different binary identity",
+            version
+        );
     }
 
     // Prefer hard link (instant, zero I/O) over copy (71MB+ binary).
@@ -656,24 +1116,39 @@ fn update_channel_symlink(channel: &str, version: &str) -> Result<PathBuf> {
 
 /// Update stable symlink to point to a version and publish stable-version marker.
 pub fn update_stable_symlink(version: &str) -> Result<PathBuf> {
+    require_admitted_fork_build(version)?;
     let stable_link = update_channel_symlink("stable", version)?;
     std::fs::write(stable_version_file()?, version)?;
     Ok(stable_link)
 }
 
+pub fn update_stable_to_admitted_fork_build(version: &str) -> Result<PathBuf> {
+    update_stable_symlink(version)
+}
+
 /// Update current symlink to point to a version and publish current-version marker.
 pub fn update_current_symlink(version: &str) -> Result<PathBuf> {
+    require_admitted_fork_build(version)?;
     let current_link = update_channel_symlink("current", version)?;
     std::fs::write(current_version_file()?, version)?;
     Ok(current_link)
 }
 
+pub fn update_current_to_admitted_fork_build(version: &str) -> Result<PathBuf> {
+    update_current_symlink(version)
+}
+
 /// Update the shared server symlink to point to a version and publish the
 /// shared-server-version marker.
 pub fn update_shared_server_symlink(version: &str) -> Result<PathBuf> {
+    require_admitted_fork_build(version)?;
     let shared_link = update_channel_symlink("shared-server", version)?;
     std::fs::write(shared_server_version_file()?, version)?;
     Ok(shared_link)
+}
+
+pub fn update_shared_server_to_admitted_fork_build(version: &str) -> Result<PathBuf> {
+    update_shared_server_symlink(version)
 }
 
 pub fn publish_local_current_build_for_source(
@@ -702,7 +1177,17 @@ pub fn publish_local_current_build_for_source(
         );
     }
     validate_binary_version_matches_source_report(&installed_report, &versioned_path, source)?;
-    let current_link = update_current_symlink(&source.version_label)?;
+    write_immutable_source_metadata(&versioned_path, source)?;
+    let predecessor = admitted_release_line_head()?;
+    admit_installed_fork_build(
+        &source.version_label,
+        &format!(
+            "local-fork:{CANONICAL_FORK_REPOSITORY}:{}",
+            source.repo_scope
+        ),
+        predecessor.as_deref(),
+    )?;
+    let current_link = update_current_to_admitted_fork_build(&source.version_label)?;
     let launcher_link = update_launcher_symlink_to_current()?;
 
     Ok(PublishedBuild {
@@ -725,7 +1210,7 @@ pub fn publish_local_current_build(repo_dir: &std::path::Path) -> Result<PathBuf
 /// Promote an already installed immutable version onto the shared server channel.
 pub fn promote_version_to_shared_server(version: &str) -> Result<Option<String>> {
     let previous = read_shared_server_version()?;
-    update_shared_server_symlink(version)?;
+    update_shared_server_to_admitted_fork_build(version)?;
     Ok(previous)
 }
 
@@ -787,7 +1272,8 @@ pub fn current_tracks_stable() -> Result<bool> {
 /// marker, otherwise the pre-update comparison would always disagree.
 pub fn advance_current_if_tracking_stable(version: &str) -> Result<bool> {
     if current_tracks_stable()? {
-        update_current_symlink(version)?;
+        validate_existing_channel_marker(read_current_version()?, "current")?;
+        update_current_to_admitted_fork_build(version)?;
         update_launcher_symlink_to_current()?;
         Ok(true)
     } else {
@@ -803,11 +1289,28 @@ pub fn advance_current_if_tracking_stable(version: &str) -> Result<bool> {
 /// marker, otherwise the pre-update comparison would always disagree.
 pub fn advance_shared_server_if_tracking_stable(version: &str) -> Result<bool> {
     if shared_server_tracks_stable()? {
-        update_shared_server_symlink(version)?;
+        validate_existing_channel_marker(read_shared_server_version()?, "shared-server")?;
+        update_shared_server_to_admitted_fork_build(version)?;
         Ok(true)
     } else {
         Ok(false)
     }
+}
+
+fn validate_existing_channel_marker(marker: Option<String>, channel: &str) -> Result<()> {
+    let Some(version) = marker
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    require_admitted_fork_build(version).map_err(|error| {
+        anyhow::anyhow!(
+            "refusing to advance {channel} channel from inadmissible build {version}: {error}"
+        )
+    })?;
+    Ok(())
 }
 
 /// Outcome of [`repair_stale_shared_server_channel`].
@@ -855,6 +1358,9 @@ pub fn repair_stale_shared_server_channel() -> Result<SharedServerRepair> {
     if !stable_binary.exists() {
         return Ok(SharedServerRepair::AlreadyCurrent);
     }
+    if require_admitted_fork_build(stable_version).is_err() {
+        return Ok(SharedServerRepair::AlreadyCurrent);
+    }
 
     // If shared-server already resolves to the same version marker, there is
     // nothing to repair.
@@ -870,6 +1376,17 @@ pub fn repair_stale_shared_server_channel() -> Result<SharedServerRepair> {
     {
         return Ok(SharedServerRepair::AlreadyCurrent);
     }
+    if previous
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|previous| require_admitted_fork_build(previous).is_err())
+    {
+        // An unverifiable pin is never a repair target. Replacing it with
+        // stable would turn repair into an admission bypass and could silently
+        // discard an operator's emergency recovery build.
+        return Ok(SharedServerRepair::AlreadyCurrent);
+    }
 
     // Only repair when stable is strictly newer than the current shared-server
     // binary on disk. This never downgrades, and it preserves a self-dev pin
@@ -879,7 +1396,7 @@ pub fn repair_stale_shared_server_channel() -> Result<SharedServerRepair> {
         return Ok(SharedServerRepair::AlreadyCurrent);
     }
 
-    update_shared_server_symlink(stable_version)?;
+    update_shared_server_to_admitted_fork_build(stable_version)?;
     Ok(SharedServerRepair::Repaired {
         previous: previous
             .as_deref()
@@ -942,9 +1459,15 @@ pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
     let version = repo_build_version(repo_dir)?;
 
     let versioned = install_binary_at_version(&source, &version)?;
-    update_stable_symlink(&version)?;
-    update_current_symlink(&version)?;
-    update_shared_server_symlink(&version)?;
+    let predecessor = admitted_release_line_head()?;
+    admit_installed_fork_build(
+        &version,
+        &format!("local-fork:{CANONICAL_FORK_REPOSITORY}:release"),
+        predecessor.as_deref(),
+    )?;
+    update_stable_to_admitted_fork_build(&version)?;
+    update_current_to_admitted_fork_build(&version)?;
+    update_shared_server_to_admitted_fork_build(&version)?;
     update_launcher_symlink_to_current()?;
 
     Ok(versioned)
@@ -958,6 +1481,7 @@ pub fn install_version(repo_dir: &std::path::Path, hash: &str) -> Result<PathBuf
 
 /// Update canary symlink to point to a version
 pub fn update_canary_symlink(hash: &str) -> Result<()> {
+    require_admitted_fork_build(hash)?;
     let _ = update_channel_symlink("canary", hash)?;
     Ok(())
 }

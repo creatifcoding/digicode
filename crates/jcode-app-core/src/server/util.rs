@@ -100,7 +100,12 @@ pub(crate) fn server_update_candidate(is_selfdev_session: bool) -> Option<(PathB
 /// build whenever that build is the freshest one on disk (the case the pin is
 /// meant to protect).
 pub(crate) fn reload_exec_target(is_selfdev_session: bool) -> Option<(PathBuf, &'static str)> {
-    let candidate = newest_reload_candidate(is_selfdev_session)?;
+    let current_exe = std::env::current_exe().ok().map(strip_deleted_suffix);
+    let candidate = newest_reload_candidate(is_selfdev_session).or_else(|| {
+        current_exe
+            .clone()
+            .map(|path| (path, "current-exe (emergency recovery)"))
+    })?;
     // On Linux a self-dev rebuild rewrites the running binary in place (a dirty
     // build reuses the same `versions/<hash>` path), which unlinks the running
     // inode. `current_exe()` then resolves `/proc/self/exe` to a path with a
@@ -110,8 +115,6 @@ pub(crate) fn reload_exec_target(is_selfdev_session: bool) -> Option<(PathBuf, &
     // re-execing the bogus " (deleted)" path, which does not exist -> the server
     // exits without a replacement and strands every connected client. Strip the
     // marker so we compare against (and can re-exec) the real on-disk path.
-    let current_exe = std::env::current_exe().ok().map(strip_deleted_suffix);
-
     // Identity/mtime comparisons must look through release wrapper scripts to
     // the payload that actually runs (see `build::resolve_binary_payload`):
     // the running exe is the `.bin` payload while channel candidates are tiny

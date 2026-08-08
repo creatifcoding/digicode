@@ -319,7 +319,7 @@ impl SelfDevTool {
         manifest.save()?;
 
         if !SelfDevTool::is_test_session()
-            && let Err(error) = build::update_shared_server_symlink(&hash)
+            && let Err(error) = build::update_shared_server_to_admitted_fork_build(&hash)
         {
             let _ = build::rollback_pending_activation_for_session(session_id);
             return Err(error);

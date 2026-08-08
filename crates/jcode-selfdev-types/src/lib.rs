@@ -58,6 +58,8 @@ impl SelfDevBuildTarget {
 pub struct BinaryVersionReport {
     pub version: Option<String>,
     pub git_hash: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// Which binary to use.

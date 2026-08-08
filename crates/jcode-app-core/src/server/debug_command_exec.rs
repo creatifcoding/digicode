@@ -607,7 +607,7 @@ pub(super) async fn execute_debug_command(
         let hash = source.version_label.clone();
         let published = crate::build::publish_local_current_build_for_source(&repo_dir, &source)?;
         crate::build::smoke_test_server_binary(&published.versioned_path)?;
-        crate::build::update_shared_server_symlink(&hash)?;
+        crate::build::update_shared_server_to_admitted_fork_build(&hash)?;
         crate::build::update_canary_symlink(&hash)?;
 
         let mut manifest = crate::build::BuildManifest::load()?;

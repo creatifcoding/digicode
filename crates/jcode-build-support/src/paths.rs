@@ -157,10 +157,22 @@ fn newest_existing_binary(
         .max_by_key(|(path, _)| binary_mtime(path))
 }
 
-fn existing_binary(path: Result<PathBuf>, label: &'static str) -> Option<(PathBuf, &'static str)> {
-    path.ok()
-        .filter(|path| path.exists())
-        .map(|path| (path, label))
+/// Return an installed channel candidate only when its immutable version
+/// directory carries a valid fork admission receipt. The final
+/// `current_exe()` fallbacks below intentionally remain available for
+/// emergency process recovery, but they never repin a channel.
+fn existing_admitted_binary(
+    path: Result<PathBuf>,
+    label: &'static str,
+) -> Option<(PathBuf, &'static str)> {
+    let path = path.ok().filter(|path| path.exists())?;
+    let canonical = resolve_binary_payload(&path);
+    let version = canonical
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())?;
+    super::require_admitted_fork_build(version).ok()?;
+    Some((path, label))
 }
 
 pub fn selfdev_build_command(repo_dir: &Path) -> SelfDevBuildCommand {
@@ -395,14 +407,49 @@ fn update_launcher_symlink(target: &Path) -> Result<PathBuf> {
 
 /// Update launcher path to point at the current channel binary.
 pub fn update_launcher_symlink_to_current() -> Result<PathBuf> {
+    let current_version = read_current_version()?
+        .and_then(|version| {
+            let version = version.trim().to_string();
+            (!version.is_empty()).then_some(version)
+        })
+        .ok_or_else(|| anyhow::anyhow!("current channel has no version marker"))?;
+    super::require_admitted_fork_build(&current_version)?;
     let current = current_binary_path()?;
+    validate_channel_binary_version(&current, &current_version, "current")?;
     update_launcher_symlink(&current)
 }
 
 /// Update launcher path to point at the stable channel binary.
 pub fn update_launcher_symlink_to_stable() -> Result<PathBuf> {
+    let stable_version = read_stable_version()?
+        .and_then(|version| {
+            let version = version.trim().to_string();
+            (!version.is_empty()).then_some(version)
+        })
+        .ok_or_else(|| anyhow::anyhow!("stable channel has no version marker"))?;
+    super::require_admitted_fork_build(&stable_version)?;
     let stable = stable_binary_path()?;
+    validate_channel_binary_version(&stable, &stable_version, "stable")?;
     update_launcher_symlink(&stable)
+}
+
+fn validate_channel_binary_version(
+    binary: &Path,
+    expected_version: &str,
+    channel: &str,
+) -> Result<()> {
+    let resolved = resolve_binary_payload(binary);
+    let actual_version = resolved
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{channel} channel target has no version directory"))?;
+    if actual_version != expected_version {
+        anyhow::bail!(
+            "{channel} channel marker {expected_version} does not match target version {actual_version}"
+        );
+    }
+    Ok(())
 }
 
 /// Resolve which client binary should be considered for launches, updates, and reloads.
@@ -415,27 +462,21 @@ pub fn update_launcher_symlink_to_stable() -> Result<PathBuf> {
 /// - Then stable channel path
 /// - Finally currently running executable
 pub fn client_update_candidate(is_selfdev_session: bool) -> Option<(PathBuf, &'static str)> {
-    if let Some(current) = existing_binary(current_binary_path(), "current") {
+    if let Some(current) = existing_admitted_binary(current_binary_path(), "current") {
         return Some(current);
     }
 
-    if is_selfdev_session {
-        if let Some(repo_dir) = get_repo_dir()
-            && let Some(dev) = find_dev_binary(&repo_dir)
-            && dev.exists()
-        {
-            return Some((dev, "dev"));
-        }
-        if let Some(canary) = existing_binary(canary_binary_path(), "canary") {
-            return Some(canary);
-        }
+    if is_selfdev_session
+        && let Some(canary) = existing_admitted_binary(canary_binary_path(), "canary")
+    {
+        return Some(canary);
     }
 
-    if let Some(launcher) = existing_binary(launcher_binary_path(), "launcher") {
+    if let Some(launcher) = existing_admitted_binary(launcher_binary_path(), "launcher") {
         return Some(launcher);
     }
 
-    if let Some(stable) = existing_binary(stable_binary_path(), "stable") {
+    if let Some(stable) = existing_admitted_binary(stable_binary_path(), "stable") {
         return Some(stable);
     }
 
@@ -449,7 +490,7 @@ pub fn client_update_candidate(is_selfdev_session: bool) -> Option<(PathBuf, &'s
 /// shared-server channel (or stable as fallback), so local dirty self-dev builds
 /// stop taking out every client by accident.
 pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathBuf, &'static str)> {
-    let shared_server = existing_binary(shared_server_binary_path(), "shared-server");
+    let shared_server = existing_admitted_binary(shared_server_binary_path(), "shared-server");
     if is_selfdev_session {
         if let Some(shared_server) = shared_server {
             return Some(shared_server);
@@ -460,7 +501,7 @@ pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathB
         return Some(shared_server);
     }
 
-    if let Some(stable) = existing_binary(stable_binary_path(), "stable") {
+    if let Some(stable) = existing_admitted_binary(stable_binary_path(), "stable") {
         return Some(stable);
     }
 
@@ -476,13 +517,18 @@ fn shared_server_channel_is_current_enough() -> bool {
     else {
         return false;
     };
+    if super::require_admitted_fork_build(shared).is_err() {
+        return false;
+    }
 
     let stable = read_stable_version().ok().flatten();
     if stable
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some_and(|stable| stable == shared)
+        .is_some_and(|stable| {
+            stable == shared && super::require_admitted_fork_build(stable).is_ok()
+        })
     {
         return true;
     }
@@ -492,7 +538,9 @@ fn shared_server_channel_is_current_enough() -> bool {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some_and(|current| current == shared)
+        .is_some_and(|current| {
+            current == shared && super::require_admitted_fork_build(current).is_ok()
+        })
 }
 
 fn normalize_version_marker(value: &str) -> String {
@@ -543,13 +591,19 @@ pub fn preferred_reload_candidate(is_selfdev_session: bool) -> Option<(PathBuf, 
 
     let repo_binary = get_repo_dir().and_then(|repo_dir| {
         if is_selfdev_session {
-            newest_existing_binary(vec![
-                (selfdev_binary_path(&repo_dir), "repo-selfdev"),
-                (release_binary_path(&repo_dir), "repo-release"),
-            ])
+            newest_existing_binary(vec![(selfdev_binary_path(&repo_dir), "repo-selfdev")])
         } else {
             newest_existing_binary(vec![(release_binary_path(&repo_dir), "repo-release")])
         }
+    });
+
+    let repo_binary = repo_binary.filter(|(path, _)| {
+        let canonical = resolve_binary_payload(path);
+        canonical
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .is_some_and(|version| super::require_admitted_fork_build(version).is_ok())
     });
 
     let repo_is_newer = |repo: &Path, current: &Path| {

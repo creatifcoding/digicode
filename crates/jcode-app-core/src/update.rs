@@ -26,7 +26,8 @@ use update_metadata::{record_release_update_duration, record_source_update_durat
 pub use update_rate_limit::{RATE_LIMIT_ERROR_PREFIX, is_rate_limit_error};
 use update_rate_limit::{clear_rate_limit_backoff, rate_limit_error};
 
-const GITHUB_REPO: &str = "1jehuang/jcode";
+const GITHUB_REPO: &str = build::CANONICAL_FORK_REPOSITORY;
+const UPSTREAM_SOURCE_REPO: &str = build::UPSTREAM_SOURCE_REPOSITORY;
 /// Minimum gap between *automatic* update checks.
 ///
 /// Every automatic check costs one or two unauthenticated `api.github.com`
@@ -188,8 +189,34 @@ pub fn fetch_latest_release_blocking() -> Result<GitHubRelease> {
     }
 
     let release: GitHubRelease = response.json().context("Failed to parse release info")?;
+    validate_canonical_release_metadata(&release)?;
     clear_rate_limit_backoff();
     Ok(release)
+}
+
+fn validate_canonical_release_metadata(release: &GitHubRelease) -> Result<()> {
+    let release_prefix = format!("https://github.com/{GITHUB_REPO}/releases/");
+    if !release._html_url.starts_with(&release_prefix) {
+        anyhow::bail!(
+            "refusing release {} from non-canonical repository URL {}",
+            release.tag_name,
+            release._html_url
+        );
+    }
+
+    let download_prefix = format!("https://github.com/{GITHUB_REPO}/releases/download/");
+    if release
+        .assets
+        .iter()
+        .any(|asset| !asset.browser_download_url.starts_with(&download_prefix))
+    {
+        anyhow::bail!(
+            "refusing release {} with an asset outside canonical repository {}",
+            release.tag_name,
+            GITHUB_REPO
+        );
+    }
+    Ok(())
 }
 
 fn github_api_request(
@@ -213,7 +240,10 @@ fn github_api_request(
 }
 
 fn latest_main_sha_blocking() -> Result<String> {
-    let url = format!("https://api.github.com/repos/{}/commits/main", GITHUB_REPO);
+    let url = format!(
+        "https://api.github.com/repos/{}/commits/main",
+        UPSTREAM_SOURCE_REPO
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(UPDATE_CHECK_TIMEOUT)
         .user_agent("jcode-updater")
@@ -282,7 +312,10 @@ fn synthetic_main_release(latest_sha: &str) -> GitHubRelease {
     GitHubRelease {
         tag_name: format!("main-{}", latest_sha),
         _name: Some(format!("Built from main ({})", latest_sha)),
-        _html_url: format!("https://github.com/{}/commit/{}", GITHUB_REPO, latest_sha),
+        _html_url: format!(
+            "https://github.com/{}/commit/{}",
+            UPSTREAM_SOURCE_REPO, latest_sha
+        ),
         _published_at: None,
         assets: vec![],
         _target_commitish: latest_sha.to_string(),
@@ -300,6 +333,12 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
     let channel_version = format!("main-{}", latest_sha);
     build::install_binary_at_version(&path, &channel_version)
         .context("Failed to install built binary")?;
+    let predecessor = build::admitted_release_line_head()?;
+    build::admit_installed_fork_build(
+        &channel_version,
+        &format!("local-fork:{GITHUB_REPO}:source-intake"),
+        predecessor.as_deref(),
+    )?;
     // Carry the long-lived daemon's reload target forward too, but only when it
     // was tracking stable. A deliberately-promoted self-dev shared-server build
     // is left untouched so the update never silently wipes it out.
@@ -323,7 +362,7 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
             channel_version, error
         )),
     }
-    build::update_stable_symlink(&channel_version)?;
+    build::update_stable_to_admitted_fork_build(&channel_version)?;
 
     metadata.installed_version = Some(channel_version.clone());
     metadata.installed_from = Some("source".to_string());
@@ -681,8 +720,9 @@ fn build_from_source() -> Result<PathBuf> {
     if repo_dir.join(".git").exists() {
         // Pull latest
         crate::logging::info("Main channel: pulling latest from main...");
+        let upstream_url = format!("https://github.com/{UPSTREAM_SOURCE_REPO}.git");
         let output = std::process::Command::new("git")
-            .args(["pull", "--ff-only", "origin", "main"])
+            .args(["pull", "--ff-only", &upstream_url, "main"])
             .current_dir(&repo_dir)
             .output()
             .context("Failed to run git pull")?;
@@ -692,7 +732,7 @@ fn build_from_source() -> Result<PathBuf> {
             let summary = summarize_git_pull_failure(&output.stderr);
             crate::logging::warn(&format!("{}, trying reset", summary));
             let output = std::process::Command::new("git")
-                .args(["fetch", "origin", "main"])
+                .args(["fetch", &upstream_url, "main"])
                 .current_dir(&repo_dir)
                 .output()
                 .context("Failed to run git fetch")?;
@@ -703,7 +743,7 @@ fn build_from_source() -> Result<PathBuf> {
                 );
             }
             let output = std::process::Command::new("git")
-                .args(["reset", "--hard", "origin/main"])
+                .args(["reset", "--hard", "FETCH_HEAD"])
                 .current_dir(&repo_dir)
                 .output()
                 .context("Failed to run git reset")?;
@@ -717,7 +757,7 @@ fn build_from_source() -> Result<PathBuf> {
     } else {
         // Clone
         crate::logging::info("Main channel: cloning repository...");
-        let clone_url = format!("https://github.com/{}.git", GITHUB_REPO);
+        let clone_url = format!("https://github.com/{UPSTREAM_SOURCE_REPO}.git");
         let output = std::process::Command::new("git")
             .args([
                 "clone", "--depth", "1", "--branch", "main", &clone_url, "jcode",
@@ -953,6 +993,7 @@ pub fn download_and_install_blocking_with_progress(
     release: &GitHubRelease,
     mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<PathBuf> {
+    validate_canonical_release_metadata(release)?;
     let started = Instant::now();
     let asset_name = get_asset_name();
     let asset = release
@@ -1043,10 +1084,22 @@ pub fn download_and_install_blocking_with_progress(
             };
             let dest = dest_dir.join(dest_name);
             if dest.exists() {
-                fs::remove_file(&dest)?;
+                let existing = fs::read(&dest).with_context(|| {
+                    format!("Failed to read immutable install {}", dest.display())
+                })?;
+                let incoming = fs::read(entry.path()).with_context(|| {
+                    format!("Failed to read downloaded {}", entry.path().display())
+                })?;
+                if existing != incoming {
+                    anyhow::bail!(
+                        "refusing to replace immutable release file {} with different bytes",
+                        dest.display()
+                    );
+                }
+            } else {
+                fs::copy(entry.path(), &dest)
+                    .with_context(|| format!("Failed to install {}", dest.display()))?;
             }
-            fs::copy(entry.path(), &dest)
-                .with_context(|| format!("Failed to install {}", dest.display()))?;
             if dest
                 .file_name()
                 .is_some_and(|name| name == build::binary_name())
@@ -1083,6 +1136,12 @@ pub fn download_and_install_blocking_with_progress(
         let _ = fs::remove_file(&temp_path);
         versioned_path
     };
+    let predecessor = build::admitted_release_line_head()?;
+    build::admit_installed_fork_build(
+        version,
+        &format!("github:{GITHUB_REPO}:release"),
+        predecessor.as_deref(),
+    )?;
     if let Err(error) = build::advance_shared_server_if_tracking_stable(version) {
         crate::logging::warn(&format!(
             "update: failed to advance shared-server channel to {}: {}",
@@ -1103,7 +1162,7 @@ pub fn download_and_install_blocking_with_progress(
             version, error
         )),
     }
-    build::update_stable_symlink(version)?;
+    build::update_stable_to_admitted_fork_build(version)?;
 
     metadata.installed_version = Some(release.tag_name.clone());
     metadata.installed_from = Some(asset.browser_download_url.clone());
@@ -1239,6 +1298,48 @@ mod tests {
     fn test_asset_name() {
         let name = get_asset_name();
         assert!(name.starts_with("jcode-"));
+    }
+
+    fn release_metadata(html_url: &str, asset_url: &str) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: "0.69.0".to_string(),
+            _name: None,
+            _html_url: html_url.to_string(),
+            _published_at: None,
+            assets: vec![GitHubAsset {
+                name: "jcode-linux-x86_64.tar.gz".to_string(),
+                browser_download_url: asset_url.to_string(),
+                _size: 1,
+            }],
+            _target_commitish: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_release_metadata_must_be_from_canonical_fork() {
+        let canonical = release_metadata(
+            &format!("https://github.com/{GITHUB_REPO}/releases/tag/v0.69.0"),
+            &format!(
+                "https://github.com/{GITHUB_REPO}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
+            ),
+        );
+        validate_canonical_release_metadata(&canonical).expect("canonical release should pass");
+
+        let upstream = release_metadata(
+            &format!("https://github.com/{UPSTREAM_SOURCE_REPO}/releases/tag/v0.69.0"),
+            &format!(
+                "https://github.com/{UPSTREAM_SOURCE_REPO}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
+            ),
+        );
+        assert!(validate_canonical_release_metadata(&upstream).is_err());
+
+        let mixed = release_metadata(
+            &format!("https://github.com/{GITHUB_REPO}/releases/tag/v0.69.0"),
+            &format!(
+                "https://github.com/{UPSTREAM_SOURCE_REPO}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
+            ),
+        );
+        assert!(validate_canonical_release_metadata(&mixed).is_err());
     }
 
     #[test]
