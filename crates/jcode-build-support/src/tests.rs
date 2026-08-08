@@ -924,6 +924,7 @@ fn legacy_fork_bootstrap_requires_one_consistent_ancestor_build() {
         std::fs::write(repo.path().join("current.txt"), "current\n").expect("write current source");
         source_fixture_git(repo.path(), &["add", "current.txt"]);
         source_fixture_git(repo.path(), &["commit", "-m", "current fork head"]);
+        let current_commit = source_fixture_git(repo.path(), &["rev-parse", "HEAD"]);
 
         let version = &legacy_commit[..9];
         write_report_binary(version, version, &["mt", "tasker"]);
@@ -945,13 +946,30 @@ fn legacy_fork_bootstrap_requires_one_consistent_ancestor_build() {
         );
         assert!(bootstrap_legacy_fork_build(repo.path()).unwrap().is_none());
 
-        std::fs::write(stable_version_file().expect("stable marker"), "conflicting")
-            .expect("write conflicting stable marker");
         std::fs::remove_file(build_admission_path(version).expect("receipt path"))
-            .expect("remove receipt for conflict check");
+            .expect("remove receipt for repin check");
+        std::fs::write(
+            stable_version_file().expect("stable marker"),
+            "external-release",
+        )
+        .expect("write ineligible repin marker");
+        let recovered = bootstrap_legacy_fork_build(repo.path())
+            .expect("recover from ineligible external repin")
+            .expect("one maintained-fork build remains eligible");
+        assert_eq!(recovered.version, version);
+
+        std::fs::remove_file(build_admission_path(version).expect("receipt path"))
+            .expect("remove receipt for ambiguity check");
+        let current_version = &current_commit[..9];
+        write_report_binary(current_version, current_version, &["mt", "tasker"]);
+        std::fs::write(
+            stable_version_file().expect("stable marker"),
+            current_version,
+        )
+        .expect("write second eligible marker");
         let error = bootstrap_legacy_fork_build(repo.path())
-            .expect_err("conflicting legacy channels must fail closed");
-        assert!(error.to_string().contains("configured channels disagree"));
+            .expect_err("multiple eligible legacy builds must fail closed");
+        assert!(error.to_string().contains("found 2"));
     });
 }
 

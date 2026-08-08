@@ -763,9 +763,11 @@ fn any_fork_admission_receipt_exists() -> Result<bool> {
 ///
 /// This is intentionally a one-time migration, not a general caller-selected
 /// admission path. It runs only before any admission receipt exists, requires
-/// every configured release-line channel to agree on one installed version,
-/// proves that binary's reported commit is an ancestor of the current clean
-/// canonical-fork checkout, and preserves the normal capability checks.
+/// exactly one configured installed version to prove canonical-fork ancestry
+/// and required capabilities against the current clean checkout. This permits
+/// recovery when an external updater has repinned some channels to an
+/// ineligible upstream release, while zero or multiple eligible builds remain
+/// fail-closed.
 pub fn bootstrap_legacy_fork_build(repo_dir: &Path) -> Result<Option<ForkBuildAdmission>> {
     if any_fork_admission_receipt_exists()? {
         return Ok(None);
@@ -785,60 +787,67 @@ pub fn bootstrap_legacy_fork_build(repo_dir: &Path) -> Result<Option<ForkBuildAd
     if configured.is_empty() {
         return Ok(None);
     }
-    if configured.len() != 1 {
-        anyhow::bail!(
-            "refusing legacy fork bootstrap: configured channels disagree: {}",
-            configured.into_iter().collect::<Vec<_>>().join(", ")
-        );
-    }
-    let version = configured
-        .into_iter()
-        .next()
-        .expect("one configured version");
-
     canonical_fork_remote(repo_dir)?;
     let source = current_source_state(repo_dir)?;
     if source.dirty {
         anyhow::bail!("refusing legacy fork bootstrap from a dirty source checkout");
     }
 
-    let binary = version_binary_path(&version)?;
-    if !binary.exists() {
-        anyhow::bail!(
-            "refusing legacy fork bootstrap: configured binary {} is missing",
-            binary.display()
-        );
-    }
-    let report = read_binary_version_report(&binary)?;
-    let reported_hash = report.git_hash.unwrap_or_default();
-    if !is_hex_commit(&reported_hash) {
-        anyhow::bail!("refusing legacy fork bootstrap: binary omitted a valid git hash");
-    }
-    let commit = git_output(
-        repo_dir,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            "--end-of-options",
-            &format!("{reported_hash}^{{commit}}"),
-        ],
-    )?;
-    if !git_is_ancestor(repo_dir, &commit, &source.full_hash)? {
-        anyhow::bail!(
-            "refusing legacy fork bootstrap: binary commit {commit} is not an ancestor of maintained fork head {}",
-            source.full_hash
-        );
-    }
-
     let authority = format!("local-fork:{CANONICAL_FORK_REPOSITORY}:legacy-bootstrap");
-    validate_transition_metadata(
-        &version,
-        &authority,
-        &reported_hash,
-        &report.capabilities,
-        None,
-    )?;
+    let mut configured = configured.into_iter().collect::<Vec<_>>();
+    configured.sort();
+    let mut eligible = Vec::new();
+    let mut rejected = Vec::new();
+    for version in configured {
+        let candidate = (|| -> Result<_> {
+            let binary = version_binary_path(&version)?;
+            if !binary.exists() {
+                anyhow::bail!("configured binary {} is missing", binary.display());
+            }
+            let report = read_binary_version_report(&binary)?;
+            let reported_hash = report.git_hash.clone().unwrap_or_default();
+            if !is_hex_commit(&reported_hash) {
+                anyhow::bail!("binary omitted a valid git hash");
+            }
+            let commit = git_output(
+                repo_dir,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "--end-of-options",
+                    &format!("{reported_hash}^{{commit}}"),
+                ],
+            )?;
+            if !git_is_ancestor(repo_dir, &commit, &source.full_hash)? {
+                anyhow::bail!(
+                    "binary commit {commit} is not an ancestor of maintained fork head {}",
+                    source.full_hash
+                );
+            }
+            validate_transition_metadata(
+                &version,
+                &authority,
+                &reported_hash,
+                &report.capabilities,
+                None,
+            )?;
+            Ok((version.clone(), binary, report, reported_hash))
+        })();
+        match candidate {
+            Ok(candidate) => eligible.push(candidate),
+            Err(error) => rejected.push(format!("{version}: {error:#}")),
+        }
+    }
+    if eligible.len() != 1 {
+        anyhow::bail!(
+            "refusing legacy fork bootstrap: expected exactly one eligible configured build, found {}; rejected: {}",
+            eligible.len(),
+            rejected.join(" | ")
+        );
+    }
+    let (version, binary, report, reported_hash) =
+        eligible.pop().expect("one eligible configured build");
     let admission = ForkBuildAdmission {
         version: version.clone(),
         git_hash: reported_hash,
