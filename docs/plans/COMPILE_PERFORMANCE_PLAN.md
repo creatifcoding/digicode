@@ -839,6 +839,43 @@ scripts/clean_target.sh --apply --aggressive   # also cargo-clean stale profiles
   script. Dry-runs verified it correctly SKIPs profiles with recent writes / active
   rustc while a parallel agent was building on `debug`/`selfdev`.
 
+### System-wide Rust cache bound (`scripts/rust_cache_gc.py`)
+
+Repository-local cleanup was insufficient once agents began creating isolated
+worktrees and explicit `CARGO_TARGET_DIR` roots under `~/.jcode/scratch`: those
+targets survived the source checkout and accumulated independently. The system
+collector treats Cargo outputs as a bounded regenerable cache across configured
+workspace roots.
+
+- It recognizes Cargo target roots by Cargo markers or standard profile lock/deps
+  structure, including arbitrary explicit `CARGO_TARGET_DIR` names. It explicitly
+  excludes `.cargo`, `.rustup`, `.git`, `builds`, and `node_modules`; published Jcode
+  binaries are not cache.
+- It reads active Cargo/rustc processes and their working directories, and refuses
+  to remove an active target or one written within the recent activity window.
+- It preserves at least 100 GiB or 15% filesystem free space, whichever is larger,
+  and bounds discovered target storage to 80 GiB. Scratch targets are reclaimed
+  before ordinary repository targets.
+- `scripts/dev_cargo.sh` invokes the collector only when free space is already below
+  the reserve. A per-user systemd timer performs routine collection every two hours
+  so bare Cargo commands and non-Jcode Rust repositories receive the same policy.
+
+```bash
+# Inspect without deleting
+scripts/rust_cache_gc.py --json
+
+# Install the user-wide collector and persistent timer
+scripts/install_rust_cache_gc.sh
+
+# Add any additional workspace root
+printf '%s\n' "$HOME/another-rust-root" >> ~/.config/jcode/rust-cache-roots
+```
+
+Policy overrides are explicit: `JCODE_RUST_CACHE_MIN_FREE_GIB`,
+`JCODE_RUST_CACHE_MIN_FREE_PERCENT`, `JCODE_RUST_CACHE_ROOTS`, and
+`JCODE_RUST_CACHE_GC=off` for the Cargo preflight. Deletion still requires
+`--apply`; dry-run remains the collector's command-line default.
+
 ### Memory-adaptive cargo job count
 
 The biggest day-to-day pain on the 8-core/15 GiB dev machine was **memory

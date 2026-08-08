@@ -1,6 +1,6 @@
 [package]
 name = "jcode"
-version = "0.68.1"
+version = "0.71.2"
 description = "Possibly the greatest coding agent ever built — blazing-fast TUI, multi-model, swarm coordination, 30+ tools"
 edition = "2024"
 autobins = false
@@ -33,6 +33,7 @@ members = [
     "crates/jcode-fuzzy",
     "crates/jcode-harness-api",
     "crates/jcode-harness-api-server",
+    "crates/jcode-sdk",
     "crates/jcode-desktop2",
     "crates/jcode-memory-types",
     "crates/jcode-metatool-store",
@@ -54,6 +55,7 @@ members = [
     "crates/jcode-provider-metadata",
     "crates/jcode-provider-env",
     "crates/jcode-provider-core",
+    "crates/jcode-schema-dialect",
     "crates/jcode-provider-bedrock",
     "crates/jcode-provider-anthropic",
     "crates/jcode-provider-antigravity",
@@ -83,6 +85,7 @@ members = [
     "crates/jcode-tasker-rounds",
     "crates/jcode-tasker-git",
     "crates/jcode-tasker-orchestration",
+    "crates/jcode-transport",
     "crates/jcode-tool-core",
     "crates/jcode-tool-types",
     "crates/jcode-tui-account-picker",
@@ -188,6 +191,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 
 # PDF parsing (behind feature flag)
 jcode-build-meta = { path = "crates/jcode-build-meta" }
+jcode-build-support = { path = "crates/jcode-build-support" }
 # Tiny leaf helpers (console/env/fs/id) used directly by the cli layer.
 # Presentation layer: the terminal UI (`tui`) + offline replay (`video_export`),
 # compiled as a separate rustc unit. It re-exports the application core
@@ -244,6 +248,14 @@ linux-compat-vendored-openssl = ["jcode-tui/linux-compat-vendored-openssl"]
 mmdr-size-api = ["jcode-tui/mmdr-size-api"]
 pdf = ["jcode-tui/pdf"]
 
+# The harness API bridge ships inside the released binary as `jcode api-bridge`.
+# SDK users must not need a Rust toolchain to reach the API: requiring
+# `cargo run -p jcode-harness-api-server` made the TypeScript SDK unusable for
+# anyone who installed jcode from a release artifact. Unix-only because the
+# bridge listens on a Unix socket.
+[target.'cfg(unix)'.dependencies]
+jcode-harness-api-server = { path = "crates/jcode-harness-api-server" }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
@@ -282,6 +294,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSMenuItem",
     "NSRunningApplication",
 ] }
+objc2-user-notifications = "0.3"
 
 [profile.release]
 opt-level = 1

@@ -87,8 +87,11 @@ impl App {
     /// The parsed bindings are cached on `App` for cheap per-keystroke lookup,
     /// so without this poll a config.toml keybinding edit would only take
     /// effect after a restart. Called from the idle tick in both local and
-    /// remote run loops; the generation check makes the no-change path a
-    /// single atomic load. Returns true when bindings were re-parsed.
+    /// remote run loops, and again immediately before dispatching a key press
+    /// so an edit lands on the very next keystroke even when the run loop is
+    /// sitting at the 5s deep-idle cadence. The generation check makes the
+    /// no-change path a single atomic load. Returns true when bindings were
+    /// re-parsed.
     pub(super) fn refresh_keybindings_if_config_reloaded(&mut self) -> bool {
         // config() performs the throttled file-fingerprint staleness check and
         // bumps the reload generation when config.toml changed on disk.
@@ -109,6 +112,10 @@ impl App {
         self.fallback_switch_key = keybind::load_fallback_switch_key();
         self.scroll_keys = keybind::load_scroll_keys();
         crate::logging::info("KEYBINDINGS: reloaded from config change");
+        // Confirm the pickup to the user. Without this, an edit that is
+        // already live is indistinguishable from one that silently did
+        // nothing, which is the main source of "did that actually apply?".
+        self.set_status_notice("Config reloaded from disk");
         true
     }
 
@@ -446,9 +453,11 @@ impl App {
             last_turn_input_tokens: None,
             pending_turn: false,
             auto_poke_incomplete_todos: features.auto_poke,
+            auto_poke_default_on: features.auto_poke,
             todo_confidence_spike_challenged: false,
             todo_gate_digest_delivered: false,
             todo_completion_gate_attempts: 0,
+            last_auto_poke_fingerprint: None,
             turn_guardrail_stopped: false,
             consecutive_guardrail_stops: 0,
             overnight_auto_poke: None,
@@ -492,6 +501,7 @@ impl App {
             onboarding_sim: None,
             onboarding_flow: None,
             onboarding_auto_model_selection_active: Arc::new(AtomicBool::new(false)),
+            onboarding_auto_model_selection_baseline: Arc::new(std::sync::Mutex::new(None)),
             onboarding_startup_checked: false,
             onboarding_import_in_progress: None,
             onboarding_import_error: None,
@@ -886,9 +896,11 @@ impl App {
             last_turn_input_tokens: None,
             pending_turn: false,
             auto_poke_incomplete_todos: features.auto_poke,
+            auto_poke_default_on: features.auto_poke,
             todo_confidence_spike_challenged: false,
             todo_gate_digest_delivered: false,
             todo_completion_gate_attempts: 0,
+            last_auto_poke_fingerprint: None,
             turn_guardrail_stopped: false,
             consecutive_guardrail_stops: 0,
             overnight_auto_poke: None,
@@ -932,6 +944,7 @@ impl App {
             onboarding_sim: None,
             onboarding_flow: None,
             onboarding_auto_model_selection_active: Arc::new(AtomicBool::new(false)),
+            onboarding_auto_model_selection_baseline: Arc::new(std::sync::Mutex::new(None)),
             onboarding_startup_checked: false,
             onboarding_import_in_progress: None,
             onboarding_import_error: None,

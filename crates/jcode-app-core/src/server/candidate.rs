@@ -507,6 +507,7 @@ impl CandidateExecutor for ServerCandidateExecutor {
             self.effort.clone(),
             Some(Arc::clone(&self.host.mcp_pool)),
             Some(self.origin_session_id.clone()),
+            super::headless::HeadlessMemoryScope::RealProject,
         )
         .await
         .map_err(|error| CandidateExecutorError::Failed(error.to_string()))?;

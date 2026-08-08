@@ -18,6 +18,73 @@ log() {
   printf 'dev_cargo: %s\n' "$*" >&2
 }
 
+# Persist one record for every Cargo action routed through this wrapper. This is
+# deliberately separate from session/tool history so compile and test latency
+# can be inspected across sessions and after daemon restarts.
+rust_action_log_started_ns=""
+rust_action_log_started_at=""
+rust_action_log_path=""
+rust_action_log_execution="local"
+
+start_rust_action_log() {
+  case "${JCODE_RUST_ACTION_LOG:-1}" in
+    0|false|no|off) return ;;
+  esac
+
+  local state_root="${JCODE_HOME:-${HOME:+$HOME/.jcode}}"
+  [[ -n "$state_root" ]] || state_root="$repo_root/target/jcode-state"
+  rust_action_log_path="${JCODE_RUST_ACTION_LOG_PATH:-$state_root/logs/rust-actions.jsonl}"
+  rust_action_log_started_ns=$(date +%s%N)
+  rust_action_log_started_at=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+  trap 'record_rust_action_log "$?"' EXIT
+}
+
+record_rust_action_log() {
+  local exit_code="$1"
+  [[ -n "$rust_action_log_started_ns" && -n "$rust_action_log_path" ]] || return 0
+  trap - EXIT
+
+  local finished_ns duration_ms profile action
+  finished_ns=$(date +%s%N)
+  duration_ms=$(( (finished_ns - rust_action_log_started_ns) / 1000000 ))
+  profile=$(selected_profile "${cargo_argv[@]}")
+  action="${cargo_argv[0]:-unknown}"
+  mkdir -p "$(dirname "$rust_action_log_path")" 2>/dev/null || return 0
+
+  JCODE_LOG_STARTED_AT="$rust_action_log_started_at" \
+  JCODE_LOG_DURATION_MS="$duration_ms" \
+  JCODE_LOG_EXIT_CODE="$exit_code" \
+  JCODE_LOG_ACTION="$action" \
+  JCODE_LOG_PROFILE="$profile" \
+  JCODE_LOG_REPO="$repo_root" \
+  JCODE_LOG_EXECUTION="$rust_action_log_execution" \
+  python3 - "$rust_action_log_path" "${cargo_argv[@]}" <<'PY' || true
+import json
+import os
+import sys
+
+path = sys.argv[1]
+record = {
+    "started_at": os.environ["JCODE_LOG_STARTED_AT"],
+    "duration_ms": int(os.environ["JCODE_LOG_DURATION_MS"]),
+    "exit_code": int(os.environ["JCODE_LOG_EXIT_CODE"]),
+    "success": os.environ["JCODE_LOG_EXIT_CODE"] == "0",
+    "action": os.environ["JCODE_LOG_ACTION"],
+    "profile": os.environ["JCODE_LOG_PROFILE"],
+    "repository": os.environ["JCODE_LOG_REPO"],
+    "execution": os.environ["JCODE_LOG_EXECUTION"],
+    "argv": sys.argv[2:],
+}
+line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+try:
+    os.write(fd, line)
+finally:
+    os.close(fd)
+PY
+  return 0
+}
+
 selected_linker_mode="not-configured"
 selected_linker_desc=""
 sccache_status="disabled"
@@ -71,6 +138,43 @@ configure_build_tmpdir() {
     build_tmpdir_status="fallback-system-default"
     log "could not create build temp directory $candidate; using system default"
   fi
+}
+
+# Keep Cargo from discovering disk exhaustion halfway through a link. The
+# system timer handles routine collection; this preflight is the fail-safe for
+# every Rust action routed through Jcode. It only scans when the filesystem is
+# already below the configured reserve, and the collector itself refuses to
+# touch active or recently-written targets.
+maybe_reclaim_low_disk() {
+  case "${JCODE_RUST_CACHE_GC:-auto}" in
+    0|false|no|off|never) return 0 ;;
+  esac
+
+  command -v df >/dev/null 2>&1 || return 0
+  local stats total_kib available_kib reserve_gib reserve_percent reserve_kib percent_kib
+  stats=$(df -Pk "$repo_root" 2>/dev/null | awk 'NR == 2 { print $2, $4 }')
+  read -r total_kib available_kib <<<"$stats"
+  [[ "$total_kib" =~ ^[0-9]+$ && "$available_kib" =~ ^[0-9]+$ ]] || return 0
+
+  reserve_gib="${JCODE_RUST_CACHE_MIN_FREE_GIB:-100}"
+  reserve_percent="${JCODE_RUST_CACHE_MIN_FREE_PERCENT:-15}"
+  [[ "$reserve_gib" =~ ^[0-9]+$ ]] || reserve_gib=100
+  [[ "$reserve_percent" =~ ^[0-9]+$ ]] || reserve_percent=15
+  reserve_kib=$((reserve_gib * 1024 * 1024))
+  percent_kib=$((total_kib * reserve_percent / 100))
+  (( percent_kib > reserve_kib )) && reserve_kib=$percent_kib
+  (( available_kib < reserve_kib )) || return 0
+
+  local collector="${JCODE_RUST_CACHE_GC_BIN:-${XDG_DATA_HOME:-${HOME:-}/.local/share}/jcode/libexec/rust-cache-gc}"
+  [[ -x "$collector" ]] || collector="$repo_root/scripts/rust_cache_gc.py"
+  [[ -x "$collector" || -f "$collector" ]] || return 0
+
+  log "free disk is below the Rust build reserve; reclaiming inactive Cargo targets"
+  python3 "$collector" \
+    --apply \
+    --min-free-gib "$reserve_gib" \
+    --min-free-percent "$reserve_percent" \
+    2>&1 | while IFS= read -r line; do log "$line"; done
 }
 
 append_rustflags() {
@@ -608,20 +712,23 @@ configure_linux_linker() {
   esac
 
   selected_linker_mode="$mode"
-  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-clang}"
 
   case "$mode" in
     lld)
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-clang}"
       append_rustflags "-C link-arg=-fuse-ld=lld"
       selected_linker_desc="clang + lld"
       log "using clang + lld"
       ;;
     mold)
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-clang}"
       append_rustflags "-C link-arg=-fuse-ld=mold"
       selected_linker_desc="clang + mold"
       log "using clang + mold"
       ;;
     system)
+      # Leave the linker driver to cargo's default (`cc`). Only mold/lld need
+      # clang as the driver, and forcing it here breaks machines without clang.
       selected_linker_desc="system linker settings"
       if [[ "$requested_mode" == "auto" ]]; then
         log "no supported fast linker detected; using system linker settings"
@@ -900,11 +1007,12 @@ run_local_cargo() {
     return "$status"
   fi
 
-  exec cargo "${cargo_argv[@]}"
+  cargo "${cargo_argv[@]}"
 }
 
 validate_feature_profile
 configure_build_tmpdir
+maybe_reclaim_low_disk
 export_git_build_metadata
 maybe_configure_low_memory_selfdev "$@"
 maybe_enable_sccache "$@"
@@ -925,10 +1033,14 @@ while IFS= read -r -d '' arg; do
   cargo_argv+=("$arg")
 done < <(build_cargo_argv "$@")
 
+start_rust_action_log
+
 if [[ "${JCODE_REMOTE_CARGO:-0}" == "1" ]]; then
   if remote_cargo_preflight; then
     log "using remote cargo via scripts/remote_build.sh"
-    exec "$repo_root/scripts/remote_build.sh" "${cargo_argv[@]}"
+    rust_action_log_execution="remote"
+    "$repo_root/scripts/remote_build.sh" "${cargo_argv[@]}"
+    exit $?
   fi
   if [[ "$(remote_cargo_fallback_mode)" == "local" ]]; then
     log "remote cargo unavailable; falling back to local cargo (set JCODE_REMOTE_CARGO_FALLBACK=error to fail instead)"
