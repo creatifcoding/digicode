@@ -479,7 +479,7 @@ pub fn admit_installed_fork_build(
     authority: &str,
     predecessor: Option<&str>,
 ) -> Result<ForkBuildAdmission> {
-    admit_installed_fork_build_inner(version, authority, predecessor, None)
+    admit_installed_fork_build_inner(version, authority, predecessor, None, false)
 }
 
 /// Admit a binary built from a verified canonical fork checkout.
@@ -497,7 +497,7 @@ pub fn admit_installed_canonical_source_build(
 ) -> Result<ForkBuildAdmission> {
     let source = canonical_source_provenance(repo_dir, expected_commit, intake_commit)?;
     let authority = format!("local-fork:{}:{}", source.repository, source.branch);
-    admit_installed_fork_build_inner(version, &authority, predecessor, Some(source))
+    admit_installed_fork_build_inner(version, &authority, predecessor, Some(source), false)
 }
 
 fn admit_installed_fork_build_inner(
@@ -505,7 +505,11 @@ fn admit_installed_fork_build_inner(
     authority: &str,
     predecessor: Option<&str>,
     source: Option<ForkBuildSource>,
+    initial_reseed: bool,
 ) -> Result<ForkBuildAdmission> {
+    if initial_reseed && (predecessor.is_some() || any_fork_admission_receipt_exists()?) {
+        anyhow::bail!("refusing initial fork reseed after an admitted release line exists");
+    }
     if source.is_none() && source_intake_authority(authority) {
         anyhow::bail!("refusing source-intake admission without verified canonical fork ancestry");
     }
@@ -542,7 +546,8 @@ fn admit_installed_fork_build_inner(
     // Once a release-line head exists, every new build must name that exact
     // head. This prevents a higher-semver build from silently starting a new
     // line from an upstream or unrelated admitted receipt.
-    if let Some(head) = admitted_release_line_head()?
+    if !initial_reseed
+        && let Some(head) = admitted_release_line_head()?
         && predecessor != Some(head.as_str())
     {
         anyhow::bail!(
@@ -726,6 +731,7 @@ pub fn admitted_predecessor(version: Option<String>) -> Result<Option<String>> {
 }
 
 pub fn admitted_release_line_head() -> Result<Option<String>> {
+    let mut rejected = Vec::new();
     for version in [
         read_current_version()?,
         read_shared_server_version()?,
@@ -736,12 +742,17 @@ pub fn admitted_release_line_head() -> Result<Option<String>> {
     {
         let version = version.trim();
         if !version.is_empty() {
-            // A configured channel without a valid receipt is not an empty
-            // release line. Treat it as corruption so admission cannot use it
-            // as an implicit escape hatch from ancestry checks.
-            require_admitted_fork_build(version)?;
-            return Ok(Some(version.to_string()));
+            match require_admitted_fork_build(version) {
+                Ok(_) => return Ok(Some(version.to_string())),
+                Err(error) => rejected.push(format!("{version}: {error:#}")),
+            }
         }
+    }
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "configured release channels contain no admitted fork build: {}",
+            rejected.join(" | ")
+        );
     }
     Ok(None)
 }
@@ -839,6 +850,9 @@ pub fn bootstrap_legacy_fork_build(repo_dir: &Path) -> Result<Option<ForkBuildAd
             Err(error) => rejected.push(format!("{version}: {error:#}")),
         }
     }
+    if eligible.is_empty() {
+        return Ok(None);
+    }
     if eligible.len() != 1 {
         anyhow::bail!(
             "refusing legacy fork bootstrap: expected exactly one eligible configured build, found {}; rejected: {}",
@@ -862,6 +876,31 @@ pub fn bootstrap_legacy_fork_build(repo_dir: &Path) -> Result<Option<ForkBuildAd
     storage::write_json(&build_admission_path(&version)?, &admission)?;
     require_admitted_fork_build(&version)?;
     Ok(Some(admission))
+}
+
+fn admit_initial_local_fork_build(
+    repo_dir: &Path,
+    source: &SourceState,
+) -> Result<ForkBuildAdmission> {
+    if source.dirty {
+        anyhow::bail!("refusing initial fork reseed from a dirty source checkout");
+    }
+    let remote = canonical_fork_remote(repo_dir)?;
+    let release_ref = canonical_release_ref(repo_dir, &remote)?;
+    let release_commit = git_output(repo_dir, &["rev-parse", &release_ref])?;
+    if !git_is_ancestor(repo_dir, &release_commit, &source.full_hash)? {
+        anyhow::bail!(
+            "refusing initial fork reseed: source {} does not descend from canonical fork release {release_commit}",
+            source.full_hash
+        );
+    }
+    admit_installed_fork_build_inner(
+        &source.version_label,
+        &format!("local-fork:{CANONICAL_FORK_REPOSITORY}:initial-reseed"),
+        None,
+        None,
+        true,
+    )
 }
 
 /// Manifest tracking build versions and their status
@@ -1601,16 +1640,27 @@ pub fn publish_local_current_build_for_source(
     }
     validate_binary_version_matches_source_report(&installed_report, &versioned_path, source)?;
     write_immutable_source_metadata(&versioned_path, source)?;
-    bootstrap_legacy_fork_build(repo_dir)?;
-    let predecessor = admitted_release_line_head()?;
-    admit_installed_fork_build(
-        &source.version_label,
-        &format!(
-            "local-fork:{CANONICAL_FORK_REPOSITORY}:{}",
-            source.repo_scope
-        ),
-        predecessor.as_deref(),
-    )?;
+    let bootstrapped = bootstrap_legacy_fork_build(repo_dir)?;
+    let predecessor = match bootstrapped {
+        Some(admission) => Some(admission.version),
+        None if any_fork_admission_receipt_exists()? => admitted_release_line_head()?,
+        None => None,
+    };
+    if predecessor.is_none() && !any_fork_admission_receipt_exists()? {
+        admit_initial_local_fork_build(repo_dir, source)?;
+    } else {
+        let predecessor = predecessor.ok_or_else(|| {
+            anyhow::anyhow!("admitted fork receipts exist without a configured release-line head")
+        })?;
+        admit_installed_fork_build(
+            &source.version_label,
+            &format!(
+                "local-fork:{CANONICAL_FORK_REPOSITORY}:{}",
+                source.repo_scope
+            ),
+            Some(&predecessor),
+        )?;
+    }
     let current_link = update_current_to_admitted_fork_build(&source.version_label)?;
     let launcher_link = update_launcher_symlink_to_current()?;
 
