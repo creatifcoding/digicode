@@ -475,11 +475,14 @@ impl Registry {
         input: &Value,
         ctx: &ToolContext,
     ) -> Vec<(String, String)> {
-        let cwd = ctx
-            .working_dir
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "none".to_string());
+        let cwd = if resolved_name == "mt" {
+            "omitted".to_string()
+        } else {
+            ctx.working_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        };
         let input_json = serde_json::to_string(input).unwrap_or_default();
         let mut fields = vec![
             ("phase".to_string(), phase.to_string()),
@@ -495,6 +498,36 @@ impl Registry {
             ("cwd".to_string(), cwd),
             ("input_json_bytes".to_string(), input_json.len().to_string()),
         ];
+
+        if resolved_name == "mt" {
+            let safe_shape = crate::metatool_observability::telemetry_input_shape(input);
+            fields.push((
+                "input_shape".to_string(),
+                safe_shape["shape"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string(),
+            ));
+            fields.push((
+                "input_key_count".to_string(),
+                safe_shape["key_count"].as_u64().unwrap_or(0).to_string(),
+            ));
+            fields.push((
+                "source_present".to_string(),
+                safe_shape["source_present"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    .to_string(),
+            ));
+            fields.push((
+                "inputs_present".to_string(),
+                safe_shape["inputs_present"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    .to_string(),
+            ));
+            return fields;
+        }
 
         if let Some(object) = input.as_object() {
             let mut keys = object.keys().cloned().collect::<Vec<_>>();
@@ -708,7 +741,17 @@ impl Registry {
         let result = tool.execute(input.clone(), ctx.clone()).await;
         let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-        crate::telemetry::record_tool_execution(resolved_name, &input, result.is_ok(), latency_ms);
+        let telemetry_input = if resolved_name == "mt" {
+            crate::metatool_observability::telemetry_input_shape(&input)
+        } else {
+            input.clone()
+        };
+        crate::telemetry::record_tool_execution(
+            resolved_name,
+            &telemetry_input,
+            result.is_ok(),
+            latency_ms,
+        );
         Self::fire_post_tool_hook(resolved_name, &ctx, &result, latency_ms);
 
         let mut output = match result {
@@ -717,7 +760,14 @@ impl Registry {
                 let mut fields =
                     Self::tool_lifecycle_fields("error", name, resolved_name, &input, &ctx);
                 fields.push(("elapsed_ms".to_string(), latency_ms.to_string()));
-                fields.push(("error".to_string(), crate::util::format_error_chain(&error)));
+                if resolved_name == "mt" {
+                    fields.push((
+                        "error_class".to_string(),
+                        crate::metatool_observability::safe_error_class(&error).to_string(),
+                    ));
+                } else {
+                    fields.push(("error".to_string(), crate::util::format_error_chain(&error)));
+                }
                 crate::logging::event_warn("TOOL_LIFECYCLE", fields);
                 return Err(error);
             }

@@ -924,6 +924,63 @@ fn todo_telemetry_opt_out_emits_nothing() {
     assert!(emitted.is_empty(), "opt-out emitted payloads: {emitted:?}");
 }
 
+#[test]
+fn metatool_telemetry_is_allowlisted_and_privacy_safe() {
+    let _guard = lock_telemetry_test_state();
+    let previous_home = std::env::var_os("JCODE_HOME");
+    let previous_no_telemetry = std::env::var_os("JCODE_NO_TELEMETRY");
+    let previous_do_not_track = std::env::var_os("DO_NOT_TRACK");
+    let temp = tempfile::TempDir::new().expect("create telemetry home");
+    jcode_core::env::set_var("JCODE_HOME", temp.path());
+    jcode_core::env::remove_var("JCODE_NO_TELEMETRY");
+    jcode_core::env::remove_var("DO_NOT_TRACK");
+    TEST_EMITTED_PAYLOADS.lock().unwrap().clear();
+
+    record_metatool_invocation(MetaToolTelemetry {
+        action: "user-controlled-action",
+        outcome: "raw error with source never-persisted-source",
+        duration_ms: 18_000,
+        source_bytes: 8_000,
+        input_bytes: 70_000,
+        output_bytes: 3_000,
+        input_shape: "object",
+        finding_action: true,
+    });
+
+    let emitted = TEST_EMITTED_PAYLOADS.lock().unwrap().clone();
+    let payload = emitted
+        .iter()
+        .rev()
+        .find(|payload| payload["event"] == "metatool_invocation")
+        .expect("MetaTool telemetry payload");
+    assert_eq!(payload["action"], "unknown");
+    assert_eq!(payload["outcome"], "unknown");
+    assert_eq!(payload["input_shape"], "object");
+    assert_eq!(payload["finding_action"], true);
+    assert_eq!(payload["duration_ms_bucket"], 10_000);
+    assert_eq!(payload["source_bytes_bucket"], 16_384);
+    assert_eq!(payload["input_bytes_bucket"], 65_537);
+    assert_eq!(payload["output_bytes_bucket"], 16_384);
+    assert!(payload.get("session_id").is_none());
+    let rendered = payload.to_string();
+    assert!(!rendered.contains("user-controlled-action"));
+    assert!(!rendered.contains("raw error"));
+    assert!(!rendered.contains("never-persisted-source"));
+
+    match previous_home {
+        Some(value) => jcode_core::env::set_var("JCODE_HOME", value),
+        None => jcode_core::env::remove_var("JCODE_HOME"),
+    }
+    match previous_no_telemetry {
+        Some(value) => jcode_core::env::set_var("JCODE_NO_TELEMETRY", value),
+        None => jcode_core::env::remove_var("JCODE_NO_TELEMETRY"),
+    }
+    match previous_do_not_track {
+        Some(value) => jcode_core::env::set_var("DO_NOT_TRACK", value),
+        None => jcode_core::env::remove_var("DO_NOT_TRACK"),
+    }
+}
+
 /// Regression: `begin_session` used to overwrite a live `SESSION_STATE`
 /// without ending it, orphaning the previous `session_start`. That is why
 /// only ~25% of release `session_start` events ever had a matching

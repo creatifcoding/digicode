@@ -4,6 +4,23 @@ jcode collects **anonymous, minimal usage statistics** to help understand how ma
 
 Recent telemetry additions also include: coarse onboarding steps, explicit thumbs-up / thumbs-down feedback, build-channel / dev-mode cleanup flags, session/workflow/tool-category summaries, coarse project language buckets, retention helpers like active days in the last 7 / 30 days, workflow cadence fields for session timing and multi-sessioning, privacy-safe per-turn timing/outcome metrics, schema v5 agent-time / autonomy / pain-attribution metrics, and numeric-only todo progress aggregates.
 
+### MetaTool Invocation Event
+
+MetaTool calls emit one coarse `metatool_invocation` event when telemetry is
+enabled. The event records only allowlisted action and outcome labels, bucketed
+duration and byte counts, a JSON value-shape label, and a boolean indicating a
+Finding action. Invalid calls and runtime failures use the same bounded event
+shape as successful calls.
+
+The event does not contain source, inputs, prompts, filenames, code, output,
+stack traces, error messages, Finding text, session identifiers, or secrets.
+Local execution traces retain only hashes, sizes, shapes, and a bounded
+failure-class digest. Local Finding and IssueProposal text is secret-redacted
+and truncated before persistence. Findings retain only a hashed local
+session/workspace correlation context, never the raw identifiers or path. Issue
+proposals are recorded locally only and are never filed with an external
+tracker.
+
 ## What We Collect
 
 ### Install Event (sent once, on first launch)

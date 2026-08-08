@@ -55,6 +55,21 @@ pub struct DiscoveryTelemetry<'a> {
     pub endpoint: &'a str,
 }
 
+/// Numeric and allowlisted MetaTool completion data. The caller must provide
+/// only sizes and coarse labels. Source, inputs, prompts, paths, output, stack
+/// traces, and secret material are intentionally absent from this contract.
+#[derive(Debug, Clone, Copy)]
+pub struct MetaToolTelemetry<'a> {
+    pub action: &'a str,
+    pub outcome: &'a str,
+    pub duration_ms: u64,
+    pub source_bytes: usize,
+    pub input_bytes: usize,
+    pub output_bytes: usize,
+    pub input_shape: &'a str,
+    pub finding_action: bool,
+}
+
 /// A distribution-safe numeric summary. Callers provide only scores, never the
 /// todo, goal, plan, or feedback-loop text those scores describe.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -715,6 +730,107 @@ pub fn record_discovery_event(data: DiscoveryTelemetry<'_>) {
             send_payload(payload, DeliveryMode::Background);
         }
         Err(err) => logging::error(&format!("failed to serialize discovery telemetry: {err}")),
+    }
+}
+
+/// Emit one coarse MetaTool invocation event. This event is deliberately
+/// separate from the session counters so invalid direct calls and local
+/// Finding actions remain observable without retaining their content.
+pub fn record_metatool_invocation(data: MetaToolTelemetry<'_>) {
+    if !is_enabled() {
+        return;
+    }
+    let Some(id) = get_or_create_id() else {
+        return;
+    };
+    let (schema_version, build_channel, git_checkout, ci, from_cargo) = telemetry_envelope();
+    let action = allowlisted_metatool_action(data.action);
+    let outcome = allowlisted_metatool_outcome(data.outcome);
+    let input_shape = allowlisted_metatool_shape(data.input_shape);
+    let event = serde_json::json!({
+        "event_id": new_event_id(),
+        "id": id,
+        "event": "metatool_invocation",
+        "version": version(),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "action": action,
+        "outcome": outcome,
+        "duration_ms_bucket": metatool_duration_bucket(data.duration_ms),
+        "source_bytes_bucket": metatool_bytes_bucket(data.source_bytes),
+        "input_bytes_bucket": metatool_bytes_bucket(data.input_bytes),
+        "output_bytes_bucket": metatool_bytes_bucket(data.output_bytes),
+        "input_shape": input_shape,
+        "finding_action": data.finding_action,
+        "schema_version": schema_version,
+        "build_channel": build_channel,
+        "is_git_checkout": git_checkout,
+        "is_ci": ci,
+        "ran_from_cargo": from_cargo,
+    });
+    if let Err(error) = serde_json::to_vec(&event) {
+        logging::error(&format!("failed to serialize MetaTool telemetry: {error}"));
+        return;
+    }
+    let _ = send_payload(event, DeliveryMode::Background);
+}
+
+fn allowlisted_metatool_action(action: &str) -> &'static str {
+    match action {
+        "status" => "status",
+        "evaluate" => "evaluate",
+        "guide" => "guide",
+        "report_finding" => "report_finding",
+        "list_findings" => "list_findings",
+        "show_finding" => "show_finding",
+        "triage_finding" => "triage_finding",
+        "propose_issue" => "propose_issue",
+        _ => "unknown",
+    }
+}
+
+fn allowlisted_metatool_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "success" => "success",
+        "invalid_input" => "invalid_input",
+        "runtime_failure" => "runtime_failure",
+        _ => "unknown",
+    }
+}
+
+fn allowlisted_metatool_shape(shape: &str) -> &'static str {
+    match shape {
+        "null" => "null",
+        "boolean" => "boolean",
+        "number" => "number",
+        "string" => "string",
+        "array" => "array",
+        "object" => "object",
+        _ => "unknown",
+    }
+}
+
+fn metatool_duration_bucket(value: u64) -> u64 {
+    match value {
+        0..=4 => 0,
+        5..=24 => 5,
+        25..=99 => 25,
+        100..=499 => 100,
+        500..=1_999 => 500,
+        2_000..=9_999 => 2_000,
+        _ => 10_000,
+    }
+}
+
+fn metatool_bytes_bucket(value: usize) -> usize {
+    match value {
+        0 => 0,
+        1..=64 => 64,
+        65..=256 => 256,
+        257..=1_024 => 1_024,
+        1_025..=16_384 => 16_384,
+        16_385..=65_536 => 65_536,
+        _ => 65_537,
     }
 }
 

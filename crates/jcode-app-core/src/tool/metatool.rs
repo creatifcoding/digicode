@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::{Tool, ToolContext, ToolOutput};
+use crate::metatool_observability::{self, FindingAction, FindingContext, TriageDisposition};
 
 const RUNTIME_DIR_ENV: &str = "JCODE_METATOOL_RUNTIME_DIR";
 const NODE_BINARY_ENV: &str = "JCODE_METATOOL_NODE";
@@ -480,6 +481,18 @@ struct MetaToolInput {
     tasker_project_id: Option<String>,
     #[serde(default)]
     artifact_mode: ArtifactMode,
+    #[serde(default)]
+    finding_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    disposition: Option<TriageDisposition>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,6 +901,11 @@ enum MetaToolAction {
     #[default]
     Evaluate,
     Guide,
+    ReportFinding,
+    ListFindings,
+    ShowFinding,
+    TriageFinding,
+    ProposeIssue,
 }
 
 fn default_action() -> MetaToolAction {
@@ -1759,8 +1777,8 @@ impl Tool for MetaTool {
                 "intent": super::intent_schema_property(),
                 "action": {
                     "type": "string",
-                    "enum": ["status", "evaluate", "guide"],
-                    "description": "status inspects runtime availability; evaluate runs code; guide returns the mt.* API reference grouped by section."
+                    "enum": ["status", "evaluate", "guide", "report_finding", "list_findings", "show_finding", "triage_finding", "propose_issue"],
+                    "description": "status inspects runtime availability; evaluate runs code; guide returns the mt.* API reference; Finding actions report, list, show, triage, or record a local-only issue proposal."
                 },
                 "code": {"type": "string", "description": "JavaScript body evaluated as an async function with the live `mt` engine object in scope. Use `return` for the final value, e.g. `await mt.put('notes', 'k', { _meta: { summary: 's' }, v: 1 }); return await mt.get('notes', 'k')`. Required for evaluate."},
                 "inputs": {
@@ -1789,12 +1807,43 @@ impl Tool for MetaTool {
                     "type": "string",
                     "enum": ["off", "apply"],
                     "description": "Optional native artifact-library capability. apply exposes a bounded read-only catalog and admits exactly one bundle through the host artifact store; the guest receives no filesystem or database authority."
-                }
+                },
+                "finding_id": {"type": "string", "description": "Durable local Finding identifier for show, triage, or propose_issue."},
+                "title": {"type": "string", "description": "Finding or local issue-proposal title."},
+                "summary": {"type": "string", "description": "Finding or local issue-proposal observation, bounded and redacted before local persistence."},
+                "disposition": {
+                    "type": "string",
+                    "enum": ["unconfirmed", "needs_reproduction", "suspected_bug", "confirmed_bug", "not_a_bug", "duplicate", "accepted_maintenance"],
+                    "description": "TriageDisposition for a Finding. Only suspected_bug and confirmed_bug unlock propose_issue."
+                },
+                "note": {"type": "string", "description": "Optional bounded triage note, redacted before local persistence."},
+                "limit": {"type": "integer", "description": "Maximum number of local Findings to return for list_findings."}
             }
         })
     }
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
+        let started_at = std::time::Instant::now();
+        let input_for_trace = input.clone();
+        let result = self.execute_inner(input, ctx.clone()).await;
+        let duration_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        metatool_observability::record_invocation(
+            &input_for_trace,
+            metatool_observability::InvocationContext {
+                session_id: &ctx.session_id,
+                message_id: &ctx.message_id,
+                tool_call_id: &ctx.tool_call_id,
+                working_dir: ctx.working_dir.as_deref(),
+            },
+            &result,
+            duration_ms,
+        );
+        result
+    }
+}
+
+impl MetaTool {
+    async fn execute_inner(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let params: MetaToolInput = serde_json::from_value(input)?;
         match params.action {
             MetaToolAction::Status => output("MetaTool runtime status", Self::status()?),
@@ -1802,6 +1851,97 @@ impl Tool for MetaTool {
                 let guide: Value = serde_json::from_str(GUIDE_SOURCE)
                     .context("parse embedded MetaTool guide manifest")?;
                 output("MetaTool mt.* API guide", guide)
+            }
+            MetaToolAction::ReportFinding => {
+                let title = params
+                    .title
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("title is required for report_finding"))?;
+                let summary = params
+                    .summary
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("summary is required for report_finding"))?;
+                let metadata = metatool_observability::execute_finding_action(
+                    FindingAction::Report { title, summary },
+                    FindingContext {
+                        session_id: &ctx.session_id,
+                        working_dir: ctx.working_dir.as_deref(),
+                    },
+                )?;
+                output("MetaTool Finding reported", metadata)
+            }
+            MetaToolAction::ListFindings => {
+                let metadata = metatool_observability::execute_finding_action(
+                    FindingAction::List {
+                        limit: params.limit,
+                    },
+                    FindingContext {
+                        session_id: &ctx.session_id,
+                        working_dir: ctx.working_dir.as_deref(),
+                    },
+                )?;
+                output("MetaTool Findings", metadata)
+            }
+            MetaToolAction::ShowFinding => {
+                let finding_id = params
+                    .finding_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("finding_id is required for show_finding"))?;
+                let metadata = metatool_observability::execute_finding_action(
+                    FindingAction::Show { finding_id },
+                    FindingContext {
+                        session_id: &ctx.session_id,
+                        working_dir: ctx.working_dir.as_deref(),
+                    },
+                )?;
+                output("MetaTool Finding", metadata)
+            }
+            MetaToolAction::TriageFinding => {
+                let finding_id = params
+                    .finding_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("finding_id is required for triage_finding"))?;
+                let disposition = params
+                    .disposition
+                    .ok_or_else(|| anyhow!("disposition is required for triage_finding"))?;
+                let metadata = metatool_observability::execute_finding_action(
+                    FindingAction::Triage {
+                        finding_id,
+                        disposition,
+                        note: params.note.as_deref(),
+                    },
+                    FindingContext {
+                        session_id: &ctx.session_id,
+                        working_dir: ctx.working_dir.as_deref(),
+                    },
+                )?;
+                output("MetaTool Finding triaged", metadata)
+            }
+            MetaToolAction::ProposeIssue => {
+                let finding_id = params
+                    .finding_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("finding_id is required for propose_issue"))?;
+                let title = params
+                    .title
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("title is required for propose_issue"))?;
+                let summary = params
+                    .summary
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("summary is required for propose_issue"))?;
+                let metadata = metatool_observability::execute_finding_action(
+                    FindingAction::ProposeIssue {
+                        finding_id,
+                        title,
+                        summary,
+                    },
+                    FindingContext {
+                        session_id: &ctx.session_id,
+                        working_dir: ctx.working_dir.as_deref(),
+                    },
+                )?;
+                output("MetaTool local issue proposal", metadata)
             }
             MetaToolAction::Evaluate => {
                 if params.profile != ExecutionProfile::Pure {
@@ -2072,14 +2212,61 @@ mod tests {
         }
     }
 
+    struct ObservabilityTestEnvironment {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        temp: tempfile::TempDir,
+        previous_runtime_dir: Option<std::ffi::OsString>,
+        previous_no_telemetry: Option<std::ffi::OsString>,
+    }
+
+    impl ObservabilityTestEnvironment {
+        fn new() -> Self {
+            let lock = crate::storage::lock_test_env();
+            let temp = tempfile::tempdir().expect("test runtime directory");
+            let previous_runtime_dir = std::env::var_os("JCODE_RUNTIME_DIR");
+            let previous_no_telemetry = std::env::var_os("JCODE_NO_TELEMETRY");
+            crate::env::set_var("JCODE_RUNTIME_DIR", temp.path());
+            crate::env::set_var("JCODE_NO_TELEMETRY", "1");
+            Self {
+                _lock: lock,
+                temp,
+                previous_runtime_dir,
+                previous_no_telemetry,
+            }
+        }
+    }
+
+    impl Drop for ObservabilityTestEnvironment {
+        fn drop(&mut self) {
+            match self.previous_runtime_dir.take() {
+                Some(value) => crate::env::set_var("JCODE_RUNTIME_DIR", value),
+                None => crate::env::remove_var("JCODE_RUNTIME_DIR"),
+            }
+            match self.previous_no_telemetry.take() {
+                Some(value) => crate::env::set_var("JCODE_NO_TELEMETRY", value),
+                None => crate::env::remove_var("JCODE_NO_TELEMETRY"),
+            }
+            let _ = self.temp.path();
+        }
+    }
+
     #[test]
-    fn schema_exposes_status_evaluate_and_profiles() {
+    fn schema_exposes_observability_actions_and_profiles() {
         let definition = MetaTool::new().to_definition();
         assert_eq!(definition.name, "mt");
         assert!(definition.description.contains("codemode"));
         assert_eq!(
             definition.input_schema["properties"]["action"]["enum"],
-            json!(["status", "evaluate", "guide"])
+            json!([
+                "status",
+                "evaluate",
+                "guide",
+                "report_finding",
+                "list_findings",
+                "show_finding",
+                "triage_finding",
+                "propose_issue"
+            ])
         );
         assert_eq!(
             definition.input_schema["properties"]["tasker_mode"]["enum"],
@@ -2092,6 +2279,22 @@ mod tests {
         assert_eq!(
             definition.input_schema["properties"]["artifact_mode"]["enum"],
             json!(["off", "apply"])
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["disposition"]["enum"],
+            json!([
+                "unconfirmed",
+                "needs_reproduction",
+                "suspected_bug",
+                "confirmed_bug",
+                "not_a_bug",
+                "duplicate",
+                "accepted_maintenance"
+            ])
+        );
+        assert_eq!(
+            definition.input_schema["properties"]["limit"]["type"],
+            "integer"
         );
     }
 
@@ -2115,6 +2318,188 @@ mod tests {
             definition.input_schema["required"],
             json!(["action", "intent"])
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_call_records_bounded_redacted_trace() {
+        let _env = ObservabilityTestEnvironment::new();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let secret = "super-secret-value";
+        let source = format!(
+            "never-persisted-source token={secret} {}",
+            "x".repeat(MAX_SOURCE_BYTES)
+        );
+        let result = MetaTool::new()
+            .execute(
+                json!({
+                    "action": "evaluate",
+                    "code": source,
+                    "inputs": {"password": secret}
+                }),
+                context(workspace.path()),
+            )
+            .await;
+        assert!(result.is_err(), "oversized source should be rejected");
+
+        let trace_path = metatool_observability::trace_path_for_test(Some(workspace.path()))
+            .expect("trace path");
+        let trace_text = std::fs::read_to_string(trace_path).expect("trace file");
+        assert!(!trace_text.contains("never-persisted-source"));
+        assert!(!trace_text.contains(secret));
+        let trace: metatool_observability::TraceRecord = trace_text
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str(line).ok())
+            .expect("trace record");
+        assert_eq!(trace.action, "evaluate");
+        assert_eq!(trace.outcome, "invalid_input");
+        assert!(trace.source_present);
+        assert!(trace.source_bytes > MAX_SOURCE_BYTES);
+        assert!(trace.source_hash.is_some());
+        assert!(trace.diagnostic_dump.is_some());
+    }
+
+    #[tokio::test]
+    async fn successful_call_records_trace_without_diagnostic_dump() {
+        let _env = ObservabilityTestEnvironment::new();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let output = MetaTool::new()
+            .execute(json!({"action": "status"}), context(workspace.path()))
+            .await
+            .expect("status call");
+        assert!(output.metadata.is_some());
+
+        let trace_path = metatool_observability::trace_path_for_test(Some(workspace.path()))
+            .expect("trace path");
+        let trace_text = std::fs::read_to_string(trace_path).expect("trace file");
+        let trace: metatool_observability::TraceRecord = trace_text
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str(line).ok())
+            .expect("trace record");
+        assert_eq!(trace.action, "status");
+        assert_eq!(trace.outcome, "success");
+        assert!(trace.output_bytes > 0);
+        assert!(trace.output_hash.is_some());
+        assert!(trace.diagnostic_dump.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_failure_records_failure_only_diagnostic_dump() {
+        let _env = ObservabilityTestEnvironment::new();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let result = MetaTool::new()
+            .execute(
+                json!({
+                    "action": "evaluate",
+                    "code": "return 1",
+                    "profile": "workspace-read"
+                }),
+                context(workspace.path()),
+            )
+            .await;
+        assert!(result.is_err(), "blocked profile should fail");
+
+        let trace_path = metatool_observability::trace_path_for_test(Some(workspace.path()))
+            .expect("trace path");
+        let trace_text = std::fs::read_to_string(trace_path).expect("trace file");
+        let trace: metatool_observability::TraceRecord = trace_text
+            .lines()
+            .last()
+            .and_then(|line| serde_json::from_str(line).ok())
+            .expect("trace record");
+        assert_eq!(trace.outcome, "runtime_failure");
+        let diagnostic = trace.diagnostic_dump.expect("diagnostic dump");
+        assert_eq!(diagnostic.error_class, "runtime_failure");
+        assert!(diagnostic.message_bytes > 0);
+        assert!(!trace_text.contains("workspace-read"));
+    }
+
+    #[tokio::test]
+    async fn finding_actions_report_list_show_triage_and_propose_locally() {
+        let _env = ObservabilityTestEnvironment::new();
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let tool = MetaTool::new();
+        let report = tool
+            .execute(
+                json!({
+                    "action": "report_finding",
+                    "title": "Observed behavior",
+                    "summary": "An unconfirmed maintenance observation"
+                }),
+                context(workspace.path()),
+            )
+            .await
+            .expect("report finding")
+            .metadata
+            .expect("report metadata");
+        let finding_id = report["finding"]["id"].as_str().expect("finding id");
+        assert_eq!(report["finding"]["disposition"], "unconfirmed");
+
+        let listed = tool
+            .execute(
+                json!({"action": "list_findings", "limit": 10}),
+                context(workspace.path()),
+            )
+            .await
+            .expect("list findings")
+            .metadata
+            .expect("list metadata");
+        assert_eq!(listed["findings"].as_array().expect("findings").len(), 1);
+
+        let shown = tool
+            .execute(
+                json!({"action": "show_finding", "finding_id": finding_id}),
+                context(workspace.path()),
+            )
+            .await
+            .expect("show finding")
+            .metadata
+            .expect("show metadata");
+        assert_eq!(shown["finding"]["id"], finding_id);
+
+        let blocked = tool
+            .execute(
+                json!({
+                    "action": "propose_issue",
+                    "finding_id": finding_id,
+                    "title": "Not yet",
+                    "summary": "Still unconfirmed"
+                }),
+                context(workspace.path()),
+            )
+            .await;
+        assert!(blocked.is_err());
+
+        tool.execute(
+            json!({
+                "action": "triage_finding",
+                "finding_id": finding_id,
+                "disposition": "confirmed_bug",
+                "note": "Reproduced locally"
+            }),
+            context(workspace.path()),
+        )
+        .await
+        .expect("triage finding");
+        let proposal = tool
+            .execute(
+                json!({
+                    "action": "propose_issue",
+                    "finding_id": finding_id,
+                    "title": "Local proposal",
+                    "summary": "Review this confirmed bug"
+                }),
+                context(workspace.path()),
+            )
+            .await
+            .expect("local proposal")
+            .metadata
+            .expect("proposal metadata");
+        assert_eq!(proposal["status"], "recorded_locally");
+        assert_eq!(proposal["external_filing"], false);
+        assert_eq!(proposal["proposal"]["status"], "local_only");
+        assert_eq!(proposal["proposal"]["externalFiling"], false);
     }
 
     #[test]

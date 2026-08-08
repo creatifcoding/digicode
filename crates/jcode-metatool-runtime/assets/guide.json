@@ -8,7 +8,8 @@
     "mt.tasker is present only when the host grants tasker_mode plan or apply. It reads a bounded canonical snapshot, including ordinary Tasker topology and concurrency projections, and may emit one atomic ordinary reconciliation effect; guest code never receives a database or agent-spawning handle.",
     "Generic tasker.reconcile is ordinary-only. Concurrency lifecycle writers are rejected, and executeWork, adjudicateCandidateSet, promoteCandidate, and recoverPromotion fail closed with host_executor_unavailable until their typed host executors are installed. Candidate-lane execution remains a host-side compatibility path, not the public all-policy API.",
     "Use tasker_mode plan before apply when inspecting a new ordinary reconciliation. Plan executes the same ordinary mutation semantics against an isolated in-memory SQLite fork, returns a normalized stable simulation, and issues a time-bounded host receipt without changing canonical state. Apply requires tasker_receipt and verifies its project, snapshot, exact change-set digest, and expiry before mutating canonical state.",
-    "mt.artifacts is present only when the host grants artifact_mode apply. It exposes a bounded read-only catalog and candidates list, and admitBundle(bundle) emits exactly one host-admitted artifacts.admit_bundle effect; guest code never receives artifact-store filesystem or database authority."
+    "mt.artifacts is present only when the host grants artifact_mode apply. It exposes a bounded read-only catalog and candidates list, and admitBundle(bundle) emits exactly one host-admitted artifacts.admit_bundle effect; guest code never receives artifact-store filesystem or database authority.",
+    "The native MetaTool action surface also supports report_finding, list_findings, show_finding, triage_finding, and propose_issue. Findings begin unconfirmed, are retained locally after secret redaction and truncation, and propose_issue records a local-only proposal only after suspected_bug or confirmed_bug triage. No external issue is filed."
   ],
   "undeclared": [
     "exec",
@@ -425,6 +426,28 @@
       {
         "name": "artifacts.admitBundle",
         "signature": "async ({key,title,source,rendered,annotation?,templateKey?}) \u2192 AdmissionQueueReceipt"
+      }
+    ],
+    "native-observability-actions": [
+      {
+        "name": "report_finding",
+        "signature": "({title,summary}) \u2192 Finding"
+      },
+      {
+        "name": "list_findings",
+        "signature": "({limit?}) \u2192 Finding[]"
+      },
+      {
+        "name": "show_finding",
+        "signature": "({finding_id}) \u2192 Finding"
+      },
+      {
+        "name": "triage_finding",
+        "signature": "({finding_id,disposition,note?}) \u2192 Finding"
+      },
+      {
+        "name": "propose_issue",
+        "signature": "({finding_id,title,summary}) \u2192 local-only IssueProposal"
       }
     ]
   }
