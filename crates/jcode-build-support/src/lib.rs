@@ -1,3 +1,4 @@
+pub mod fork_governance;
 mod paths;
 mod platform_support;
 mod source_state;
@@ -39,6 +40,12 @@ use std::process::Command;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+pub use fork_governance::{
+    CapabilityManifestEntry, ContractSpec, ForkCapabilityManifest, MANIFEST_FILE_NAME,
+    MANIFEST_SCHEMA_VERSION, RetirementRecord, builtin_capability_ids, builtin_manifest,
+    digest_bytes, load_manifest_or_legacy, manifest_path_for_binary, read_manifest_for_binary,
+    write_immutable_manifest,
+};
 pub use jcode_selfdev_types::{
     BinaryChoice, BinaryVersionReport, BuildInfo, CanaryStatus, CrashInfo, DevBinarySourceMetadata,
     MigrationContext, PendingActivation, PublishedBuild, SelfDevBuildCommand, SelfDevBuildTarget,
@@ -55,7 +62,6 @@ pub const CANONICAL_FORK_RELEASE_BRANCH: &str = "master";
 /// Upstream is an input to source-update workflows only. It is never a valid
 /// release or local-fork binary authority.
 pub const UPSTREAM_SOURCE_REPOSITORY: &str = "1jehuang/jcode";
-pub const REQUIRED_FORK_CAPABILITIES: &[&str] = &["mt", "tasker"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForkBuildAdmission {
@@ -374,6 +380,97 @@ fn source_fingerprint_for_binary(binary: &Path) -> Result<Option<String>> {
     Ok(Some(metadata.source_fingerprint))
 }
 
+fn manifest_for_report(
+    binary: &Path,
+    report: &BinaryVersionReport,
+) -> Result<(ForkCapabilityManifest, bool)> {
+    if let Some(manifest) = read_manifest_for_binary(binary)? {
+        let legacy = manifest.manifest_version.starts_with("legacy-");
+        if !legacy {
+            manifest.validate_baseline(&builtin_manifest()?)?;
+        }
+        if let Some(version) = report.manifest_version.as_deref()
+            && version != manifest.manifest_version
+        {
+            anyhow::bail!(
+                "binary manifest schema/version {} does not match installed manifest {}",
+                version,
+                manifest.manifest_version
+            );
+        }
+        if let Some(declared) = report.manifest_sha256.as_deref() {
+            let actual = manifest.digest()?;
+            let generated = builtin_manifest()?.digest()?;
+            if declared != actual && declared != generated {
+                anyhow::bail!(
+                    "binary manifest digest {} does not match installed manifest {}",
+                    declared,
+                    actual
+                );
+            }
+        }
+        return Ok((manifest, legacy));
+    }
+
+    // A post-governance binary carries the generated manifest digest in its
+    // version report. It is safe to reconstruct the checked-in generated
+    // manifest only when that digest matches the trusted compile-time source.
+    // The immutable sidecar is written before the admission receipt.
+    if report.manifest_version.is_some() || report.manifest_sha256.is_some() {
+        let generated = builtin_manifest()?;
+        let generated_digest = generated.digest()?;
+        if report.manifest_version.as_deref() != Some(generated.manifest_version.as_str())
+            || report.manifest_sha256.as_deref() != Some(generated_digest.as_str())
+        {
+            anyhow::bail!(
+                "post-governance build {} is missing a trusted capability manifest sidecar",
+                binary.display()
+            );
+        }
+        return Ok((generated, false));
+    }
+
+    // Old installed binaries are migrated explicitly to a schema-versioned
+    // legacy manifest. New report-producing builds never use this branch.
+    Ok((
+        fork_governance::legacy_manifest(
+            &report.capabilities,
+            report.git_hash.as_deref().unwrap_or("legacy"),
+        )?,
+        true,
+    ))
+}
+
+fn validate_manifest_report_identity(
+    binary: &Path,
+    report: &BinaryVersionReport,
+    manifest: &ForkCapabilityManifest,
+) -> Result<()> {
+    if let Some(version) = report.manifest_version.as_deref()
+        && version != manifest.manifest_version
+    {
+        anyhow::bail!(
+            "admitted build {} manifest version changed: receipt {}, report {}",
+            binary.display(),
+            manifest.manifest_version,
+            version
+        );
+    }
+    if let Some(declared) = report.manifest_sha256.as_deref() {
+        let actual = manifest.digest()?;
+        let generated = builtin_manifest()?.digest()?;
+        if declared != actual && declared != generated {
+            anyhow::bail!(
+                "admitted build {} manifest digest changed: report {}, actual {}",
+                binary.display(),
+                declared,
+                actual
+            );
+        }
+    }
+    Ok(())
+}
+
 fn write_immutable_source_metadata(binary: &Path, source: &SourceState) -> Result<()> {
     let path = binary_source_metadata_path(binary);
     let metadata = DevBinarySourceMetadata::from(source);
@@ -390,14 +487,6 @@ fn write_immutable_source_metadata(binary: &Path, source: &SourceState) -> Resul
     storage::write_json(&path, &metadata)
 }
 
-fn missing_capabilities(capabilities: &[String]) -> Vec<&'static str> {
-    REQUIRED_FORK_CAPABILITIES
-        .iter()
-        .copied()
-        .filter(|required| !capabilities.iter().any(|value| value == required))
-        .collect()
-}
-
 fn capability_loss<'a>(candidate: &'a [String], predecessor: &'a [String]) -> Vec<&'a String> {
     predecessor
         .iter()
@@ -411,6 +500,7 @@ fn validate_transition_metadata(
     git_hash: &str,
     capabilities: &[String],
     predecessor: Option<&ForkBuildAdmission>,
+    allowed_retirements: &[String],
 ) -> Result<()> {
     if !canonical_authority(authority) {
         anyhow::bail!(
@@ -421,16 +511,21 @@ fn validate_transition_metadata(
         anyhow::bail!("refusing to admit fork build {version}: binary omitted git_hash");
     }
 
-    let missing = missing_capabilities(capabilities);
-    if !missing.is_empty() {
+    if capabilities.is_empty() {
         anyhow::bail!(
-            "refusing to admit fork build {version}: binary is missing required capabilities {}",
-            missing.join(", ")
+            "refusing to admit fork build {version}: binary omitted the generated capability manifest"
         );
     }
 
     if let Some(predecessor) = predecessor {
-        let lost = capability_loss(capabilities, &predecessor.capabilities);
+        let lost = capability_loss(capabilities, &predecessor.capabilities)
+            .into_iter()
+            .filter(|capability| {
+                !allowed_retirements
+                    .iter()
+                    .any(|retired| retired == *capability)
+            })
+            .collect::<Vec<_>>();
         if !lost.is_empty() {
             let lost = lost
                 .into_iter()
@@ -497,6 +592,12 @@ pub fn admit_installed_canonical_source_build(
 ) -> Result<ForkBuildAdmission> {
     let source = canonical_source_provenance(repo_dir, expected_commit, intake_commit)?;
     let authority = format!("local-fork:{}:{}", source.repository, source.branch);
+    let binary = version_binary_path(version)?;
+    let report = read_binary_version_report(&binary)?;
+    let (manifest, legacy) = manifest_for_report(&binary, &report)?;
+    if !legacy {
+        manifest.validate_source_paths(repo_dir)?;
+    }
     admit_installed_fork_build_inner(version, &authority, predecessor, Some(source), false)
 }
 
@@ -532,7 +633,8 @@ fn admit_installed_fork_build_inner(
             );
         }
     }
-    let git_hash = report.git_hash.unwrap_or_default();
+    let git_hash = report.git_hash.clone().unwrap_or_default();
+    let (mut candidate_manifest, candidate_legacy) = manifest_for_report(&binary, &report)?;
     if let Some(source) = source.as_ref() {
         validate_recorded_source(source, &git_hash)?;
     }
@@ -542,6 +644,30 @@ fn admit_installed_fork_build_inner(
         .map_err(|error| {
             anyhow::anyhow!("build {version} does not extend an admitted fork release: {error}")
         })?;
+
+    let mut predecessor_legacy = false;
+    let predecessor_manifest = if let Some(predecessor_admission) = predecessor_admission.as_ref() {
+        let predecessor_binary = version_binary_path(&predecessor_admission.version)?;
+        let predecessor_report = read_binary_version_report(&predecessor_binary)?;
+        let (manifest, legacy) = manifest_for_report(&predecessor_binary, &predecessor_report)?;
+        predecessor_legacy = legacy;
+        Some(manifest)
+    } else {
+        None
+    };
+
+    if let Some(predecessor_manifest) = predecessor_manifest.as_ref()
+        && !candidate_legacy
+        && !predecessor_legacy
+    {
+        candidate_manifest.predecessor_manifest_sha256 = Some(predecessor_manifest.digest()?);
+        candidate_manifest.sha256 = None;
+        ForkCapabilityManifest::validate_transition(
+            predecessor_manifest,
+            &candidate_manifest,
+            version,
+        )?;
+    }
 
     // Once a release-line head exists, every new build must name that exact
     // head. This prevents a higher-semver build from silently starting a new
@@ -562,7 +688,14 @@ fn admit_installed_fork_build_inner(
         &git_hash,
         &report.capabilities,
         predecessor_admission.as_ref(),
+        &candidate_manifest
+            .retirements
+            .iter()
+            .map(|record| record.capability_id.clone())
+            .collect::<Vec<_>>(),
     )?;
+
+    write_immutable_manifest(&binary, &candidate_manifest)?;
 
     let binary_sha256 = binary_sha256(&binary)?;
     let source_fingerprint = source_fingerprint_for_binary(&binary)?;
@@ -649,6 +782,26 @@ fn require_admitted_fork_build_inner(
     }
 
     let report = read_binary_version_report(&binary)?;
+    let manifest_sidecar_exists = manifest_path_for_binary(&binary).exists();
+    let (manifest, legacy_manifest) = manifest_for_report(&binary, &report)?;
+    if !manifest_sidecar_exists && !legacy_manifest {
+        anyhow::bail!(
+            "admitted fork build {version} is missing its post-governance capability manifest sidecar"
+        );
+    }
+    validate_manifest_report_identity(&binary, &report, &manifest)?;
+    let manifest_capabilities = manifest
+        .capabilities
+        .iter()
+        .map(|capability| capability.id.clone())
+        .collect::<Vec<_>>();
+    if manifest_capabilities != report.capabilities {
+        anyhow::bail!(
+            "admitted fork build {version} capability manifest changed: manifest {:?}, binary {:?}",
+            manifest_capabilities,
+            report.capabilities
+        );
+    }
     if let Some(expected) = release_version(version) {
         let reported = report
             .version
@@ -684,14 +837,27 @@ fn require_admitted_fork_build_inner(
         );
     }
 
-    let missing = missing_capabilities(&admission.capabilities);
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "fork admission for {version} is missing required capabilities {}",
-            missing.join(", ")
-        );
+    if let Some(predecessor_version) = admission.predecessor.as_deref()
+        && !legacy_manifest
+    {
+        let predecessor_binary = version_binary_path(predecessor_version)?;
+        let predecessor_report = read_binary_version_report(&predecessor_binary)?;
+        let (predecessor_manifest, predecessor_legacy) =
+            manifest_for_report(&predecessor_binary, &predecessor_report)?;
+        if !predecessor_legacy {
+            ForkCapabilityManifest::validate_transition(&predecessor_manifest, &manifest, version)?;
+        }
     }
 
+    let allowed_retirements = if legacy_manifest {
+        Vec::new()
+    } else {
+        manifest
+            .retirements
+            .iter()
+            .map(|record| record.capability_id.clone())
+            .collect::<Vec<_>>()
+    };
     if let Some(predecessor) = admission.predecessor.as_deref() {
         let predecessor = require_admitted_fork_build_inner(predecessor, seen)?;
         validate_transition_metadata(
@@ -700,6 +866,7 @@ fn require_admitted_fork_build_inner(
             &admission.git_hash,
             &admission.capabilities,
             Some(&predecessor),
+            &allowed_retirements,
         )?;
     } else {
         validate_transition_metadata(
@@ -708,6 +875,7 @@ fn require_admitted_fork_build_inner(
             &admission.git_hash,
             &admission.capabilities,
             None,
+            &allowed_retirements,
         )?;
     }
     Ok(admission)
@@ -842,6 +1010,7 @@ pub fn bootstrap_legacy_fork_build(repo_dir: &Path) -> Result<Option<ForkBuildAd
                 &reported_hash,
                 &report.capabilities,
                 None,
+                &[],
             )?;
             Ok((version.clone(), binary, report, reported_hash))
         })();
@@ -1576,12 +1745,191 @@ fn update_channel_symlink(channel: &str, version: &str) -> Result<PathBuf> {
     Ok(link_path)
 }
 
+fn channel_marker_path(channel: &str) -> Result<PathBuf> {
+    match channel {
+        "stable" => stable_version_file(),
+        "current" => current_version_file(),
+        "shared-server" => shared_server_version_file(),
+        _ => anyhow::bail!(
+            "unsupported governed channel {channel}; expected stable, current, or shared-server"
+        ),
+    }
+}
+
+fn normalized_channel_marker(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn read_channel_marker(channel: &str) -> Result<Option<String>> {
+    let path = channel_marker_path(channel)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "refusing to read symlinked governed channel marker {}",
+            path.display()
+        );
+    }
+    let value = std::fs::read_to_string(&path)?;
+    Ok(normalized_channel_marker(Some(&value)).map(str::to_string))
+}
+
+struct ChannelCasLock {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl Drop for ChannelCasLock {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_channel_cas_lock(channel: &str) -> Result<ChannelCasLock> {
+    let lock_path = builds_dir()?.join(format!(".channel-{channel}.lock"));
+    for _ in 0..200 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => {
+                return Ok(ChannelCasLock {
+                    path: lock_path,
+                    file: Some(file),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create governed channel lock {}", lock_path.display())
+                });
+            }
+        }
+    }
+    anyhow::bail!(
+        "timed out waiting for governed channel lock {}",
+        lock_path.display()
+    )
+}
+
+fn write_channel_marker_atomically(path: &Path, version: &str) -> Result<()> {
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to replace symlinked governed channel marker {}",
+                path.display()
+            );
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("governed channel marker has no parent"))?;
+    storage::ensure_dir(parent)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp = parent.join(format!(
+        ".{}.tmp-{}-{nonce}",
+        binary_stem(),
+        std::process::id()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .with_context(|| format!("create temporary channel marker {}", temp.display()))?;
+    use std::io::Write as _;
+    file.write_all(version.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error).with_context(|| {
+            format!(
+                "atomically install governed channel marker {}",
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn rollback_channel_symlink(channel: &str, previous: Option<&str>) -> Result<()> {
+    let link = builds_dir()?.join(channel).join(binary_name());
+    match normalized_channel_marker(previous) {
+        Some(previous) => {
+            update_channel_symlink(channel, previous)?;
+        }
+        None => {
+            if link.exists() {
+                std::fs::remove_file(link)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Promote an admitted immutable version using a governed compare-and-swap.
+///
+/// `expected` is the caller's observed marker. The marker is re-read while a
+/// per-channel lock is held, so a stale updater fails closed instead of
+/// overwriting a newer upstream automerge or operator promotion. The binary
+/// symlink and marker are staged together with rollback on marker failure.
+pub fn promote_channel_cas(
+    channel: &str,
+    version: &str,
+    expected: Option<&str>,
+) -> Result<Option<String>> {
+    channel_marker_path(channel)?;
+    require_admitted_fork_build(version)?;
+    let _lock = acquire_channel_cas_lock(channel)?;
+    let previous = read_channel_marker(channel)?;
+    if normalized_channel_marker(expected) != normalized_channel_marker(previous.as_deref()) {
+        anyhow::bail!(
+            "stale governed channel state for {channel}: expected {:?}, observed {:?}",
+            normalized_channel_marker(expected),
+            normalized_channel_marker(previous.as_deref())
+        );
+    }
+
+    update_channel_symlink(channel, version)?;
+    if let Err(error) = write_channel_marker_atomically(&channel_marker_path(channel)?, version) {
+        let rollback = rollback_channel_symlink(channel, previous.as_deref());
+        return match rollback {
+            Ok(()) => {
+                Err(error).context("governed channel marker update failed; symlink rolled back")
+            }
+            Err(rollback_error) => Err(error).context(format!(
+                "governed channel marker update failed and rollback failed: {rollback_error:#}"
+            )),
+        };
+    }
+    Ok(previous)
+}
+
+fn update_admitted_channel(channel: &str, version: &str) -> Result<PathBuf> {
+    let expected = read_channel_marker(channel)?;
+    promote_channel_cas(channel, version, expected.as_deref())?;
+    Ok(builds_dir()?.join(channel).join(binary_name()))
+}
+
 /// Update stable symlink to point to a version and publish stable-version marker.
 pub fn update_stable_symlink(version: &str) -> Result<PathBuf> {
-    require_admitted_fork_build(version)?;
-    let stable_link = update_channel_symlink("stable", version)?;
-    std::fs::write(stable_version_file()?, version)?;
-    Ok(stable_link)
+    update_admitted_channel("stable", version)
 }
 
 pub fn update_stable_to_admitted_fork_build(version: &str) -> Result<PathBuf> {
@@ -1590,10 +1938,7 @@ pub fn update_stable_to_admitted_fork_build(version: &str) -> Result<PathBuf> {
 
 /// Update current symlink to point to a version and publish current-version marker.
 pub fn update_current_symlink(version: &str) -> Result<PathBuf> {
-    require_admitted_fork_build(version)?;
-    let current_link = update_channel_symlink("current", version)?;
-    std::fs::write(current_version_file()?, version)?;
-    Ok(current_link)
+    update_admitted_channel("current", version)
 }
 
 pub fn update_current_to_admitted_fork_build(version: &str) -> Result<PathBuf> {
@@ -1603,10 +1948,7 @@ pub fn update_current_to_admitted_fork_build(version: &str) -> Result<PathBuf> {
 /// Update the shared server symlink to point to a version and publish the
 /// shared-server-version marker.
 pub fn update_shared_server_symlink(version: &str) -> Result<PathBuf> {
-    require_admitted_fork_build(version)?;
-    let shared_link = update_channel_symlink("shared-server", version)?;
-    std::fs::write(shared_server_version_file()?, version)?;
-    Ok(shared_link)
+    update_admitted_channel("shared-server", version)
 }
 
 pub fn update_shared_server_to_admitted_fork_build(version: &str) -> Result<PathBuf> {
@@ -1684,8 +2026,7 @@ pub fn publish_local_current_build(repo_dir: &std::path::Path) -> Result<PathBuf
 /// Promote an already installed immutable version onto the shared server channel.
 pub fn promote_version_to_shared_server(version: &str) -> Result<Option<String>> {
     let previous = read_shared_server_version()?;
-    update_shared_server_to_admitted_fork_build(version)?;
-    Ok(previous)
+    promote_channel_cas("shared-server", version, previous.as_deref())
 }
 
 /// Returns true when the `shared-server` channel is merely tracking the

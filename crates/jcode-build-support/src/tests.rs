@@ -86,6 +86,8 @@ fn test_binary_version_hash_mismatch_rejects_publish_candidate() {
         version: Some("v0.0.0-dev (oldhash, dirty)".to_string()),
         git_hash: Some("oldhash".to_string()),
         capabilities: vec!["mt".to_string(), "tasker".to_string()],
+        manifest_version: None,
+        manifest_sha256: None,
     };
 
     let error = validate_binary_version_matches_source_report(&report, Path::new("jcode"), &source)
@@ -796,6 +798,40 @@ fn write_report_binary(version: &str, git_hash: &str, capabilities: &[&str]) -> 
 }
 
 #[cfg(unix)]
+fn write_governed_report_binary(version: &str, git_hash: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let manifest = builtin_manifest().expect("builtin capability manifest");
+    let path = version_binary_path(version).expect("version path");
+    std::fs::create_dir_all(path.parent().expect("version parent")).expect("version directory");
+    let report = serde_json::json!({
+        "version": format!("v{version} ({git_hash})"),
+        "git_hash": git_hash,
+        "capabilities": manifest
+            .capabilities
+            .iter()
+            .map(|capability| capability.id.clone())
+            .collect::<Vec<_>>(),
+        "manifest_version": manifest.manifest_version.clone(),
+        "manifest_sha256": manifest.digest().expect("manifest digest"),
+    });
+    let report = serde_json::to_string(&report).expect("report json");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ] && [ \"$2\" = \"--json\" ]; then\nprintf '%s\\n' '{report}'\nexit 0\nfi\nexit 1\n"
+        ),
+    )
+    .expect("write governed report binary");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("governed report metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("make governed report executable");
+    path
+}
+
+#[cfg(unix)]
 fn source_fixture_git(repo: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)
@@ -1181,6 +1217,110 @@ fn admitted_descendant_is_accepted() {
         .expect("admitted descendant");
         assert_eq!(admission.predecessor.as_deref(), Some(predecessor));
         require_admitted_fork_build(candidate).expect("descendant remains admitted");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn governed_manifest_admission_preserves_exact_predecessor_digest() {
+    with_temp_jcode_home(|| {
+        let predecessor = "0.68.1";
+        write_governed_report_binary(predecessor, "governed-head");
+        let authority = format!("github:{CANONICAL_FORK_REPOSITORY}:release");
+        let first = admit_installed_fork_build(predecessor, &authority, None)
+            .expect("generated manifest build should be admitted");
+        assert_eq!(
+            first.capabilities.len(),
+            builtin_capability_ids().unwrap().len()
+        );
+        update_stable_symlink(predecessor).expect("publish governed predecessor");
+
+        let candidate = "0.69.0";
+        write_governed_report_binary(candidate, "governed-candidate");
+        let second = admit_installed_fork_build(candidate, &authority, Some(predecessor))
+            .expect("generated manifest descendant should be admitted");
+        let predecessor_manifest =
+            read_manifest_for_binary(&version_binary_path(predecessor).expect("predecessor path"))
+                .expect("read predecessor manifest")
+                .expect("predecessor manifest");
+        let candidate_manifest =
+            read_manifest_for_binary(&version_binary_path(candidate).expect("candidate path"))
+                .expect("read candidate manifest")
+                .expect("candidate manifest");
+        let predecessor_digest = predecessor_manifest.digest().unwrap();
+        assert_eq!(
+            candidate_manifest.predecessor_manifest_sha256.as_deref(),
+            Some(predecessor_digest.as_str())
+        );
+        assert_eq!(second.predecessor.as_deref(), Some(predecessor));
+        require_admitted_fork_build(candidate).expect("candidate manifest must remain admitted");
+    });
+}
+
+#[test]
+fn governed_channel_cas_rejects_stale_state_without_overwriting_newer_promotion() {
+    with_temp_jcode_home(|| {
+        let previous = "0.68.1";
+        let candidate = "0.69.0";
+        install_test_admitted_binary(previous).expect("install previous build");
+        install_test_admitted_binary(candidate).expect("install candidate build");
+        update_stable_symlink(previous).expect("publish previous stable build");
+
+        let error = promote_channel_cas("stable", candidate, Some("stale-observation"))
+            .expect_err("stale CAS observation must fail closed");
+        assert!(error.to_string().contains("stale governed channel state"));
+        assert_eq!(
+            read_stable_version()
+                .expect("read stable marker")
+                .as_deref(),
+            Some(previous),
+            "stale promotion must not overwrite the observed marker"
+        );
+
+        let promoted_from = promote_channel_cas("stable", candidate, Some(previous))
+            .expect("fresh CAS observation should promote")
+            .expect("promotion should report its predecessor");
+        assert_eq!(promoted_from, previous);
+        assert_eq!(
+            read_stable_version()
+                .expect("read stable marker")
+                .as_deref(),
+            Some(candidate)
+        );
+        assert!(
+            !builds_dir()
+                .expect("builds directory")
+                .join(".channel-stable.lock")
+                .exists(),
+            "CAS lock must be released after promotion"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn governed_channel_cas_rejects_symlinked_marker() {
+    use std::os::unix::fs::symlink;
+
+    with_temp_jcode_home(|| {
+        let version = "0.68.1";
+        install_test_admitted_binary(version).expect("install admitted build");
+        let marker = stable_version_file().expect("stable marker path");
+        let target = marker.with_extension("attacker-target");
+        std::fs::write(&target, "attacker\n").expect("write attacker marker target");
+        symlink(&target, &marker).expect("install symlinked marker");
+
+        let error = promote_channel_cas("stable", version, Some("attacker"))
+            .expect_err("symlinked marker must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("symlinked governed channel marker")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read attacker target"),
+            "attacker\n"
+        );
     });
 }
 

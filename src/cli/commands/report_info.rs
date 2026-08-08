@@ -112,7 +112,9 @@ pub(super) struct VersionReport {
     pub(super) build_time: String,
     pub(super) git_date: String,
     pub(super) release_build: bool,
-    pub(super) capabilities: Vec<&'static str>,
+    pub(super) capabilities: Vec<String>,
+    pub(super) manifest_version: Option<String>,
+    pub(super) manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -414,6 +416,9 @@ pub(super) async fn run_provider_current_command(
 }
 
 pub(super) fn run_version_command(emit_json: bool) -> Result<()> {
+    let capability_manifest = jcode_build_support::builtin_manifest()?;
+    let manifest_sha256 = Some(capability_manifest.digest()?);
+    let manifest_version = Some(capability_manifest.manifest_version.clone());
     let report = VersionReport {
         version: jcode_build_meta::version().to_string(),
         semver: jcode_build_meta::semver().to_string(),
@@ -425,7 +430,13 @@ pub(super) fn run_version_command(emit_json: bool) -> Result<()> {
             .unwrap_or_else(|| "unknown".to_string()),
         git_date: jcode_build_meta::git_date().to_string(),
         release_build: jcode_build_meta::is_release_build(),
-        capabilities: vec!["mt", "tasker"],
+        capabilities: capability_manifest
+            .capabilities
+            .iter()
+            .map(|capability| capability.id.clone())
+            .collect(),
+        manifest_version,
+        manifest_sha256,
     };
 
     if emit_json {
@@ -441,6 +452,12 @@ pub(super) fn run_version_command(emit_json: bool) -> Result<()> {
         println!("git_date\t{}", report.git_date);
         println!("release_build\t{}", report.release_build);
         println!("capabilities\t{}", report.capabilities.join(","));
+        if let Some(version) = report.manifest_version.as_deref() {
+            println!("manifest_version\t{version}");
+        }
+        if let Some(digest) = report.manifest_sha256.as_deref() {
+            println!("manifest_sha256\t{digest}");
+        }
     }
 
     Ok(())

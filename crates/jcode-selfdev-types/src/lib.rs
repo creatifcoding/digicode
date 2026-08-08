@@ -60,6 +60,13 @@ pub struct BinaryVersionReport {
     pub git_hash: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Schema version of the generated fork capability manifest, when this is
+    /// a post-governance build. Legacy binaries omit it and are migrated once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_version: Option<String>,
+    /// SHA-256 of the canonical generated capability manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_sha256: Option<String>,
 }
 
 /// Which binary to use.
