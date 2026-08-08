@@ -267,6 +267,7 @@ pub fn record_invocation(
     jcode_base::telemetry::record_metatool_invocation(telemetry);
 
     let fields = [
+        ("trace_id", trace.trace_id.clone()),
         ("action", action.to_string()),
         ("outcome", outcome.to_string()),
         (
@@ -479,6 +480,8 @@ fn observability_dir(working_dir: Option<&Path>) -> Result<PathBuf> {
         .unwrap_or_else(|| "global".to_string());
     let directory = root.join(digest_str(&workspace));
     crate::storage::ensure_dir(&directory)?;
+    crate::platform::set_directory_permissions_owner_only(&directory)
+        .context("harden local MetaTool observability directory")?;
     Ok(directory)
 }
 
@@ -508,7 +511,12 @@ fn prune_findings(findings: &mut Vec<Finding>, now: u64) {
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
     fs::write(&temporary, bytes).context("write local MetaTool observability state")?;
-    fs::rename(&temporary, path).context("commit local MetaTool observability state")
+    crate::platform::set_permissions_owner_only(&temporary)
+        .context("harden temporary MetaTool observability state")?;
+    fs::rename(&temporary, path).context("commit local MetaTool observability state")?;
+    crate::platform::set_permissions_owner_only(path)
+        .context("harden local MetaTool observability state")?;
+    Ok(())
 }
 
 fn find_finding<'a>(findings: &'a [Finding], finding_id: &str) -> Result<&'a Finding> {
