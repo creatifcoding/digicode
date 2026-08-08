@@ -754,6 +754,7 @@ fn write_test_admission(
         binary_sha256: binary_sha256(&binary).expect("hash test binary"),
         predecessor: predecessor.map(str::to_string),
         source_fingerprint: None,
+        source: None,
         capabilities: capabilities
             .iter()
             .map(|value| (*value).to_string())
@@ -792,6 +793,174 @@ fn write_report_binary(version: &str, git_hash: &str, capabilities: &[&str]) -> 
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).expect("make report binary executable");
     path
+}
+
+#[cfg(unix)]
+fn source_fixture_git(repo: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("run git fixture command");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[cfg(unix)]
+fn canonical_source_fixture() -> (tempfile::TempDir, String, String, String) {
+    let repo = tempfile::tempdir().expect("source fixture tempdir");
+    source_fixture_git(repo.path(), &["init", "-b", CANONICAL_FORK_RELEASE_BRANCH]);
+    source_fixture_git(repo.path(), &["config", "user.email", "test@example.com"]);
+    source_fixture_git(repo.path(), &["config", "user.name", "Test User"]);
+    source_fixture_git(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:creatifcoding/jcode.git",
+        ],
+    );
+
+    std::fs::write(repo.path().join("base.txt"), "base\n").expect("write base");
+    source_fixture_git(repo.path(), &["add", "base.txt"]);
+    source_fixture_git(repo.path(), &["commit", "-m", "base"]);
+
+    std::fs::write(repo.path().join("canonical.txt"), "canonical\n").expect("write canonical");
+    source_fixture_git(repo.path(), &["add", "canonical.txt"]);
+    source_fixture_git(repo.path(), &["commit", "-m", "canonical release"]);
+    let canonical = source_fixture_git(repo.path(), &["rev-parse", "HEAD"]);
+
+    source_fixture_git(repo.path(), &["checkout", "-b", "intake"]);
+    std::fs::write(repo.path().join("upstream.txt"), "upstream\n").expect("write upstream");
+    source_fixture_git(repo.path(), &["add", "upstream.txt"]);
+    source_fixture_git(repo.path(), &["commit", "-m", "upstream intake"]);
+    let upstream = source_fixture_git(repo.path(), &["rev-parse", "HEAD"]);
+
+    source_fixture_git(
+        repo.path(),
+        &[
+            "checkout",
+            "-b",
+            "merge-candidate",
+            CANONICAL_FORK_RELEASE_BRANCH,
+        ],
+    );
+    source_fixture_git(
+        repo.path(),
+        &["merge", "--no-ff", "intake", "-m", "admit upstream intake"],
+    );
+    let merge = source_fixture_git(repo.path(), &["rev-parse", "HEAD"]);
+
+    (repo, canonical, upstream, merge)
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_upstream_source_build_cannot_be_admitted_or_advance_channel() {
+    with_temp_jcode_home(|| {
+        let (repo, _canonical, upstream, _merge) = canonical_source_fixture();
+        source_fixture_git(repo.path(), &["checkout", "intake"]);
+        let version = "0.70.0";
+        write_report_binary(version, &upstream[..7], &["mt", "tasker"]);
+
+        let source_intake_error = admit_installed_fork_build(
+            version,
+            &format!("local-fork:{CANONICAL_FORK_REPOSITORY}:source-intake"),
+            None,
+        )
+        .expect_err("caller-supplied source-intake authority must not be evidence");
+        assert!(source_intake_error.to_string().contains("source-intake"));
+
+        let error = admit_installed_canonical_source_build(
+            version,
+            repo.path(),
+            &upstream,
+            Some(&upstream),
+            None,
+        )
+        .expect_err("raw upstream SHA must not pass canonical ancestry checks");
+        assert!(error.to_string().contains("merge commit"));
+        assert!(
+            read_build_admission(version)
+                .expect("read rejected receipt")
+                .is_none()
+        );
+        assert!(
+            update_stable_to_admitted_fork_build(version).is_err(),
+            "raw upstream build must not advance stable"
+        );
+        assert!(
+            update_current_to_admitted_fork_build(version).is_err(),
+            "raw upstream build must not advance current"
+        );
+        assert!(
+            update_shared_server_to_admitted_fork_build(version).is_err(),
+            "raw upstream build must not advance shared-server"
+        );
+        assert!(
+            update_canary_symlink(version).is_err(),
+            "raw upstream build must not advance canary"
+        );
+        assert!(read_stable_version().expect("read stable marker").is_none());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_release_descendant_and_verified_merge_can_be_admitted() {
+    with_temp_jcode_home(|| {
+        let (repo, canonical, upstream, merge) = canonical_source_fixture();
+
+        let canonical_version = "0.70.0";
+        source_fixture_git(repo.path(), &["checkout", CANONICAL_FORK_RELEASE_BRANCH]);
+        write_report_binary(canonical_version, &canonical[..7], &["mt", "tasker"]);
+        admit_installed_canonical_source_build(
+            canonical_version,
+            repo.path(),
+            &canonical,
+            None,
+            None,
+        )
+        .expect("canonical release branch head should be admissible");
+        update_stable_to_admitted_fork_build(canonical_version)
+            .expect("canonical release branch should advance stable");
+
+        let merge_version = "0.71.0";
+        source_fixture_git(repo.path(), &["checkout", "merge-candidate"]);
+        write_report_binary(merge_version, &merge[..7], &["mt", "tasker"]);
+        let admission = admit_installed_canonical_source_build(
+            merge_version,
+            repo.path(),
+            &merge,
+            Some(&upstream),
+            Some(canonical_version),
+        )
+        .expect("verified canonical merge descendant should be admissible");
+        assert_eq!(admission.predecessor.as_deref(), Some(canonical_version));
+        assert_eq!(
+            admission
+                .source
+                .as_ref()
+                .and_then(|source| source.intake_commit.as_deref()),
+            Some(upstream.as_str())
+        );
+        update_stable_to_admitted_fork_build(merge_version)
+            .expect("verified merge descendant should advance stable");
+        require_admitted_fork_build(merge_version)
+            .expect("verified merge descendant should remain admitted");
+        assert_eq!(
+            read_stable_version()
+                .expect("read stable marker")
+                .as_deref(),
+            Some(merge_version)
+        );
+    });
 }
 
 #[cfg(unix)]

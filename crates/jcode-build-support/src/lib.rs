@@ -26,7 +26,7 @@ pub use storage_helpers::{
     version_binary_path, write_build_progress,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use jcode_storage as storage;
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,9 @@ pub use jcode_selfdev_types::{
 /// channel builds. This is deliberately the maintained fork, not the upstream
 /// source repository.
 pub const CANONICAL_FORK_REPOSITORY: &str = "creatifcoding/jcode";
+/// Branch on the canonical fork that is allowed to feed automatic source
+/// updates. Upstream branches are intake-only and never build targets.
+pub const CANONICAL_FORK_RELEASE_BRANCH: &str = "master";
 /// Upstream is an input to source-update workflows only. It is never a valid
 /// release or local-fork binary authority.
 pub const UPSTREAM_SOURCE_REPOSITORY: &str = "1jehuang/jcode";
@@ -67,13 +70,279 @@ pub struct ForkBuildAdmission {
     /// the canonical release metadata and therefore have no dirty fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_fingerprint: Option<String>,
+    /// Git provenance for an automatic source build. This is recorded only
+    /// after the checkout's remote, release branch, and ancestry have been
+    /// verified locally. A caller-supplied authority string is not evidence of
+    /// this provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ForkBuildSource>,
     pub capabilities: Vec<String>,
     pub admitted_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkBuildSource {
+    pub repository: String,
+    pub branch: String,
+    pub commit: String,
+    /// Upstream commit that was fetched as intake and then incorporated by a
+    /// verified merge. The upstream commit is never itself a build target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intake_commit: Option<String>,
 }
 
 fn canonical_authority(authority: &str) -> bool {
     authority.starts_with(&format!("github:{CANONICAL_FORK_REPOSITORY}:"))
         || authority.starts_with(&format!("local-fork:{CANONICAL_FORK_REPOSITORY}:"))
+}
+
+fn source_intake_authority(authority: &str) -> bool {
+    authority == format!("local-fork:{CANONICAL_FORK_REPOSITORY}:source-intake")
+}
+
+fn canonical_remote_url(url: &str) -> bool {
+    let url = url.trim().trim_end_matches('/');
+    [
+        format!("https://github.com/{CANONICAL_FORK_REPOSITORY}"),
+        format!("git@github.com:{CANONICAL_FORK_REPOSITORY}"),
+        format!("ssh://git@github.com/{CANONICAL_FORK_REPOSITORY}"),
+    ]
+    .into_iter()
+    .any(|prefix| url.trim_end_matches(".git") == prefix)
+}
+
+fn git_output(repo_dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_ref_exists(repo_dir: &Path, reference: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(repo_dir)
+        .output()
+        .with_context(|| format!("failed to check git ref {reference}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "failed to check git ref {reference}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn git_is_ancestor(repo_dir: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(repo_dir)
+        .output()
+        .with_context(|| format!("failed to compare git ancestry {ancestor}..{descendant}"))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => anyhow::bail!(
+            "failed to compare git ancestry {ancestor}..{descendant}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn is_hex_commit(value: &str) -> bool {
+    let value = value.trim();
+    (7..=64).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn commit_matches(expected: &str, actual: &str) -> bool {
+    let expected = expected.trim();
+    let actual = actual.trim();
+    !expected.is_empty()
+        && !actual.is_empty()
+        && (expected == actual || actual.starts_with(expected) || expected.starts_with(actual))
+}
+
+/// Return the configured remote that points at the canonical fork.
+///
+/// This deliberately rejects a checkout whose only remote is upstream. The
+/// updater may fetch upstream as intake in a separate workflow, but it must
+/// never turn that checkout into a build target by relabeling it.
+pub fn canonical_fork_remote(repo_dir: &Path) -> Result<String> {
+    let remotes = git_output(repo_dir, &["remote"])?;
+    for remote in remotes
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let url = git_output(repo_dir, &["remote", "get-url", remote])?;
+        if canonical_remote_url(&url) {
+            return Ok(remote.to_string());
+        }
+    }
+    anyhow::bail!(
+        "refusing source build: checkout has no remote for canonical fork {CANONICAL_FORK_REPOSITORY}"
+    )
+}
+
+fn canonical_release_ref(repo_dir: &Path, remote: &str) -> Result<String> {
+    let remote_ref = format!("refs/remotes/{remote}/{CANONICAL_FORK_RELEASE_BRANCH}");
+    if git_ref_exists(repo_dir, &remote_ref)? {
+        return Ok(remote_ref);
+    }
+
+    let local_ref = format!("refs/heads/{CANONICAL_FORK_RELEASE_BRANCH}");
+    if git_ref_exists(repo_dir, &local_ref)? {
+        return Ok(local_ref);
+    }
+
+    anyhow::bail!(
+        "refusing source build: canonical fork release branch {CANONICAL_FORK_RELEASE_BRANCH} is not present"
+    )
+}
+
+/// Validate that a source checkout is a canonical fork release build target.
+///
+/// The checkout may be exactly at the canonical release branch, or it may be
+/// an explicitly admitted merge descendant. In the latter case the caller
+/// must provide the upstream commit that was fetched as intake, and the local
+/// graph must prove both canonical ancestry and a merge commit. The authority
+/// string used in the eventual receipt is intentionally not an input here.
+pub fn canonical_source_provenance(
+    repo_dir: &Path,
+    expected_commit: &str,
+    intake_commit: Option<&str>,
+) -> Result<ForkBuildSource> {
+    if !repo_dir.join(".git").exists() {
+        anyhow::bail!(
+            "refusing source build: {} is not a git checkout",
+            repo_dir.display()
+        );
+    }
+    if !is_hex_commit(expected_commit) {
+        anyhow::bail!("refusing source build: expected commit is not a valid git SHA");
+    }
+
+    let remote = canonical_fork_remote(repo_dir)?;
+    let release_ref = canonical_release_ref(repo_dir, &remote)?;
+    let release_commit = git_output(repo_dir, &["rev-parse", &release_ref])?;
+    let head = git_output(repo_dir, &["rev-parse", "HEAD"])?;
+
+    if !commit_matches(expected_commit, &head) {
+        anyhow::bail!(
+            "refusing source build: checkout HEAD {head} does not match expected commit {expected_commit}"
+        );
+    }
+    if !git_is_ancestor(repo_dir, &release_commit, &head)? {
+        anyhow::bail!(
+            "refusing source build: HEAD {head} is not a descendant of canonical release branch {release_commit}"
+        );
+    }
+
+    let intake_commit = if head == release_commit {
+        if intake_commit.is_some() {
+            anyhow::bail!(
+                "refusing source build: canonical release branch head cannot claim an upstream intake merge"
+            );
+        }
+        None
+    } else {
+        let intake_commit = intake_commit
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "refusing source build: non-branch HEAD requires an explicitly admitted upstream merge"
+                )
+            })?;
+        if !is_hex_commit(intake_commit) {
+            anyhow::bail!("refusing source build: intake commit is not a valid git SHA");
+        }
+        let intake_commit = git_output(
+            repo_dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &format!("{intake_commit}^{{commit}}"),
+            ],
+        )?;
+        if !git_is_ancestor(repo_dir, &intake_commit, &head)? {
+            anyhow::bail!(
+                "refusing source build: intake commit {intake_commit} is not an ancestor of canonical descendant {head}"
+            );
+        }
+        if git_is_ancestor(repo_dir, &intake_commit, &release_commit)? {
+            anyhow::bail!(
+                "refusing source build: intake commit {intake_commit} is already in the canonical release history"
+            );
+        }
+
+        let ancestry_range = format!("{release_commit}..{head}");
+        let merge_commits = git_output(
+            repo_dir,
+            &["rev-list", "--merges", "--ancestry-path", &ancestry_range],
+        )?;
+        if merge_commits.is_empty() {
+            anyhow::bail!(
+                "refusing source build: canonical descendant {head} has no verified merge commit"
+            );
+        }
+        Some(intake_commit)
+    };
+
+    let dirty = git_output(repo_dir, &["status", "--porcelain"])?;
+    if !dirty.is_empty() {
+        anyhow::bail!(
+            "refusing source build: canonical checkout {} has uncommitted changes",
+            repo_dir.display()
+        );
+    }
+
+    Ok(ForkBuildSource {
+        repository: CANONICAL_FORK_REPOSITORY.to_string(),
+        branch: CANONICAL_FORK_RELEASE_BRANCH.to_string(),
+        commit: head,
+        intake_commit,
+    })
+}
+
+fn validate_recorded_source(source: &ForkBuildSource, git_hash: &str) -> Result<()> {
+    if source.repository != CANONICAL_FORK_REPOSITORY {
+        anyhow::bail!(
+            "fork build source repository {:?} is not the canonical fork {CANONICAL_FORK_REPOSITORY}",
+            source.repository
+        );
+    }
+    if source.branch != CANONICAL_FORK_RELEASE_BRANCH {
+        anyhow::bail!(
+            "fork build source branch {:?} is not the canonical release branch {CANONICAL_FORK_RELEASE_BRANCH}",
+            source.branch
+        );
+    }
+    if !is_hex_commit(&source.commit) || !commit_matches(git_hash, &source.commit) {
+        anyhow::bail!(
+            "fork build source commit {} does not match binary git hash {}",
+            source.commit,
+            git_hash
+        );
+    }
+    if let Some(intake_commit) = source.intake_commit.as_deref()
+        && (!is_hex_commit(intake_commit) || intake_commit == source.commit)
+    {
+        anyhow::bail!("fork build source has an invalid upstream intake commit");
+    }
+    Ok(())
 }
 
 fn release_version(value: &str) -> Option<(u64, u64, u64)> {
@@ -215,6 +484,36 @@ pub fn admit_installed_fork_build(
     authority: &str,
     predecessor: Option<&str>,
 ) -> Result<ForkBuildAdmission> {
+    admit_installed_fork_build_inner(version, authority, predecessor, None)
+}
+
+/// Admit a binary built from a verified canonical fork checkout.
+///
+/// Unlike [`admit_installed_fork_build`], this API does not accept an authority
+/// string. It derives the authority from the checkout after proving that the
+/// binary commit is on the canonical release branch or an explicitly admitted
+/// merge descendant. Upstream commits therefore remain intake-only.
+pub fn admit_installed_canonical_source_build(
+    version: &str,
+    repo_dir: &Path,
+    expected_commit: &str,
+    intake_commit: Option<&str>,
+    predecessor: Option<&str>,
+) -> Result<ForkBuildAdmission> {
+    let source = canonical_source_provenance(repo_dir, expected_commit, intake_commit)?;
+    let authority = format!("local-fork:{}:{}", source.repository, source.branch);
+    admit_installed_fork_build_inner(version, &authority, predecessor, Some(source))
+}
+
+fn admit_installed_fork_build_inner(
+    version: &str,
+    authority: &str,
+    predecessor: Option<&str>,
+    source: Option<ForkBuildSource>,
+) -> Result<ForkBuildAdmission> {
+    if source.is_none() && source_intake_authority(authority) {
+        anyhow::bail!("refusing source-intake admission without verified canonical fork ancestry");
+    }
     let binary = version_binary_path(version)?;
     let report = read_binary_version_report(&binary)?;
     if let Some(expected) = release_version(version) {
@@ -235,6 +534,9 @@ pub fn admit_installed_fork_build(
         }
     }
     let git_hash = report.git_hash.unwrap_or_default();
+    if let Some(source) = source.as_ref() {
+        validate_recorded_source(source, &git_hash)?;
+    }
     let predecessor_admission = predecessor
         .map(require_admitted_fork_build)
         .transpose()
@@ -274,6 +576,7 @@ pub fn admit_installed_fork_build(
             && existing.binary_sha256 == binary_sha256
             && existing.predecessor.as_deref() == predecessor
             && existing.source_fingerprint == source_fingerprint
+            && existing.source == source
             && existing.capabilities == report.capabilities
         {
             return Ok(existing);
@@ -290,6 +593,7 @@ pub fn admit_installed_fork_build(
         binary_sha256,
         predecessor: predecessor.map(str::to_string),
         source_fingerprint,
+        source,
         capabilities: report.capabilities,
         admitted_at: Utc::now(),
     };
@@ -321,6 +625,9 @@ fn require_admitted_fork_build_inner(
             "fork admission for {version} has untrusted authority {:?}",
             admission.authority
         );
+    }
+    if source_intake_authority(&admission.authority) {
+        anyhow::bail!("fork admission for {version} uses an unverified source-intake authority");
     }
     if admission.binary_sha256.trim().is_empty() {
         anyhow::bail!("fork admission for {version} omitted immutable binary identity");
@@ -365,6 +672,9 @@ fn require_admitted_fork_build_inner(
             admission.git_hash,
             report.git_hash
         );
+    }
+    if let Some(source) = admission.source.as_ref() {
+        validate_recorded_source(source, &admission.git_hash)?;
     }
     if report.capabilities != admission.capabilities {
         anyhow::bail!(

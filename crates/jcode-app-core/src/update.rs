@@ -27,7 +27,7 @@ pub use update_rate_limit::{RATE_LIMIT_ERROR_PREFIX, is_rate_limit_error};
 use update_rate_limit::{clear_rate_limit_backoff, rate_limit_error};
 
 const GITHUB_REPO: &str = build::CANONICAL_FORK_REPOSITORY;
-const UPSTREAM_SOURCE_REPO: &str = build::UPSTREAM_SOURCE_REPOSITORY;
+const CANONICAL_RELEASE_BRANCH: &str = build::CANONICAL_FORK_RELEASE_BRANCH;
 /// Minimum gap between *automatic* update checks.
 ///
 /// Every automatic check costs one or two unauthenticated `api.github.com`
@@ -241,8 +241,8 @@ fn github_api_request(
 
 fn latest_main_sha_blocking() -> Result<String> {
     let url = format!(
-        "https://api.github.com/repos/{}/commits/main",
-        UPSTREAM_SOURCE_REPO
+        "https://api.github.com/repos/{}/commits/{}",
+        GITHUB_REPO, CANONICAL_RELEASE_BRANCH
     );
     let client = reqwest::blocking::Client::builder()
         .timeout(UPDATE_CHECK_TIMEOUT)
@@ -251,12 +251,15 @@ fn latest_main_sha_blocking() -> Result<String> {
 
     let response = github_api_request(&client, &url)
         .send()
-        .context("Failed to check main branch")?;
+        .context("Failed to check canonical release branch")?;
     if let Some(error) = rate_limit_error(&response) {
         return Err(error);
     }
     if !response.status().is_success() {
-        anyhow::bail!("GitHub API error checking main: {}", response.status());
+        anyhow::bail!(
+            "GitHub API error checking canonical release branch: {}",
+            response.status()
+        );
     }
 
     let commit: serde_json::Value = response.json().context("Failed to parse commit info")?;
@@ -311,11 +314,11 @@ fn verify_asset_checksum_if_available(
 fn synthetic_main_release(latest_sha: &str) -> GitHubRelease {
     GitHubRelease {
         tag_name: format!("main-{}", latest_sha),
-        _name: Some(format!("Built from main ({})", latest_sha)),
-        _html_url: format!(
-            "https://github.com/{}/commit/{}",
-            UPSTREAM_SOURCE_REPO, latest_sha
-        ),
+        _name: Some(format!(
+            "Built from canonical release branch ({})",
+            latest_sha
+        )),
+        _html_url: format!("https://github.com/{}/commit/{}", GITHUB_REPO, latest_sha),
         _published_at: None,
         assets: vec![],
         _target_commitish: latest_sha.to_string(),
@@ -323,7 +326,7 @@ fn synthetic_main_release(latest_sha: &str) -> GitHubRelease {
 }
 
 fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
-    let path = build_from_source()?;
+    let path = build_from_source(latest_sha)?;
     crate::logging::info(&format!(
         "Main channel: built successfully at {}",
         path.display()
@@ -334,9 +337,11 @@ fn install_main_source_update_blocking(latest_sha: &str) -> Result<PathBuf> {
     build::install_binary_at_version(&path, &channel_version)
         .context("Failed to install built binary")?;
     let predecessor = build::admitted_release_line_head()?;
-    build::admit_installed_fork_build(
+    build::admit_installed_canonical_source_build(
         &channel_version,
-        &format!("local-fork:{GITHUB_REPO}:source-intake"),
+        &source_build_repo_dir()?,
+        latest_sha,
+        None,
         predecessor.as_deref(),
     )?;
     // Carry the long-lived daemon's reload target forward too, but only when it
@@ -709,8 +714,12 @@ fn has_cargo() -> bool {
         .unwrap_or(false)
 }
 
-/// Build jcode from source by cloning/pulling the repo and running cargo build
-fn build_from_source() -> Result<PathBuf> {
+/// Build jcode from the canonical fork release branch.
+///
+/// Upstream is never a checkout or build target here. A checkout with only an
+/// upstream remote fails closed, and the ancestry validator runs before cargo
+/// so an untrusted SHA cannot become an installed binary by relabeling.
+fn build_from_source(expected_sha: &str) -> Result<PathBuf> {
     let started = Instant::now();
     let build_dir = source_build_root()?;
     fs::create_dir_all(&build_dir)?;
@@ -718,49 +727,50 @@ fn build_from_source() -> Result<PathBuf> {
     let repo_dir = build_dir.join("jcode");
 
     if repo_dir.join(".git").exists() {
-        // Pull latest
-        crate::logging::info("Main channel: pulling latest from main...");
-        let upstream_url = format!("https://github.com/{UPSTREAM_SOURCE_REPO}.git");
+        let remote = build::canonical_fork_remote(&repo_dir)?;
+        crate::logging::info(&format!(
+            "Main channel: fetching canonical release branch {}...",
+            CANONICAL_RELEASE_BRANCH
+        ));
         let output = std::process::Command::new("git")
-            .args(["pull", "--ff-only", &upstream_url, "main"])
+            .args(["fetch", "--force", &remote, CANONICAL_RELEASE_BRANCH])
             .current_dir(&repo_dir)
             .output()
-            .context("Failed to run git pull")?;
+            .context("Failed to fetch canonical release branch")?;
 
         if !output.status.success() {
-            // If pull fails (e.g. diverged), reset to origin/main
-            let summary = summarize_git_pull_failure(&output.stderr);
-            crate::logging::warn(&format!("{}, trying reset", summary));
-            let output = std::process::Command::new("git")
-                .args(["fetch", &upstream_url, "main"])
-                .current_dir(&repo_dir)
-                .output()
-                .context("Failed to run git fetch")?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "git fetch failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            let output = std::process::Command::new("git")
-                .args(["reset", "--hard", "FETCH_HEAD"])
-                .current_dir(&repo_dir)
-                .output()
-                .context("Failed to run git reset")?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "git reset failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            anyhow::bail!(
+                "git fetch of canonical release branch failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = std::process::Command::new("git")
+            .args(["reset", "--hard", "FETCH_HEAD"])
+            .current_dir(&repo_dir)
+            .output()
+            .context("Failed to reset canonical source checkout")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git reset of canonical source checkout failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     } else {
         // Clone
-        crate::logging::info("Main channel: cloning repository...");
-        let clone_url = format!("https://github.com/{UPSTREAM_SOURCE_REPO}.git");
+        crate::logging::info(&format!(
+            "Main channel: cloning canonical fork release branch {}...",
+            CANONICAL_RELEASE_BRANCH
+        ));
+        let clone_url = format!("https://github.com/{GITHUB_REPO}.git");
         let output = std::process::Command::new("git")
             .args([
-                "clone", "--depth", "1", "--branch", "main", &clone_url, "jcode",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                CANONICAL_RELEASE_BRANCH,
+                &clone_url,
+                "jcode",
             ])
             .current_dir(&build_dir)
             .output()
@@ -773,6 +783,9 @@ fn build_from_source() -> Result<PathBuf> {
             );
         }
     }
+
+    build::canonical_source_provenance(&repo_dir, expected_sha, None)
+        .context("canonical source ancestry validation failed before build")?;
 
     // Build
     crate::logging::info("Main channel: building with cargo...");
@@ -1326,9 +1339,9 @@ mod tests {
         validate_canonical_release_metadata(&canonical).expect("canonical release should pass");
 
         let upstream = release_metadata(
-            &format!("https://github.com/{UPSTREAM_SOURCE_REPO}/releases/tag/v0.69.0"),
+            &format!("https://github.com/{build::UPSTREAM_SOURCE_REPOSITORY}/releases/tag/v0.69.0"),
             &format!(
-                "https://github.com/{UPSTREAM_SOURCE_REPO}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
+                "https://github.com/{build::UPSTREAM_SOURCE_REPOSITORY}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
             ),
         );
         assert!(validate_canonical_release_metadata(&upstream).is_err());
@@ -1336,7 +1349,7 @@ mod tests {
         let mixed = release_metadata(
             &format!("https://github.com/{GITHUB_REPO}/releases/tag/v0.69.0"),
             &format!(
-                "https://github.com/{UPSTREAM_SOURCE_REPO}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
+                "https://github.com/{build::UPSTREAM_SOURCE_REPOSITORY}/releases/download/v0.69.0/jcode-linux-x86_64.tar.gz"
             ),
         );
         assert!(validate_canonical_release_metadata(&mixed).is_err());
