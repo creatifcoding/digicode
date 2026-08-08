@@ -1,0 +1,900 @@
+{
+  "schema_version": 1,
+  "manifest_version": "1.0.0",
+  "generated_from_commit": "1d54c4579cc5742216551c078bef002eecf72d82",
+  "capabilities": [
+    {
+      "id": "ag-ui",
+      "display_name": "AG-UI React Native gateway",
+      "owner": "maintained-fork",
+      "introduced_commit": "3d2404ba07269468192ed5af4d74a45c35c56afc",
+      "lifecycle": "active",
+      "source_paths": [
+        "apps/mobile/app/_layout.tsx",
+        "apps/mobile/app/index.tsx",
+        "apps/mobile/app/session/[id].tsx",
+        "apps/mobile/src/network/pairing.ts",
+        "apps/mobile/src/network/transport.ts",
+        "apps/mobile/src/protocol/reducer.ts",
+        "apps/mobile/src/protocol/types.ts",
+        "crates/jcode-protocol/src/lib.rs",
+        "docs/proposals/JCODE_AG_UI_REACT_NATIVE.md"
+      ],
+      "asset_paths": [
+        "apps/mobile/app.json",
+        "apps/mobile/docs/setup-and-security.md",
+        "apps/mobile/package.json"
+      ],
+      "schema_contract": {
+        "summary": "schema: The mobile gateway and AG-UI proposal share versioned session and transport message shapes.",
+        "references": [
+          "apps/mobile/app/_layout.tsx",
+          "apps/mobile/app/index.tsx",
+          "apps/mobile/app/session/[id].tsx"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The gateway exposes pairing, transport, and session routes through the mobile client protocol.",
+        "references": [
+          "apps/mobile/app/_layout.tsx",
+          "apps/mobile/app/index.tsx",
+          "apps/mobile/app/session/[id].tsx",
+          "apps/mobile/src/network/pairing.ts"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: The client preserves reconnect, pairing, reducer, and session lifecycle semantics.",
+        "references": [
+          "apps/mobile/src/protocol/types.ts",
+          "crates/jcode-protocol/src/lib.rs",
+          "docs/proposals/JCODE_AG_UI_REACT_NATIVE.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: The protocol and mobile app can evolve with explicit reducer and transport compatibility anchors.",
+        "references": [
+          "apps/mobile/app.json",
+          "apps/mobile/app/_layout.tsx"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: App configuration and security setup are packaged with the gateway implementation.",
+        "references": [
+          "apps/mobile/app.json",
+          "apps/mobile/docs/setup-and-security.md",
+          "apps/mobile/package.json"
+        ]
+      },
+      "evidence": [
+        "commit:3d2404ba07269468192ed5af4d74a45c35c56afc",
+        "docs:docs/proposals/JCODE_AG_UI_REACT_NATIVE.md",
+        "source:apps/mobile/src/protocol/types.ts"
+      ]
+    },
+    {
+      "id": "artifact-library",
+      "display_name": "Artifact library packet and admission surface",
+      "owner": "maintained-fork",
+      "introduced_commit": "dc46cf169da5a941b5f734b789b2ff78086e6a37",
+      "lifecycle": "active",
+      "source_paths": [
+        "docs/artifacts/psr-candidate-type-001/README.md",
+        "docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
+        "docs/artifacts/psr-candidate-type-001/candidate.manifest.json",
+        "docs/artifacts/psr-candidate-type-001/psr.md",
+        "docs/artifacts/psr-candidate-type-001/revisions.md",
+        "examples/artifact-library/psr-candidate-type-001/artifact.manifest.json",
+        "examples/artifact-library/psr-candidate-type-001/candidate.manifest.json",
+        "examples/artifact-library/psr-candidate-type-001/mt-admission.request.json",
+        "examples/artifact-library/psr-candidate-type-001/psr.md",
+        "examples/artifact-library/psr-candidate-type-001/rendered.html",
+        "examples/artifact-library/psr-candidate-type-001/revisions.md",
+        "scripts/seed_psr_artifact.sh"
+      ],
+      "asset_paths": [
+        "docs/artifacts/psr-candidate-type-001/mt-admission.request.json",
+        "docs/artifacts/psr-candidate-type-001/rendered.html",
+        "examples/artifact-library/psr-candidate-type-001/mt-admission.request.json",
+        "examples/artifact-library/psr-candidate-type-001/rendered.html"
+      ],
+      "schema_contract": {
+        "summary": "schema: Artifact packets use explicit artifact and candidate manifests with a stable template and instance identity.",
+        "references": [
+          "docs/artifacts/psr-candidate-type-001/README.md",
+          "docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
+          "docs/artifacts/psr-candidate-type-001/candidate.manifest.json"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The packet targets the MetaTool artifact admission operation without making the compatibility script the owner.",
+        "references": [
+          "docs/artifacts/psr-candidate-type-001/README.md",
+          "docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
+          "docs/artifacts/psr-candidate-type-001/candidate.manifest.json",
+          "docs/artifacts/psr-candidate-type-001/psr.md"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: The library preserves observed, proposed, blocked, and measured admission states.",
+        "references": [
+          "examples/artifact-library/psr-candidate-type-001/rendered.html",
+          "examples/artifact-library/psr-candidate-type-001/revisions.md",
+          "scripts/seed_psr_artifact.sh"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: The packet keeps historical script compatibility while migrating operation language to admission.",
+        "references": [
+          "docs/artifacts/psr-candidate-type-001/README.md",
+          "docs/artifacts/psr-candidate-type-001/mt-admission.request.json"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Rendered HTML, request JSON, manifests, and source prose are the reviewable artifact bundle.",
+        "references": [
+          "docs/artifacts/psr-candidate-type-001/mt-admission.request.json",
+          "docs/artifacts/psr-candidate-type-001/rendered.html",
+          "examples/artifact-library/psr-candidate-type-001/mt-admission.request.json",
+          "examples/artifact-library/psr-candidate-type-001/rendered.html"
+        ]
+      },
+      "evidence": [
+        "commit:dc46cf169da5a941b5f734b789b2ff78086e6a37",
+        "docs:docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
+        "script:scripts/seed_psr_artifact.sh"
+      ]
+    },
+    {
+      "id": "artifact-server",
+      "display_name": "Durable artifact HTTP server",
+      "owner": "maintained-fork",
+      "introduced_commit": "70c63eee37c122b8f77680bfaacb5d8b132e64d6",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-artifact-server/Cargo.toml",
+        "crates/jcode-artifact-server/src/lib.rs",
+        "crates/jcode-artifact-server/src/main.rs",
+        "docs/artifacts/psr-candidate-type-001/README.md"
+      ],
+      "asset_paths": [
+        "docs/artifacts/psr-candidate-type-001/rendered.html",
+        "docs/artifacts/psr-candidate-type-001/revisions.md"
+      ],
+      "schema_contract": {
+        "summary": "schema: The server serves the durable artifact and revision records produced by the artifact store.",
+        "references": [
+          "crates/jcode-artifact-server/Cargo.toml",
+          "crates/jcode-artifact-server/src/lib.rs",
+          "crates/jcode-artifact-server/src/main.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The server exposes catalog, revision, and presentation endpoints for admitted artifacts.",
+        "references": [
+          "crates/jcode-artifact-server/Cargo.toml",
+          "crates/jcode-artifact-server/src/lib.rs",
+          "crates/jcode-artifact-server/src/main.rs",
+          "docs/artifacts/psr-candidate-type-001/README.md"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: The server reopens persisted artifacts and emits the documented presentation events.",
+        "references": [
+          "crates/jcode-artifact-server/src/lib.rs",
+          "crates/jcode-artifact-server/src/main.rs",
+          "docs/artifacts/psr-candidate-type-001/README.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Server restart and revision rendering preserve the artifact store's serialized records.",
+        "references": [
+          "crates/jcode-artifact-server/Cargo.toml",
+          "docs/artifacts/psr-candidate-type-001/rendered.html"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: The offline rendered artifact and revision documentation are the server's presentation fixtures.",
+        "references": [
+          "docs/artifacts/psr-candidate-type-001/rendered.html",
+          "docs/artifacts/psr-candidate-type-001/revisions.md"
+        ]
+      },
+      "evidence": [
+        "commit:70c63eee37c122b8f77680bfaacb5d8b132e64d6",
+        "source:crates/jcode-artifact-server/src/lib.rs"
+      ]
+    },
+    {
+      "id": "artifact-store",
+      "display_name": "Durable artifact store",
+      "owner": "maintained-fork",
+      "introduced_commit": "532d9733b466a50ce69f5c235848c958e75a5833",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-artifact-store/Cargo.toml",
+        "crates/jcode-artifact-store/src/lib.rs",
+        "docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
+        "docs/artifacts/psr-candidate-type-001/candidate.manifest.json"
+      ],
+      "asset_paths": [
+        "docs/artifacts/psr-candidate-type-001/mt-admission.request.json",
+        "docs/artifacts/psr-candidate-type-001/revisions.md"
+      ],
+      "schema_contract": {
+        "summary": "schema: Artifact records, revisions, annotations, and candidate metadata have explicit serialized store shapes.",
+        "references": [
+          "crates/jcode-artifact-store/Cargo.toml",
+          "crates/jcode-artifact-store/src/lib.rs",
+          "docs/artifacts/psr-candidate-type-001/artifact.manifest.json"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The store provides the persistence boundary used by MetaTool admission and artifact presentation.",
+        "references": [
+          "crates/jcode-artifact-store/Cargo.toml",
+          "crates/jcode-artifact-store/src/lib.rs",
+          "docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
+          "docs/artifacts/psr-candidate-type-001/candidate.manifest.json"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Store reads and writes preserve immutable revisions and candidate status across restarts.",
+        "references": [
+          "crates/jcode-artifact-store/src/lib.rs",
+          "docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
+          "docs/artifacts/psr-candidate-type-001/candidate.manifest.json"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Existing packet manifests and revision notes provide the durable migration and replay anchors.",
+        "references": [
+          "crates/jcode-artifact-store/Cargo.toml",
+          "docs/artifacts/psr-candidate-type-001/mt-admission.request.json"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Admission requests and revision records are stored and rendered as packet assets.",
+        "references": [
+          "docs/artifacts/psr-candidate-type-001/mt-admission.request.json",
+          "docs/artifacts/psr-candidate-type-001/revisions.md"
+        ]
+      },
+      "evidence": [
+        "commit:532d9733b466a50ce69f5c235848c958e75a5833",
+        "source:crates/jcode-artifact-store/src/lib.rs"
+      ]
+    },
+    {
+      "id": "candidate-lanes",
+      "display_name": "Governed Tasker candidate lanes",
+      "owner": "maintained-fork",
+      "introduced_commit": "b803212db8308c0d9a44ab8f08b1b8cefd37fbce",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-app-core/src/server/candidate.rs",
+        "crates/jcode-tasker-promotion/src/lib.rs",
+        "crates/jcode-tasker-promotion/tests/promotion.rs",
+        "crates/jcode-tasker-rounds/src/lib.rs",
+        "crates/jcode-tasker-rounds/tests/rounds.rs",
+        "docs/proposals/TASKER_CONCURRENCY_ARTIFACTS.md"
+      ],
+      "asset_paths": [
+        "crates/jcode-tasker-promotion/Cargo.toml",
+        "crates/jcode-tasker-rounds/Cargo.toml",
+        "docs/audits/F658_CONCURRENCY_EVIDENCE_PACK.md"
+      ],
+      "schema_contract": {
+        "summary": "schema: Candidate sets, rounds, promotions, and adjudication records use typed concurrency artifacts.",
+        "references": [
+          "crates/jcode-app-core/src/server/candidate.rs",
+          "crates/jcode-tasker-promotion/src/lib.rs",
+          "crates/jcode-tasker-promotion/tests/promotion.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The candidate lane surface coordinates bounded headless execution and promotion workflows.",
+        "references": [
+          "crates/jcode-app-core/src/server/candidate.rs",
+          "crates/jcode-tasker-promotion/src/lib.rs",
+          "crates/jcode-tasker-promotion/tests/promotion.rs",
+          "crates/jcode-tasker-rounds/src/lib.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Candidate execution, cancellation, retry, and adjudication preserve ownership and recovery semantics.",
+        "references": [
+          "crates/jcode-tasker-rounds/src/lib.rs",
+          "crates/jcode-tasker-rounds/tests/rounds.rs",
+          "docs/proposals/TASKER_CONCURRENCY_ARTIFACTS.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Promotion artifacts and round records keep retry and recovery state across workflow steps.",
+        "references": [
+          "crates/jcode-app-core/src/server/candidate.rs",
+          "crates/jcode-tasker-promotion/Cargo.toml"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Promotion packages, round fixtures, and evidence packs are retained as reviewable lane assets.",
+        "references": [
+          "crates/jcode-tasker-promotion/Cargo.toml",
+          "crates/jcode-tasker-rounds/Cargo.toml",
+          "docs/audits/F658_CONCURRENCY_EVIDENCE_PACK.md"
+        ]
+      },
+      "evidence": [
+        "commit:b803212db8308c0d9a44ab8f08b1b8cefd37fbce",
+        "source:crates/jcode-app-core/src/server/candidate.rs",
+        "test:crates/jcode-tasker-promotion/tests/promotion.rs"
+      ]
+    },
+    {
+      "id": "fork-governance",
+      "display_name": "Fork capability preservation governance",
+      "owner": "maintained-fork",
+      "introduced_commit": "9631300544b8e108be75c8d297511c261ff2b0f3",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-app-core/src/build.rs",
+        "crates/jcode-app-core/src/update.rs",
+        "crates/jcode-build-support/src/fork_governance.rs",
+        "crates/jcode-build-support/src/lib.rs",
+        "crates/jcode-build-support/src/paths.rs",
+        "crates/jcode-build-support/src/source_state.rs",
+        "docs/AGENT_NATIVE_VCS_CORE_BEHAVIOR.md"
+      ],
+      "asset_paths": [
+        "docs/FORK_CAPABILITY_MANIFEST.json",
+        "docs/TASKER_PARITY_MANIFEST.json"
+      ],
+      "schema_contract": {
+        "summary": "schema: Fork admission is identified by a versioned manifest containing complete capability contract objects.",
+        "references": [
+          "crates/jcode-app-core/src/build.rs",
+          "crates/jcode-app-core/src/update.rs",
+          "crates/jcode-build-support/src/fork_governance.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: Build support loads the checked-in manifest and exposes immutable manifest identity beside build admission.",
+        "references": [
+          "crates/jcode-app-core/src/build.rs",
+          "crates/jcode-app-core/src/update.rs",
+          "crates/jcode-build-support/src/fork_governance.rs",
+          "crates/jcode-build-support/src/lib.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Canonical fork ancestry, immutable receipts, predecessor preservation, and channel safety are explicit invariants.",
+        "references": [
+          "crates/jcode-build-support/src/paths.rs",
+          "crates/jcode-build-support/src/source_state.rs",
+          "docs/AGENT_NATIVE_VCS_CORE_BEHAVIOR.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Legacy flat capability receipts have an explicit migration path without weakening new manifest validation.",
+        "references": [
+          "crates/jcode-app-core/src/build.rs",
+          "docs/FORK_CAPABILITY_MANIFEST.json"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: The checked-in manifest and parity inventory are source-controlled governance assets.",
+        "references": [
+          "docs/FORK_CAPABILITY_MANIFEST.json",
+          "docs/TASKER_PARITY_MANIFEST.json"
+        ]
+      },
+      "evidence": [
+        "commit:9631300544b8e108be75c8d297511c261ff2b0f3",
+        "docs:docs/AGENT_NATIVE_VCS_CORE_BEHAVIOR.md",
+        "source:crates/jcode-build-support/src/fork_governance.rs"
+      ]
+    },
+    {
+      "id": "linux-computer-use",
+      "display_name": "Linux computer-use backend",
+      "owner": "maintained-fork",
+      "introduced_commit": "1167d124fc62e4a384d249c23054801ba573358d",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-app-core/src/tool/linux_computer.rs",
+        "crates/jcode-computer-use-linux/src/abs_pointer.rs",
+        "crates/jcode-computer-use-linux/src/atspi_tree.rs",
+        "crates/jcode-computer-use-linux/src/chrome_runtime.rs",
+        "crates/jcode-computer-use-linux/src/diagnostics.rs",
+        "crates/jcode-computer-use-linux/src/gnome_extension.rs",
+        "crates/jcode-computer-use-linux/src/identity.rs",
+        "crates/jcode-computer-use-linux/src/lib.rs",
+        "crates/jcode-computer-use-linux/src/main.rs",
+        "crates/jcode-computer-use-linux/src/remote_desktop.rs",
+        "crates/jcode-computer-use-linux/src/screenshot.rs",
+        "crates/jcode-computer-use-linux/src/server.rs",
+        "crates/jcode-computer-use-linux/src/terminal.rs",
+        "crates/jcode-computer-use-linux/src/windowing/mod.rs",
+        "crates/jcode-computer-use-linux/src/windows.rs"
+      ],
+      "asset_paths": [
+        "crates/jcode-computer-use-linux/Cargo.upstream.toml",
+        "crates/jcode-computer-use-linux/LICENSE-MIT",
+        "crates/jcode-computer-use-linux/README.md",
+        "crates/jcode-computer-use-linux/UPSTREAM.md",
+        "crates/jcode-computer-use-linux/gnome-shell-extension/extension.js",
+        "crates/jcode-computer-use-linux/gnome-shell-extension/metadata.json"
+      ],
+      "schema_contract": {
+        "summary": "schema: The Linux backend models accessibility trees, windows, screenshots, terminals, and pointer input.",
+        "references": [
+          "crates/jcode-app-core/src/tool/linux_computer.rs",
+          "crates/jcode-computer-use-linux/src/abs_pointer.rs",
+          "crates/jcode-computer-use-linux/src/atspi_tree.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The app-core Linux computer tool delegates to the isolated backend and its supported windowing targets.",
+        "references": [
+          "crates/jcode-app-core/src/tool/linux_computer.rs",
+          "crates/jcode-computer-use-linux/src/abs_pointer.rs",
+          "crates/jcode-computer-use-linux/src/atspi_tree.rs",
+          "crates/jcode-computer-use-linux/src/chrome_runtime.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Desktop discovery, observation, input, and diagnostics remain bounded by the selected Linux backend.",
+        "references": [
+          "crates/jcode-computer-use-linux/src/terminal.rs",
+          "crates/jcode-computer-use-linux/src/windowing/mod.rs",
+          "crates/jcode-computer-use-linux/src/windows.rs"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Upstream provenance and the vendored backend boundary are recorded for future source synchronization.",
+        "references": [
+          "crates/jcode-app-core/src/tool/linux_computer.rs",
+          "crates/jcode-computer-use-linux/Cargo.upstream.toml"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: The GNOME extension, metadata, license, and upstream notes are packaged backend assets.",
+        "references": [
+          "crates/jcode-computer-use-linux/Cargo.upstream.toml",
+          "crates/jcode-computer-use-linux/LICENSE-MIT",
+          "crates/jcode-computer-use-linux/README.md",
+          "crates/jcode-computer-use-linux/UPSTREAM.md",
+          "crates/jcode-computer-use-linux/gnome-shell-extension/extension.js",
+          "crates/jcode-computer-use-linux/gnome-shell-extension/metadata.json"
+        ]
+      },
+      "evidence": [
+        "asset:crates/jcode-computer-use-linux/gnome-shell-extension/metadata.json",
+        "commit:1167d124fc62e4a384d249c23054801ba573358d",
+        "source:crates/jcode-computer-use-linux/src/lib.rs"
+      ]
+    },
+    {
+      "id": "mobile-gateway",
+      "display_name": "Expo mobile session gateway",
+      "owner": "maintained-fork",
+      "introduced_commit": "8112656960ca0360ef82f91af1106258d6ad71bc",
+      "lifecycle": "active",
+      "source_paths": [
+        "apps/mobile/app/_layout.tsx",
+        "apps/mobile/app/index.tsx",
+        "apps/mobile/app/session/[id].tsx",
+        "apps/mobile/src/network/pairing.ts",
+        "apps/mobile/src/network/transport.ts",
+        "apps/mobile/src/network/urls.ts",
+        "apps/mobile/src/protocol/reducer.ts",
+        "apps/mobile/src/protocol/types.ts",
+        "apps/mobile/src/storage/credentials.ts",
+        "apps/mobile/src/ui/mobile-context.tsx",
+        "docs/proposals/JCODE_AG_UI_REACT_NATIVE.md"
+      ],
+      "asset_paths": [
+        "apps/mobile/app.json",
+        "apps/mobile/docs/setup-and-security.md",
+        "apps/mobile/package-lock.json",
+        "apps/mobile/package.json",
+        "apps/mobile/tsconfig.json"
+      ],
+      "schema_contract": {
+        "summary": "schema: The Expo client carries typed pairing, transport, session, reducer, and credential records.",
+        "references": [
+          "apps/mobile/app/_layout.tsx",
+          "apps/mobile/app/index.tsx",
+          "apps/mobile/app/session/[id].tsx"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The gateway exposes mobile pairing and session transport against the Jcode protocol.",
+        "references": [
+          "apps/mobile/app/_layout.tsx",
+          "apps/mobile/app/index.tsx",
+          "apps/mobile/app/session/[id].tsx",
+          "apps/mobile/src/network/pairing.ts"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Reconnect, credential handling, reducer transitions, and session navigation remain deterministic.",
+        "references": [
+          "apps/mobile/src/storage/credentials.ts",
+          "apps/mobile/src/ui/mobile-context.tsx",
+          "docs/proposals/JCODE_AG_UI_REACT_NATIVE.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: App and protocol version changes are anchored by typed reducers, URL helpers, and setup guidance.",
+        "references": [
+          "apps/mobile/app.json",
+          "apps/mobile/app/_layout.tsx"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Expo configuration, package locks, TypeScript configuration, and security setup ship with the gateway.",
+        "references": [
+          "apps/mobile/app.json",
+          "apps/mobile/docs/setup-and-security.md",
+          "apps/mobile/package-lock.json",
+          "apps/mobile/package.json",
+          "apps/mobile/tsconfig.json"
+        ]
+      },
+      "evidence": [
+        "commit:8112656960ca0360ef82f91af1106258d6ad71bc",
+        "docs:apps/mobile/docs/setup-and-security.md",
+        "source:apps/mobile/src/network/transport.ts"
+      ]
+    },
+    {
+      "id": "mt",
+      "display_name": "Native MetaTool capability",
+      "owner": "maintained-fork",
+      "introduced_commit": "1429eb617585732d3fdf037a51e43afca6561b2e",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-app-core/src/tool/metatool.rs",
+        "crates/jcode-metatool-runtime/src/lib.rs",
+        "crates/jcode-metatool-store/src/lib.rs",
+        "crates/jcode-metatool-types/src/lib.rs",
+        "docs/proposals/NATIVE_METATOOL.md",
+        "runtimes/metatool-codemode/engine/src/api-surface.ts",
+        "runtimes/metatool-codemode/engine/src/host.ts",
+        "runtimes/metatool-codemode/engine/src/manifest.ts",
+        "runtimes/metatool-codemode/engine/src/plugins/metatool.ts"
+      ],
+      "asset_paths": [
+        "crates/jcode-metatool-runtime/assets/agentos-sidecar.mjs",
+        "crates/jcode-metatool-runtime/assets/codemode-sidecar.mjs",
+        "crates/jcode-metatool-runtime/assets/guest-engine.mjs",
+        "crates/jcode-metatool-runtime/assets/guide.json",
+        "runtimes/metatool-codemode/engine/package.json",
+        "runtimes/metatool-codemode/engine/project.json"
+      ],
+      "schema_contract": {
+        "summary": "schema: MetaTool uses typed capability descriptors, broker requests, store records, and deterministic runtime manifests.",
+        "references": [
+          "crates/jcode-app-core/src/tool/metatool.rs",
+          "crates/jcode-metatool-runtime/src/lib.rs",
+          "crates/jcode-metatool-store/src/lib.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The mt tool and guest engine expose bounded evaluate, guide, and host-brokered capability operations.",
+        "references": [
+          "crates/jcode-app-core/src/tool/metatool.rs",
+          "crates/jcode-metatool-runtime/src/lib.rs",
+          "crates/jcode-metatool-store/src/lib.rs",
+          "crates/jcode-metatool-types/src/lib.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Guest code remains isolated while host-owned capabilities enforce declared effects and persistence boundaries.",
+        "references": [
+          "runtimes/metatool-codemode/engine/src/host.ts",
+          "runtimes/metatool-codemode/engine/src/manifest.ts",
+          "runtimes/metatool-codemode/engine/src/plugins/metatool.ts"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: The runtime sidecars and native store preserve the transition from the legacy bridge to brokered MetaTool.",
+        "references": [
+          "crates/jcode-app-core/src/tool/metatool.rs",
+          "crates/jcode-metatool-runtime/assets/agentos-sidecar.mjs"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: AgentOS sidecars, guest engine, guide metadata, and codemode package descriptors are required runtime assets.",
+        "references": [
+          "crates/jcode-metatool-runtime/assets/agentos-sidecar.mjs",
+          "crates/jcode-metatool-runtime/assets/codemode-sidecar.mjs",
+          "crates/jcode-metatool-runtime/assets/guest-engine.mjs",
+          "crates/jcode-metatool-runtime/assets/guide.json",
+          "runtimes/metatool-codemode/engine/package.json",
+          "runtimes/metatool-codemode/engine/project.json"
+        ]
+      },
+      "evidence": [
+        "commit:1429eb617585732d3fdf037a51e43afca6561b2e",
+        "docs:docs/proposals/NATIVE_METATOOL.md",
+        "source:crates/jcode-app-core/src/tool/metatool.rs"
+      ]
+    },
+    {
+      "id": "native-vcs-maintenance",
+      "display_name": "Native VCS and build maintenance",
+      "owner": "maintained-fork",
+      "introduced_commit": "3d4669a346cff935fe0ae5afd0e0fa1c4e6a19b3",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-app-core/src/build.rs",
+        "crates/jcode-app-core/src/update.rs",
+        "crates/jcode-build-support/src/lib.rs",
+        "crates/jcode-build-support/src/paths.rs",
+        "crates/jcode-build-support/src/source_state.rs",
+        "docs/AGENT_NATIVE_VCS_CORE_BEHAVIOR.md"
+      ],
+      "asset_paths": [
+        "crates/jcode-build-support/examples/write_dev_sidecar.rs",
+        "docs/AGENT_NATIVE_VCS_CORE_BEHAVIOR.md",
+        "scripts/check_guardrails.sh",
+        "scripts/remote_build.sh"
+      ],
+      "schema_contract": {
+        "summary": "schema: Source state, build reports, immutable binaries, and channel metadata have explicit provenance shapes.",
+        "references": [
+          "crates/jcode-app-core/src/build.rs",
+          "crates/jcode-app-core/src/update.rs",
+          "crates/jcode-build-support/src/lib.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: Build support provides source validation, binary path, sidecar, and channel update helpers.",
+        "references": [
+          "crates/jcode-app-core/src/build.rs",
+          "crates/jcode-app-core/src/update.rs",
+          "crates/jcode-build-support/src/lib.rs",
+          "crates/jcode-build-support/src/paths.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Canonical fork ancestry and source-intake boundaries fail closed before executable updates.",
+        "references": [
+          "crates/jcode-build-support/src/paths.rs",
+          "crates/jcode-build-support/src/source_state.rs",
+          "docs/AGENT_NATIVE_VCS_CORE_BEHAVIOR.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Build sidecars and source reports preserve development, stable, and release channel state during upgrades.",
+        "references": [
+          "crates/jcode-app-core/src/build.rs",
+          "crates/jcode-build-support/examples/write_dev_sidecar.rs"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Sidecar examples, guardrail scripts, remote build tooling, and VCS behavior documentation are maintained assets.",
+        "references": [
+          "crates/jcode-build-support/examples/write_dev_sidecar.rs",
+          "docs/AGENT_NATIVE_VCS_CORE_BEHAVIOR.md",
+          "scripts/check_guardrails.sh",
+          "scripts/remote_build.sh"
+        ]
+      },
+      "evidence": [
+        "commit:3d4669a346cff935fe0ae5afd0e0fa1c4e6a19b3",
+        "docs:docs/AGENT_NATIVE_VCS_CORE_BEHAVIOR.md",
+        "source:crates/jcode-build-support/src/source_state.rs"
+      ]
+    },
+    {
+      "id": "session-search",
+      "display_name": "Cross-session search and inspection",
+      "owner": "maintained-fork",
+      "introduced_commit": "023a62a95351dbc313e1b5c29c8e02151d855faf",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-app-core/src/tool/session_search.rs",
+        "crates/jcode-app-core/src/tool/session_search_index.rs",
+        "crates/jcode-base/src/session.rs",
+        "crates/jcode-base/src/session_list_cache.rs",
+        "crates/jcode-tui-session-picker/src/lib.rs",
+        "crates/jcode-tui/src/tui/session_picker.rs",
+        "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md"
+      ],
+      "asset_paths": [
+        "crates/jcode-tui-session-picker/Cargo.toml",
+        "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md",
+        "docs/REMOTE_HANDOFF.md"
+      ],
+      "schema_contract": {
+        "summary": "schema: Session search results and persisted session metadata use stable identifiers and transcript projections.",
+        "references": [
+          "crates/jcode-app-core/src/tool/session_search.rs",
+          "crates/jcode-app-core/src/tool/session_search_index.rs",
+          "crates/jcode-base/src/session.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The session-search tool and picker expose bounded search, hit inspection, and cross-session navigation.",
+        "references": [
+          "crates/jcode-app-core/src/tool/session_search.rs",
+          "crates/jcode-app-core/src/tool/session_search_index.rs",
+          "crates/jcode-base/src/session.rs",
+          "crates/jcode-base/src/session_list_cache.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Search ordering, filtering, loading, and opening a hit preserve the session inspection workflow.",
+        "references": [
+          "crates/jcode-tui-session-picker/src/lib.rs",
+          "crates/jcode-tui/src/tui/session_picker.rs",
+          "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Session caches, persistence, and handoff documents provide compatibility anchors for older transcripts.",
+        "references": [
+          "crates/jcode-app-core/src/tool/session_search.rs",
+          "crates/jcode-tui-session-picker/Cargo.toml"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Picker package metadata and multi-session documentation are part of the inspection surface.",
+        "references": [
+          "crates/jcode-tui-session-picker/Cargo.toml",
+          "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md",
+          "docs/REMOTE_HANDOFF.md"
+        ]
+      },
+      "evidence": [
+        "commit:023a62a95351dbc313e1b5c29c8e02151d855faf",
+        "docs:docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md",
+        "source:crates/jcode-app-core/src/tool/session_search.rs"
+      ]
+    },
+    {
+      "id": "swarm-coordination",
+      "display_name": "Multi-agent swarm coordination",
+      "owner": "maintained-fork",
+      "introduced_commit": "4c9b3eb1252c93bcea91ba8958b2202d0193a41b",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-app-core/src/server/swarm.rs",
+        "crates/jcode-app-core/src/server/swarm_channels.rs",
+        "crates/jcode-app-core/src/server/swarm_persistence.rs",
+        "crates/jcode-swarm-core/src/lib.rs",
+        "crates/jcode-tui/src/tui/app/remote/swarm_plan_core.rs",
+        "crates/jcode-tui/src/tui/app/remote/swarm_status_core.rs",
+        "docs/SWARM_ARCHITECTURE.md",
+        "docs/SWARM_TASK_GRAPH.md"
+      ],
+      "asset_paths": [
+        "assets/readme/100-sessions-spawn-demo.gif",
+        "crates/jcode-tui-mermaid/examples/swarm_plan_fixture.json",
+        "docs/SWARM_ARCHITECTURE.md",
+        "docs/images/swarm.png"
+      ],
+      "schema_contract": {
+        "summary": "schema: Swarm sessions, channels, plans, persistence, and task graphs use typed coordination records.",
+        "references": [
+          "crates/jcode-app-core/src/server/swarm.rs",
+          "crates/jcode-app-core/src/server/swarm_channels.rs",
+          "crates/jcode-app-core/src/server/swarm_persistence.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The swarm runtime and TUI expose bounded spawn, messaging, plan, status, and graph projections.",
+        "references": [
+          "crates/jcode-app-core/src/server/swarm.rs",
+          "crates/jcode-app-core/src/server/swarm_channels.rs",
+          "crates/jcode-app-core/src/server/swarm_persistence.rs",
+          "crates/jcode-swarm-core/src/lib.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Worker ownership, lifecycle, persistence, and recovery preserve the multi-agent coordination model.",
+        "references": [
+          "crates/jcode-tui/src/tui/app/remote/swarm_status_core.rs",
+          "docs/SWARM_ARCHITECTURE.md",
+          "docs/SWARM_TASK_GRAPH.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Persisted swarm state and task-graph documents provide compatibility and restart anchors.",
+        "references": [
+          "assets/readme/100-sessions-spawn-demo.gif",
+          "crates/jcode-app-core/src/server/swarm.rs"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Swarm fixtures, diagrams, and the multi-session demo are maintained review and regression assets.",
+        "references": [
+          "assets/readme/100-sessions-spawn-demo.gif",
+          "crates/jcode-tui-mermaid/examples/swarm_plan_fixture.json",
+          "docs/SWARM_ARCHITECTURE.md",
+          "docs/images/swarm.png"
+        ]
+      },
+      "evidence": [
+        "commit:4c9b3eb1252c93bcea91ba8958b2202d0193a41b",
+        "docs:docs/SWARM_TASK_GRAPH.md",
+        "source:crates/jcode-swarm-core/src/lib.rs"
+      ]
+    },
+    {
+      "id": "tasker",
+      "display_name": "Native and Pi-compatible Tasker capability",
+      "owner": "maintained-fork",
+      "introduced_commit": "a618ed43caef2a4d4b8abd67d82f0ed920e4fde9",
+      "lifecycle": "active",
+      "source_paths": [
+        "crates/jcode-app-core/src/tool/tasker.rs",
+        "crates/jcode-tasker-git/src/lib.rs",
+        "crates/jcode-tasker-orchestration/src/execution.rs",
+        "crates/jcode-tasker-orchestration/src/lib.rs",
+        "crates/jcode-tasker-pi/src/lib.rs",
+        "crates/jcode-tasker-promotion/src/lib.rs",
+        "crates/jcode-tasker-rounds/src/lib.rs",
+        "crates/jcode-tasker-store/src/lib.rs",
+        "crates/jcode-tasker-types/src/lib.rs",
+        "docs/TASKER_PARITY_MANIFEST.json",
+        "docs/proposals/NATIVE_TASKER.md",
+        "docs/proposals/TASKER_CONCURRENCY_ARTIFACTS.md"
+      ],
+      "asset_paths": [
+        "crates/jcode-tasker-store/migrations/0001_initial.sql",
+        "docs/TASKER_PARITY_MANIFEST.json",
+        "docs/proposals/TASKER_CONCURRENCY_ARTIFACTS.md"
+      ],
+      "schema_contract": {
+        "summary": "schema: Tasker preserves Pi-compatible tasks, features, dependencies, notes, gates, and concurrency projections.",
+        "references": [
+          "crates/jcode-app-core/src/tool/tasker.rs",
+          "crates/jcode-tasker-git/src/lib.rs",
+          "crates/jcode-tasker-orchestration/src/execution.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: The public tasker tool and native mt.tasker capability expose bounded reads and receipt-governed mutations.",
+        "references": [
+          "crates/jcode-app-core/src/tool/tasker.rs",
+          "crates/jcode-tasker-git/src/lib.rs",
+          "crates/jcode-tasker-orchestration/src/execution.rs",
+          "crates/jcode-tasker-orchestration/src/lib.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Canonical task state, dependency readiness, claims, plans, gates, and candidate execution remain compatible.",
+        "references": [
+          "docs/TASKER_PARITY_MANIFEST.json",
+          "docs/proposals/NATIVE_TASKER.md",
+          "docs/proposals/TASKER_CONCURRENCY_ARTIFACTS.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: The Pi schema, SQL migration, parity manifest, and native Tasker proposal anchor compatibility evolution.",
+        "references": [
+          "crates/jcode-app-core/src/tool/tasker.rs",
+          "crates/jcode-tasker-store/migrations/0001_initial.sql"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: The initial SQL migration, parity inventory, and concurrency artifact proposal are required Tasker assets.",
+        "references": [
+          "crates/jcode-tasker-store/migrations/0001_initial.sql",
+          "docs/TASKER_PARITY_MANIFEST.json",
+          "docs/proposals/TASKER_CONCURRENCY_ARTIFACTS.md"
+        ]
+      },
+      "evidence": [
+        "commit:a618ed43caef2a4d4b8abd67d82f0ed920e4fde9",
+        "docs:docs/TASKER_PARITY_MANIFEST.json",
+        "source:crates/jcode-app-core/src/tool/tasker.rs"
+      ]
+    }
+  ],
+  "retirements": [],
+  "sha256": "e92adc68735af2eecef8bef24b9a7ff39fb5fe9ecfddb51bf4c4d9a45c79007d"
+}
