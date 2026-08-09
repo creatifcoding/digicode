@@ -798,6 +798,32 @@ fn write_report_binary(version: &str, git_hash: &str, capabilities: &[&str]) -> 
 }
 
 #[cfg(unix)]
+fn write_report_binary_without_version(version: &str, git_hash: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = version_binary_path(version).expect("version path");
+    std::fs::create_dir_all(path.parent().expect("version parent")).expect("version directory");
+    let report = serde_json::json!({
+        "git_hash": git_hash,
+        "capabilities": ["mt", "tasker"],
+    });
+    let report = serde_json::to_string(&report).expect("report json");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"version\" ] && [ \"$2\" = \"--json\" ]; then\nprintf '%s\\n' '{report}'\nexit 0\nfi\nexit 1\n"
+        ),
+    )
+    .expect("write report binary");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("report metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("make report binary executable");
+    path
+}
+
+#[cfg(unix)]
 fn write_governed_report_binary(version: &str, git_hash: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1254,6 +1280,58 @@ fn governed_manifest_admission_preserves_exact_predecessor_digest() {
         );
         assert_eq!(second.predecessor.as_deref(), Some(predecessor));
         require_admitted_fork_build(candidate).expect("candidate manifest must remain admitted");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fork_admission_requires_a_runtime_version_smoke() {
+    with_temp_jcode_home(|| {
+        let version = "runtime-smoke";
+        write_report_binary_without_version(version, "runtime-smoke-hash");
+        let error = admit_installed_fork_build(
+            version,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+        )
+        .expect_err("a binary without a runtime version must not be admitted");
+
+        assert!(error.to_string().contains("Binary smoke test"));
+        assert!(
+            read_build_admission(version)
+                .expect("read rejected receipt")
+                .is_none()
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn fork_admission_rejects_a_stale_manifest_sidecar() {
+    with_temp_jcode_home(|| {
+        let version = "0.68.1";
+        let binary = write_governed_report_binary(version, "governed-stale-sidecar");
+        let mut stale = builtin_manifest().expect("builtin manifest");
+        stale.capabilities[0]
+            .behavior_contract
+            .summary
+            .push_str(" drift");
+        stale.sha256 = None;
+        write_immutable_manifest(&binary, &stale).expect("write stale sidecar fixture");
+
+        let error = admit_installed_fork_build(
+            version,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+        )
+        .expect_err("stale manifest sidecar must not be admitted");
+
+        assert!(error.to_string().contains("manifest is stale"));
+        assert!(
+            read_build_admission(version)
+                .expect("read rejected receipt")
+                .is_none()
+        );
     });
 }
 

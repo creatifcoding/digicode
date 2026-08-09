@@ -388,26 +388,26 @@ fn manifest_for_report(
         let legacy = manifest.manifest_version.starts_with("legacy-");
         if !legacy {
             manifest.validate_baseline(&builtin_manifest()?)?;
-        }
-        if let Some(version) = report.manifest_version.as_deref()
-            && version != manifest.manifest_version
-        {
-            anyhow::bail!(
-                "binary manifest schema/version {} does not match installed manifest {}",
-                version,
-                manifest.manifest_version
-            );
-        }
-        if let Some(declared) = report.manifest_sha256.as_deref() {
-            let actual = manifest.digest()?;
-            let generated = builtin_manifest()?.digest()?;
-            if declared != actual && declared != generated {
+            let version = report.manifest_version.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "post-governance binary {} omitted its capability manifest version",
+                    binary.display()
+                )
+            })?;
+            if version != manifest.manifest_version {
                 anyhow::bail!(
-                    "binary manifest digest {} does not match installed manifest {}",
-                    declared,
-                    actual
+                    "binary manifest schema/version {} does not match installed manifest {}",
+                    version,
+                    manifest.manifest_version
                 );
             }
+            let digest = report.manifest_sha256.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "post-governance binary {} omitted its capability manifest digest",
+                    binary.display()
+                )
+            })?;
+            manifest.validate_freshness(digest)?;
         }
         return Ok((manifest, legacy));
     }
@@ -446,9 +446,17 @@ fn validate_manifest_report_identity(
     report: &BinaryVersionReport,
     manifest: &ForkCapabilityManifest,
 ) -> Result<()> {
-    if let Some(version) = report.manifest_version.as_deref()
-        && version != manifest.manifest_version
-    {
+    if manifest.manifest_version.starts_with("legacy-") {
+        return Ok(());
+    }
+
+    let version = report.manifest_version.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "admitted build {} omitted its capability manifest version",
+            binary.display()
+        )
+    })?;
+    if version != manifest.manifest_version {
         anyhow::bail!(
             "admitted build {} manifest version changed: receipt {}, report {}",
             binary.display(),
@@ -456,19 +464,19 @@ fn validate_manifest_report_identity(
             version
         );
     }
-    if let Some(declared) = report.manifest_sha256.as_deref() {
-        let actual = manifest.digest()?;
-        let generated = builtin_manifest()?.digest()?;
-        if declared != actual && declared != generated {
-            anyhow::bail!(
-                "admitted build {} manifest digest changed: report {}, actual {}",
-                binary.display(),
-                declared,
-                actual
-            );
-        }
-    }
-    Ok(())
+
+    let digest = report.manifest_sha256.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "admitted build {} omitted its capability manifest digest",
+            binary.display()
+        )
+    })?;
+    manifest.validate_freshness(digest).with_context(|| {
+        format!(
+            "admitted build {} capability manifest identity is invalid",
+            binary.display()
+        )
+    })
 }
 
 fn write_immutable_source_metadata(binary: &Path, source: &SourceState) -> Result<()> {
@@ -1359,23 +1367,35 @@ fn read_binary_version_report(binary: &Path) -> Result<BinaryVersionReport> {
         );
     }
 
-    serde_json::from_slice(&output.stdout).map_err(|err| {
+    let report: BinaryVersionReport = serde_json::from_slice(&output.stdout).map_err(|err| {
         anyhow::anyhow!(
             "Binary smoke test for {} returned invalid JSON: {}",
             binary.display(),
             err
         )
-    })
+    })?;
+    validate_runtime_smoke_report(binary, &report)?;
+    Ok(report)
 }
 
-pub fn smoke_test_binary(binary: &Path) -> Result<()> {
-    let report = read_binary_version_report(binary)?;
-    if report.version.as_deref().unwrap_or_default().is_empty() {
+fn validate_runtime_smoke_report(binary: &Path, report: &BinaryVersionReport) -> Result<()> {
+    if report
+        .version
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
         anyhow::bail!(
             "Binary smoke test for {} returned JSON without a version field",
             binary.display()
         );
     }
+    Ok(())
+}
+
+pub fn smoke_test_binary(binary: &Path) -> Result<()> {
+    read_binary_version_report(binary)?;
     Ok(())
 }
 

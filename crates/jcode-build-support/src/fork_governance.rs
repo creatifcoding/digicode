@@ -137,6 +137,38 @@ impl ForkCapabilityManifest {
         digest_bytes(&self.canonical_bytes()?)
     }
 
+    /// Validate that an installed manifest is fresh with respect to the
+    /// manifest digest reported by its binary at runtime.
+    ///
+    /// Admission adds `predecessor_manifest_sha256` when it links a new
+    /// release to the existing release line. That linkage is intentionally
+    /// excluded from the freshness comparison. Every other manifest field is
+    /// part of the runtime identity and must match exactly.
+    pub fn validate_freshness(&self, runtime_digest: &str) -> Result<()> {
+        self.validate()?;
+        let runtime_digest = runtime_digest.trim();
+        if runtime_digest.is_empty() {
+            anyhow::bail!("runtime report omitted the capability manifest digest");
+        }
+
+        let actual = self.digest()?;
+        if actual == runtime_digest {
+            return Ok(());
+        }
+
+        let mut admission_linked = self.clone();
+        admission_linked.predecessor_manifest_sha256 = None;
+        if admission_linked.digest()? == runtime_digest {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "fork capability manifest is stale: runtime reported digest {}, installed manifest digest {}",
+            runtime_digest,
+            actual
+        )
+    }
+
     pub fn with_digest(mut self) -> Result<Self> {
         self.sha256 = Some(self.digest()?);
         Ok(self)
@@ -537,6 +569,27 @@ mod tests {
         let digest = manifest.digest().unwrap();
         assert_eq!(manifest.sha256.as_deref(), Some(digest.as_str()));
         manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn manifest_freshness_allows_admission_linkage_but_rejects_contract_drift() {
+        let baseline = manifest(&["alpha"]).with_digest().unwrap();
+        let runtime_digest = baseline.digest().unwrap();
+
+        let mut linked = baseline.clone();
+        linked.predecessor_manifest_sha256 = Some("predecessor-digest".to_string());
+        linked = linked.with_digest().unwrap();
+        linked
+            .validate_freshness(&runtime_digest)
+            .expect("admission-owned predecessor linkage should be allowed");
+
+        let mut stale = linked;
+        stale.capabilities[0].behavior_contract.summary = "drifted".to_string();
+        stale = stale.with_digest().unwrap();
+        let error = stale
+            .validate_freshness(&runtime_digest)
+            .expect_err("contract drift must make the sidecar stale");
+        assert!(error.to_string().contains("manifest is stale"));
     }
 
     #[test]
