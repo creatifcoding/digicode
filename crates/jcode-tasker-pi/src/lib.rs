@@ -125,9 +125,23 @@ pub fn make_task_list_id(raw: &str) -> String {
 /// concurrency records require a typed `proj_*` identity. Keeping the adapter
 /// mapping here prevents callers from treating those two namespaces as aliases.
 pub fn native_project_id_for_partition(partition: &ProjectPartition) -> ProjectId {
+    let database_path =
+        std::fs::canonicalize(&partition.db_path).unwrap_or_else(|_| partition.db_path.clone());
+    project_id_from_identity(&format!(
+        "jcode-tasker-pi-partition:{}\0{}",
+        database_path.to_string_lossy(),
+        partition.list_id,
+    ))
+}
+
+pub(crate) fn legacy_native_project_id_for_list(list_id: &str) -> ProjectId {
+    project_id_from_identity(&format!("jcode-tasker-pi-list:{list_id}"))
+}
+
+fn project_id_from_identity(identity: &str) -> ProjectId {
     let mut hasher = Sha1::new();
     hasher.update(Uuid::NAMESPACE_OID.as_bytes());
-    hasher.update(format!("jcode-tasker-pi-list:{}", partition.list_id).as_bytes());
+    hasher.update(identity.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -3833,6 +3847,35 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.to_string().starts_with("proj_"));
         assert_ne!(first.to_string(), partition.list_id);
+    }
+
+    #[test]
+    fn native_project_identity_separates_databases_but_not_partition_labels() {
+        let baseline = ProjectPartition::with_db_path_and_list_id(
+            "/state/tasker-a.db",
+            "/workspace/project-a",
+            "list_project",
+        );
+        let other_database = ProjectPartition::with_db_path_and_list_id(
+            "/state/tasker-b.db",
+            "/workspace/project-a",
+            "list_project",
+        );
+        let other_project_root = ProjectPartition::with_db_path_and_list_id(
+            "/state/tasker-a.db",
+            "/workspace/project-b",
+            "list_project",
+        );
+
+        let baseline_id = native_project_id_for_partition(&baseline);
+        assert_ne!(
+            baseline_id,
+            native_project_id_for_partition(&other_database)
+        );
+        assert_eq!(
+            baseline_id,
+            native_project_id_for_partition(&other_project_root)
+        );
     }
 
     fn feature_input(title: &str) -> CreateFeature {

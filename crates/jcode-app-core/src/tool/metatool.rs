@@ -54,6 +54,10 @@ const MAX_SOURCE_BYTES: usize = 64 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const TASKER_SNAPSHOT_LIMIT: usize = 500;
 const TASKER_RECEIPT_TTL_SECONDS: u64 = 30 * 60;
+
+pub(crate) fn tasker_receipt_root_for_database(database: &Path) -> PathBuf {
+    database.with_extension("receipts")
+}
 const TASKER_RECEIPT_PREFIX: &str = "tpr_";
 const ARTIFACT_CATALOG_LIMIT: usize = 200;
 const ARTIFACT_MAX_TEXT_BYTES: usize = 1024 * 1024;
@@ -252,7 +256,7 @@ impl MetaTool {
 
     #[cfg(test)]
     fn with_store_and_tasker_roots(store_root: PathBuf, tasker_database_path: PathBuf) -> Self {
-        let tasker_receipt_root = tasker_database_path.with_extension("receipts");
+        let tasker_receipt_root = tasker_receipt_root_for_database(&tasker_database_path);
         Self {
             store_root_override: Some(store_root),
             tasker_database_path_override: Some(tasker_database_path),
@@ -269,10 +273,10 @@ impl MetaTool {
     }
 
     fn tasker_receipt_root(&self) -> Result<PathBuf> {
-        self.tasker_receipt_root_override
+        Ok(self
+            .tasker_receipt_root_override
             .clone()
-            .map(Ok)
-            .unwrap_or_else(|| Ok(crate::storage::jcode_dir()?.join("tasker-plan-receipts")))
+            .unwrap_or_else(|| tasker_receipt_root_for_database(&self.tasker_database_path())))
     }
 
     /// Workspace-scoped durable store directory: the guest's /data mount is
@@ -2326,6 +2330,22 @@ mod tests {
             }
             let _ = self.temp.path();
         }
+    }
+
+    #[test]
+    fn tasker_receipt_root_is_owned_by_the_selected_database() {
+        let temp = tempfile::tempdir().expect("temporary Tasker directory");
+        let database = temp.path().join("selected-tasker.db");
+        let tool = MetaTool {
+            tasker_database_path_override: Some(database.clone()),
+            tasker_receipt_root_override: None,
+            ..MetaTool::new()
+        };
+
+        assert_eq!(
+            tool.tasker_receipt_root().expect("receipt root"),
+            tasker_receipt_root_for_database(&database)
+        );
     }
 
     #[test]

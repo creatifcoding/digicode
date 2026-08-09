@@ -267,7 +267,7 @@ impl ServerCandidateLaneHost {
             bail!("candidate authority rejected: Tasker snapshot changed before execution");
         }
         crate::tool::verify_candidate_lane_receipt(
-            &configured_database.with_extension("receipts"),
+            &crate::tool::tasker_receipt_root_for_database(&configured_database),
             &job.receipt_id,
             &store,
             &snapshot_hash,
@@ -345,7 +345,7 @@ impl ServerCandidateLaneHost {
                     bail!("candidate authority rejected: Tasker snapshot changed before execution");
                 }
                 crate::tool::verify_candidate_lane_receipt(
-                    &resolved.partition.db_path.with_extension("receipts"),
+                    &crate::tool::tasker_receipt_root_for_database(&resolved.partition.db_path),
                     &resolved.job.receipt_id,
                     &store,
                     &reopened_snapshot_hash,
@@ -969,7 +969,7 @@ mod tests {
             let decoded_proposal: CandidateLaneLaunchRequest =
                 serde_json::from_value(proposal.clone()).expect("decode candidate test proposal");
             let receipt_id = crate::tool::issue_candidate_lane_receipt_for_test(
-                &self.database.with_extension("receipts"),
+                &crate::tool::tasker_receipt_root_for_database(&self.database),
                 &store,
                 &self.snapshot_hash,
                 &decoded_proposal,

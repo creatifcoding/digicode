@@ -58,7 +58,8 @@ pub use jcode_tool_types::{ToolImage, ToolOutput};
 pub(crate) use metatool::issue_candidate_lane_receipt_for_test;
 pub(crate) use metatool::{
     CandidateLaneHost, CandidateLaneHostRequest, CandidateLaneHostResponse,
-    SocketCandidateLaneHost, tasker_snapshot_for_project, verify_candidate_lane_receipt,
+    SocketCandidateLaneHost, tasker_receipt_root_for_database, tasker_snapshot_for_project,
+    verify_candidate_lane_receipt,
 };
 pub(crate) use session_search::spawn_recent_index_warmup;
 
