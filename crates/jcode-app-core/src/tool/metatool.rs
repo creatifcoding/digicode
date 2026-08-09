@@ -103,6 +103,8 @@ pub(crate) struct CandidateLaneHostRequest {
     pub id: u64,
     pub operation_id: String,
     pub session_id: String,
+    pub tasker_database_path: String,
+    pub tasker_list_id: String,
     pub working_dir: String,
     pub expected_snapshot_hash: String,
     pub receipt_id: String,
@@ -149,6 +151,8 @@ impl CandidateLaneHost for SocketCandidateLaneHost {
             request: crate::protocol::TaskerCandidateExecutionRequest {
                 operation_id: request.operation_id.clone(),
                 session_id: request.session_id.clone(),
+                tasker_database_path: request.tasker_database_path.clone(),
+                tasker_list_id: request.tasker_list_id.clone(),
                 working_dir: request.working_dir.clone(),
                 expected_snapshot_hash: request.expected_snapshot_hash.clone(),
                 receipt_id: request.receipt_id.clone(),
@@ -761,6 +765,10 @@ fn bind_tasker_effect_to_partition(
     Ok(())
 }
 
+fn concurrency_project_id(partition: &ProjectPartition) -> String {
+    jcode_tasker_pi::native_project_id_for_partition(partition).to_string()
+}
+
 fn validate_receipt_id(id: &str) -> Result<()> {
     if !id.starts_with(TASKER_RECEIPT_PREFIX)
         || id.len() > 64
@@ -794,7 +802,7 @@ fn issue_tasker_receipt(
         list_id: partition.list_id.clone(),
         snapshot_hash: snapshot_hash.to_owned(),
         change_digest: tasker_change_digest(input)?,
-        concurrency_project_id: input.project_id.clone(),
+        concurrency_project_id: Some(concurrency_project_id(partition)),
         issued_at,
         expires_at: issued_at + TASKER_RECEIPT_TTL_SECONDS,
     };
@@ -834,7 +842,9 @@ fn verify_tasker_receipt(
     if receipt.snapshot_hash != snapshot_hash {
         return Err(anyhow!("Tasker plan receipt snapshot mismatch"));
     }
-    if receipt.concurrency_project_id != input.project_id {
+    if receipt.concurrency_project_id.as_deref()
+        != Some(concurrency_project_id(store.partition()).as_str())
+    {
         return Err(anyhow!("Tasker plan receipt concurrency project mismatch"));
     }
     if receipt.change_digest != tasker_change_digest(input)? {
@@ -872,7 +882,7 @@ fn prepare_candidate_lane_apply(
     // Candidate execution is always bound to the partition selected by the
     // host. A guest-supplied project id may not switch that scope.
     bind_tasker_effect_to_partition(&mut input, store.partition())?;
-    let canonical_project_id = store.partition().list_id.clone();
+    let canonical_project_id = concurrency_project_id(store.partition());
     let (_, canonical_snapshot_hash) = tasker_snapshot_for_project(store, &canonical_project_id)?;
     if input.expected_snapshot_hash.as_deref() != Some(canonical_snapshot_hash.as_str()) {
         return Err(anyhow!(
@@ -893,6 +903,31 @@ fn prepare_candidate_lane_apply(
         .validate()
         .map_err(|error| anyhow!("candidate lane request rejected: {error}"))?;
     Ok((proposal, receipt, canonical_snapshot_hash))
+}
+
+fn candidate_lane_host_request(
+    ctx: &ToolContext,
+    partition: &ProjectPartition,
+    canonical_snapshot_hash: String,
+    receipt: &TaskerPlanReceipt,
+    proposal: CandidateLaneLaunchRequest,
+) -> CandidateLaneHostRequest {
+    CandidateLaneHostRequest {
+        id: next_candidate_request_id(),
+        operation_id: format!(
+            "candidate-{}-{}",
+            ctx.session_id,
+            next_candidate_request_id()
+        ),
+        session_id: ctx.session_id.clone(),
+        tasker_database_path: partition.db_path.to_string_lossy().into_owned(),
+        tasker_list_id: partition.list_id.clone(),
+        working_dir: partition.project_root.clone(),
+        expected_snapshot_hash: canonical_snapshot_hash,
+        receipt_id: receipt.id.clone(),
+        proposal: serde_json::to_value(proposal)
+            .expect("validated candidate proposal must remain serializable"),
+    }
 }
 
 fn validate_candidate_host_response(
@@ -947,7 +982,7 @@ fn default_profile() -> ExecutionProfile {
 
 #[cfg(test)]
 fn tasker_snapshot(store: &PiTaskerStore) -> Result<(Value, String)> {
-    let project_id = store.partition().list_id.clone();
+    let project_id = concurrency_project_id(store.partition());
     tasker_snapshot_for_project(store, &project_id)
 }
 
@@ -1176,11 +1211,8 @@ fn reconcile_tasker_effects(
         &input,
     )?;
 
-    let project_id = input
-        .project_id
-        .as_deref()
-        .unwrap_or(&store.partition().list_id);
-    let (_, current_hash) = tasker_snapshot_for_project(store, project_id)?;
+    let concurrency_project_id = concurrency_project_id(store.partition());
+    let (_, current_hash) = tasker_snapshot_for_project(store, &concurrency_project_id)?;
     if current_hash != initial_snapshot_hash {
         return Err(anyhow!(
             "Tasker state changed during codemode evaluation; rerun to reconcile against the current snapshot"
@@ -1993,7 +2025,7 @@ impl MetaTool {
                 } else {
                     let partition =
                         self.tasker_partition(&ctx, params.tasker_project_id.as_deref())?;
-                    let project_id = partition.list_id.clone();
+                    let project_id = concurrency_project_id(&partition);
                     let store = self.tasker_store(partition.clone())?;
                     let (snapshot, snapshot_hash) =
                         tasker_snapshot_for_project(&store, &project_id)?;
@@ -2069,7 +2101,6 @@ impl MetaTool {
                 let reconciliation = match tasker_context {
                     Some((partition, _, snapshot_hash)) => Some({
                         let receipt_root = self.tasker_receipt_root()?;
-                        let project_root = partition.project_root.clone();
                         let effects = tasker_effects.clone();
                         let mode = params.tasker_mode;
                         let requested_receipt = params.tasker_receipt.clone();
@@ -2100,20 +2131,13 @@ impl MetaTool {
                                     CandidateLaneExecutionBlocked::HostExecutorUnavailable,
                                 )
                             })?;
-                            let operation_id = format!(
-                                "candidate-{}-{}",
-                                ctx.session_id,
-                                next_candidate_request_id()
+                            let host_request = candidate_lane_host_request(
+                                &ctx,
+                                &partition,
+                                canonical_snapshot_hash.clone(),
+                                &receipt,
+                                proposal,
                             );
-                            let host_request = CandidateLaneHostRequest {
-                                id: next_candidate_request_id(),
-                                operation_id,
-                                session_id: ctx.session_id.clone(),
-                                working_dir: project_root.clone(),
-                                expected_snapshot_hash: canonical_snapshot_hash.clone(),
-                                receipt_id: receipt.id.clone(),
-                                proposal: serde_json::to_value(proposal)?,
-                            };
                             let cancellation = CancellationToken::new();
                             let cancellation_watcher =
                                 ctx.graceful_shutdown_signal.clone().map(|signal| {
@@ -3015,6 +3039,8 @@ mod tests {
                 ..Default::default()
             })
             .expect("create project b seed");
+        let concurrency_project_a = concurrency_project_id(&partition_a);
+        let concurrency_project_b = concurrency_project_id(&partition_b);
 
         store_a
             .open_concurrency_store()
@@ -3022,7 +3048,7 @@ mod tests {
             .create_candidate_set(
                 json!({
                     "id": "cset-project-a",
-                    "projectId": "list_project_a",
+                    "projectId": concurrency_project_a,
                     "taskId": task_a.id,
                     "baseRevision": 0,
                     "baseCommit": "base-a",
@@ -3042,7 +3068,7 @@ mod tests {
             .create_candidate_set(
                 json!({
                     "id": "cset-project-b",
-                    "projectId": "list_project_b",
+                    "projectId": concurrency_project_b,
                     "taskId": task_b.id,
                     "baseRevision": 0,
                     "baseCommit": "base-b",
@@ -3075,7 +3101,7 @@ mod tests {
             .tasker_store(selected.clone())
             .expect("open selected project store");
         let (selected_snapshot, selected_hash) =
-            tasker_snapshot_for_project(&selected_store, &selected.list_id)
+            tasker_snapshot_for_project(&selected_store, &concurrency_project_id(&selected))
                 .expect("selected project snapshot");
         assert_eq!(
             selected_snapshot["tasks"]
@@ -3088,7 +3114,7 @@ mod tests {
         );
         assert_eq!(
             selected_snapshot["concurrency"]["candidateSets"][0]["projectId"],
-            partition_b.list_id
+            concurrency_project_id(&partition_b)
         );
 
         let effect = ExecutionEffect {
@@ -3123,6 +3149,46 @@ mod tests {
             .as_str()
             .expect("selected receipt")
             .to_owned();
+        assert!(
+            planned["receipt"]["concurrency_project_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("proj_"))
+        );
+        assert_ne!(
+            planned["receipt"]["concurrency_project_id"],
+            partition_b.list_id
+        );
+
+        let proposal = CandidateLaneLaunchRequest {
+            task_reference: Some(task_b.id.clone()),
+            policy: jcode_tasker_types::ConcurrencyPolicy::Speculative { max_candidates: 2 },
+            lane_count: 2,
+            acceptance: jcode_tasker_orchestration::AcceptanceContract::new(
+                vec![jcode_tasker_orchestration::ValidationCommand::new(
+                    "true",
+                    Vec::<String>::new(),
+                )],
+                "selected partition candidate validation",
+                Vec::new(),
+            ),
+            prompt: "implement selected partition candidate".into(),
+            limits: Default::default(),
+        };
+        let selected_receipt: TaskerPlanReceipt =
+            serde_json::from_value(planned["receipt"].clone()).expect("decode selected receipt");
+        let host_request = candidate_lane_host_request(
+            &context_a,
+            &selected,
+            selected_hash.clone(),
+            &selected_receipt,
+            proposal,
+        );
+        assert_eq!(
+            host_request.tasker_database_path,
+            database.to_string_lossy()
+        );
+        assert_eq!(host_request.tasker_list_id, partition_b.list_id);
+        assert_eq!(host_request.working_dir, partition_b.project_root);
         assert_eq!(
             selected_store
                 .list_tasks(None)
@@ -3143,8 +3209,9 @@ mod tests {
         )
         .expect("apply selected project write");
 
-        let (selected_after, _) = tasker_snapshot_for_project(&selected_store, &selected.list_id)
-            .expect("selected project readback");
+        let (selected_after, _) =
+            tasker_snapshot_for_project(&selected_store, &concurrency_project_id(&selected))
+                .expect("selected project readback");
         assert!(
             selected_after["tasks"]
                 .as_array()
@@ -3154,11 +3221,12 @@ mod tests {
         );
         assert_eq!(
             selected_after["concurrency"]["candidateSets"][0]["projectId"],
-            partition_b.list_id
+            concurrency_project_id(&partition_b)
         );
 
-        let (other_snapshot, _) = tasker_snapshot_for_project(&store_a, &partition_a.list_id)
-            .expect("other project readback");
+        let (other_snapshot, _) =
+            tasker_snapshot_for_project(&store_a, &concurrency_project_id(&partition_a))
+                .expect("other project readback");
         assert!(
             other_snapshot["tasks"]
                 .as_array()
@@ -3168,7 +3236,7 @@ mod tests {
         );
         assert_eq!(
             other_snapshot["concurrency"]["candidateSets"][0]["projectId"],
-            partition_a.list_id
+            concurrency_project_id(&partition_a)
         );
 
         let mut wrong_store = tool

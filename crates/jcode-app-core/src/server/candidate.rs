@@ -96,6 +96,8 @@ pub(super) fn cancel_operation(session_id: &str, operation_id: &str) -> bool {
 pub(super) struct CandidateLaneJob {
     pub operation_id: String,
     pub session_id: String,
+    pub tasker_database_path_claim: PathBuf,
+    pub tasker_list_id: String,
     pub working_dir_claim: PathBuf,
     pub expected_snapshot_hash: String,
     pub proposal: CandidateLaneLaunchRequest,
@@ -108,6 +110,12 @@ impl CandidateLaneJob {
         }
         if request.session_id.trim().is_empty() {
             bail!("candidate authority rejected: session id is required");
+        }
+        if request.tasker_database_path.trim().is_empty() {
+            bail!("candidate authority rejected: Tasker database path is required");
+        }
+        if request.tasker_list_id.trim().is_empty() {
+            bail!("candidate authority rejected: Tasker list id is required");
         }
         if request.working_dir.trim().is_empty() {
             bail!("candidate authority rejected: working directory is required");
@@ -126,6 +134,8 @@ impl CandidateLaneJob {
         Ok(Self {
             operation_id: request.operation_id,
             session_id: request.session_id,
+            tasker_database_path_claim: PathBuf::from(request.tasker_database_path),
+            tasker_list_id: request.tasker_list_id,
             working_dir_claim: PathBuf::from(request.working_dir),
             expected_snapshot_hash: request.expected_snapshot_hash,
             proposal,
@@ -230,27 +240,26 @@ impl ServerCandidateLaneHost {
                 job.session_id
             );
         }
-        let authoritative_dir = session
-            .working_dir
-            .as_deref()
-            .filter(|dir| !dir.trim().is_empty())
-            .ok_or_else(|| anyhow!("candidate authority rejected: session has no project root"))?;
-        let authoritative_dir = canonical_project_root(Path::new(authoritative_dir))?;
+        let configured_database = canonical_database_path(&self.database_path)?;
+        let claimed_database = canonical_database_path(&job.tasker_database_path_claim)?;
+        if claimed_database != configured_database {
+            bail!("candidate authority rejected: Tasker database claim does not match the host");
+        }
+        let partition =
+            jcode_tasker_pi::resolve_project_partition(&configured_database, &job.tasker_list_id)
+                .context("resolve selected Tasker partition")?;
+        let authoritative_dir = canonical_project_root(Path::new(&partition.project_root))?;
         let claimed_dir = canonical_project_root(&job.working_dir_claim)?;
         if claimed_dir != authoritative_dir {
             bail!(
-                "candidate authority rejected: working directory claim does not match the live session"
+                "candidate authority rejected: working directory claim does not match the selected Tasker partition"
             );
         }
 
-        let store = PiTaskerStore::open(ProjectPartition::with_db_path(
-            self.database_path.clone(),
-            authoritative_dir.to_string_lossy().into_owned(),
-        ))
-        .context("open canonical Tasker project")?;
-        let pi_list_id = store.partition().list_id.clone();
-        let project_id = native_project_id_for_pi_list(&pi_list_id);
-        let (_, snapshot_hash) = crate::tool::tasker_snapshot_for_project(&store, &pi_list_id)?;
+        let store = PiTaskerStore::open(partition).context("open canonical Tasker project")?;
+        let project_id = jcode_tasker_pi::native_project_id_for_partition(store.partition());
+        let (_, snapshot_hash) =
+            crate::tool::tasker_snapshot_for_project(&store, &project_id.to_string())?;
         if snapshot_hash != job.expected_snapshot_hash {
             bail!("candidate authority rejected: Tasker snapshot changed before execution");
         }
@@ -377,11 +386,12 @@ fn canonical_project_root(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn native_project_id_for_pi_list(list_id: &str) -> ProjectId {
-    ProjectId::from_uuid(uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_OID,
-        format!("jcode-tasker-pi-list:{list_id}").as_bytes(),
-    ))
+fn canonical_database_path(path: &Path) -> Result<PathBuf> {
+    if !path.exists() {
+        bail!("Tasker database path does not exist: {}", path.display());
+    }
+    std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalize Tasker database path {}", path.display()))
 }
 
 fn native_task_id_for_pi_task(task_id: &str) -> TaskId {
@@ -785,6 +795,7 @@ mod tests {
         host: ServerCandidateLaneHost,
         sessions: SessionAgents,
         task_display_id: i64,
+        tasker_list_id: String,
         snapshot_hash: String,
         project_id: ProjectId,
         task_id: TaskId,
@@ -838,10 +849,11 @@ mod tests {
                 })
                 .expect("create isolated task");
             let pi_list_id = store.partition().list_id.clone();
-            let project_id = native_project_id_for_pi_list(&pi_list_id);
+            let project_id = jcode_tasker_pi::native_project_id_for_partition(store.partition());
             let task_id = native_task_id_for_pi_task(&task.id);
-            let (_, snapshot_hash) = crate::tool::tasker_snapshot_for_project(&store, &pi_list_id)
-                .expect("snapshot isolated Tasker store");
+            let (_, snapshot_hash) =
+                crate::tool::tasker_snapshot_for_project(&store, &project_id.to_string())
+                    .expect("snapshot isolated Tasker store");
             drop(store);
 
             let (provider, provider_state) = provider_fixture;
@@ -895,6 +907,7 @@ mod tests {
                 host,
                 sessions,
                 task_display_id: task.display_id,
+                tasker_list_id: pi_list_id,
                 snapshot_hash,
                 project_id,
                 task_id,
@@ -913,6 +926,8 @@ mod tests {
                 id: 42,
                 operation_id: operation_id.to_string(),
                 session_id: self.origin_session_id.clone(),
+                tasker_database_path: self.database.to_string_lossy().into_owned(),
+                tasker_list_id: self.tasker_list_id.clone(),
                 working_dir: self.repository.to_string_lossy().into_owned(),
                 expected_snapshot_hash: self.snapshot_hash.clone(),
                 receipt_id: format!("receipt-{operation_id}"),
@@ -1482,6 +1497,8 @@ mod tests {
             id: 1,
             operation_id: "op-1".into(),
             session_id: "session-1".into(),
+            tasker_database_path: "tasks.db".into(),
+            tasker_list_id: "list_session_1".into(),
             working_dir: ".".into(),
             expected_snapshot_hash: "sha256:host".into(),
             receipt_id: "tpr_1".into(),
@@ -1492,6 +1509,72 @@ mod tests {
             error
                 .to_string()
                 .contains("decode guest candidate proposal")
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_partition_authority_is_independent_of_session_working_directory() {
+        let fixture = DogfoodFixture::new(2).await;
+        let unrelated_root = fixture._workspace.path().join("unrelated-session-project");
+        std::fs::create_dir_all(&unrelated_root).expect("create unrelated session project");
+        let mut session = Session::load(&fixture.origin_session_id).expect("load origin session");
+        session.working_dir = Some(unrelated_root.to_string_lossy().into_owned());
+        session
+            .save()
+            .expect("save unrelated session working directory");
+
+        let request = fixture.request(
+            "selected-partition-authority",
+            json!({"kind": "speculative", "max_candidates": 2}),
+            2,
+        );
+        let job = CandidateLaneJob::from_request(request).expect("decode selected partition job");
+        let resolved = fixture
+            .host
+            .resolve_job(job)
+            .await
+            .expect("resolve selected partition independently of session cwd");
+
+        assert_eq!(resolved.project_root, fixture.repository);
+        assert_eq!(resolved.project_id, fixture.project_id);
+        assert!(resolved.project_id.to_string().starts_with("proj_"));
+        assert_ne!(resolved.project_id.to_string(), fixture.tasker_list_id);
+    }
+
+    #[tokio::test]
+    async fn candidate_authority_rejects_database_and_list_scope_switching() {
+        let fixture = DogfoodFixture::new(2).await;
+        let other_database = fixture._workspace.path().join("other.db");
+        install_pi_schema(&other_database);
+
+        let mut wrong_database = fixture.request(
+            "wrong-database",
+            json!({"kind": "speculative", "max_candidates": 2}),
+            2,
+        );
+        wrong_database.tasker_database_path = other_database.to_string_lossy().into_owned();
+        let error = fixture
+            .host
+            .resolve_job(CandidateLaneJob::from_request(wrong_database).unwrap())
+            .await
+            .expect_err("database scope switch must fail closed");
+        assert!(error.to_string().contains("database claim does not match"));
+
+        let mut wrong_list = fixture.request(
+            "wrong-list",
+            json!({"kind": "speculative", "max_candidates": 2}),
+            2,
+        );
+        wrong_list.tasker_list_id = "list_not_selected".into();
+        let error = fixture
+            .host
+            .resolve_job(CandidateLaneJob::from_request(wrong_list).unwrap())
+            .await
+            .expect_err("list scope switch must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("resolve selected Tasker partition")
         );
     }
 

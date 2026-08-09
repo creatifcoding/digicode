@@ -185,7 +185,10 @@ try {
 	  const expectedSnapshotHash = typeof config.snapshot_hash === "string"
 	    ? config.snapshot_hash
 	    : null;
-	  const projectId = typeof config.project_id === "string" ? config.project_id : null;
+		  // This is the Pi compatibility partition selector (list_*), not the
+		  // native concurrency project identity (proj_*). The host derives the
+		  // latter and never accepts it from guest code.
+		  const projectId = typeof config.project_id === "string" ? config.project_id : null;
 	  let reconciled = false;
 
 	  const bounded = (value, fallback = 100) => Math.max(

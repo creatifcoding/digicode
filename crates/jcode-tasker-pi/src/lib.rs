@@ -11,7 +11,7 @@ pub use mutation_policy::{
     MutationPolicyResult, decide_mutation_policy,
 };
 
-use jcode_tasker_types::{ResourceAccess, ResourceIntent, ResourceKind};
+use jcode_tasker_types::{ProjectId, ResourceAccess, ResourceIntent, ResourceKind};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -116,6 +116,24 @@ pub fn make_task_list_id(raw: &str) -> String {
     } else {
         format!("list_{raw}")
     }
+}
+
+/// Return the stable native Tasker project identity owned by one Pi
+/// compatibility partition.
+///
+/// Pi `list_*` identifiers select compatibility partitions. Native Tasker
+/// concurrency records require a typed `proj_*` identity. Keeping the adapter
+/// mapping here prevents callers from treating those two namespaces as aliases.
+pub fn native_project_id_for_partition(partition: &ProjectPartition) -> ProjectId {
+    let mut hasher = Sha1::new();
+    hasher.update(Uuid::NAMESPACE_OID.as_bytes());
+    hasher.update(format!("jcode-tasker-pi-list:{}", partition.list_id).as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ProjectId::from_uuid(Uuid::from_bytes(bytes))
 }
 
 /// Resolve one exact Pi `list_id` to its unique project-root partition.
@@ -3800,6 +3818,21 @@ mod tests {
             Err(PiTaskerError::ProjectPartitionAmbiguous { list_id, project_roots })
                 if list_id == "list_ambiguous" && project_roots.len() == 2
         ));
+    }
+
+    #[test]
+    fn pi_partition_maps_to_a_stable_distinct_native_project_identity() {
+        let partition = ProjectPartition::with_db_path_and_list_id(
+            "/state/tasker.db",
+            "/workspace/project",
+            "list_project",
+        );
+        let first = native_project_id_for_partition(&partition);
+        let second = native_project_id_for_partition(&partition);
+
+        assert_eq!(first, second);
+        assert!(first.to_string().starts_with("proj_"));
+        assert_ne!(first.to_string(), partition.list_id);
     }
 
     fn feature_input(title: &str) -> CreateFeature {

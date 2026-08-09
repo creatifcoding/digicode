@@ -32,6 +32,8 @@ fn test_tasker_candidate_execution_request_roundtrip() -> Result<()> {
         request: TaskerCandidateExecutionRequest {
             operation_id: "candidate-op-1".into(),
             session_id: "session-a".into(),
+            tasker_database_path: "/state/tasker.db".into(),
+            tasker_list_id: "list_project".into(),
             working_dir: "/workspace/project".into(),
             expected_snapshot_hash: "sha256:snapshot".into(),
             receipt_id: "tpr_abc".into(),
@@ -47,6 +49,7 @@ fn test_tasker_candidate_execution_request_roundtrip() -> Result<()> {
         return Err(anyhow!("expected candidate execution request"));
     };
     assert_eq!(request.receipt_id, "tpr_abc");
+    assert_eq!(request.tasker_list_id, "list_project");
     assert_eq!(request.proposal["laneCount"], 2);
     Ok(())
 }

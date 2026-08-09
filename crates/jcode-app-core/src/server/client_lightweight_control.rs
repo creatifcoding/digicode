@@ -146,6 +146,8 @@ pub(super) async fn handle_lightweight_control_request(
                 id,
                 operation_id: request.operation_id,
                 session_id: request.session_id,
+                tasker_database_path: request.tasker_database_path,
+                tasker_list_id: request.tasker_list_id,
                 working_dir: request.working_dir,
                 expected_snapshot_hash: request.expected_snapshot_hash,
                 receipt_id: request.receipt_id,

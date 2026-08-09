@@ -41,6 +41,8 @@ fn is_false(value: &bool) -> bool {
 pub struct TaskerCandidateExecutionRequest {
     pub operation_id: String,
     pub session_id: String,
+    pub tasker_database_path: String,
+    pub tasker_list_id: String,
     pub working_dir: String,
     pub expected_snapshot_hash: String,
     pub receipt_id: String,
