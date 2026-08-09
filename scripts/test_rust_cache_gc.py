@@ -79,6 +79,16 @@ class RustCacheGcTests(unittest.TestCase):
                 [valid.resolve(), explicit.resolve()],
             )
 
+    def test_discovery_is_bounded_when_native_find_times_out(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            with mock.patch.object(
+                rust_cache_gc.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(["find", str(root)], 120),
+            ):
+                self.assertEqual(rust_cache_gc.discover_targets([root]), [])
+
     def test_explicit_root_does_not_expand_to_the_default_roots_file(self):
         with tempfile.TemporaryDirectory() as raw:
             base = Path(raw)

@@ -23,6 +23,7 @@ from typing import Iterable
 
 GIB = 1024**3
 TARGET_NAMES = {"target"}
+TARGET_PREFIXES = ("target-", "compile-cache-")
 SKIP_PARTS = {".cargo", ".git", ".rustup", "builds", "node_modules"}
 
 
@@ -87,7 +88,7 @@ def configured_roots(args: argparse.Namespace) -> list[Path]:
 
 
 def is_target_name(name: str) -> bool:
-    return name in TARGET_NAMES or name.startswith("target-")
+    return name in TARGET_NAMES or name.startswith(TARGET_PREFIXES)
 
 
 def is_cargo_target(path: Path) -> bool:
@@ -110,7 +111,7 @@ def is_cargo_target(path: Path) -> bool:
     )
 
 
-def discover_targets(roots: Iterable[Path]) -> list[Path]:
+def discover_targets_with_walk(roots: Iterable[Path]) -> list[Path]:
     found: list[Path] = []
     seen: set[Path] = set()
     for root in roots:
@@ -130,6 +131,70 @@ def discover_targets(roots: Iterable[Path]) -> list[Path]:
                     continue
                 found.append(candidate)
                 seen.add(candidate)
+    return found
+
+
+def discover_targets(roots: Iterable[Path]) -> list[Path]:
+    roots = list(roots)
+    expression = ["-xdev", "(", "-type", "d", "("]
+    for index, name in enumerate(sorted(SKIP_PARTS)):
+        if index:
+            expression.append("-o")
+        expression.extend(["-name", name])
+    expression.extend(
+        [
+            ")",
+            ")",
+            "-prune",
+            "-o",
+            "(",
+            "-type",
+            "d",
+            "(",
+            "-name",
+            "target",
+            "-o",
+            "-name",
+            "target-*",
+            "-o",
+            "-name",
+            "compile-cache-*",
+            ")",
+            "-print0",
+            "-prune",
+            ")",
+        ]
+    )
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            result = subprocess.run(
+                ["find", str(root), *expression],
+                check=False,
+                capture_output=True,
+                timeout=120,
+            )
+        except FileNotFoundError:
+            return discover_targets_with_walk(roots)
+        except subprocess.TimeoutExpired:
+            print(f"rust_cache_gc: target discovery exceeded 120 seconds for {root}", file=sys.stderr)
+            continue
+        if result.returncode not in {0, 1}:
+            detail = os.fsdecode(result.stderr).strip()
+            print(
+                f"rust_cache_gc: target discovery failed for {root}: {detail or result.returncode}",
+                file=sys.stderr,
+            )
+            continue
+        for raw in result.stdout.split(b"\0"):
+            if not raw:
+                continue
+            candidate = Path(os.fsdecode(raw)).resolve()
+            if candidate in seen or not is_cargo_target(candidate):
+                continue
+            found.append(candidate)
+            seen.add(candidate)
     return found
 
 
