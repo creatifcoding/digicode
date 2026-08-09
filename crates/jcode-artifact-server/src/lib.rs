@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, path::PathBuf};
+//! Read-only presentation for the durable artifact library.
+//!
+//! Artifact creation and revision admission belong to the governed
+//! `mt.artifacts.admitBundle` capability. This server intentionally owns only
+//! loopback presentation and a host-controlled lifetime; it has no mutation
+//! routes or independent admission authority.
+
+use std::{future::Future, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result};
 use jcode_artifact_store::{Artifact, ArtifactStore, Revision};
@@ -33,15 +40,36 @@ impl ArtifactServer {
     }
 
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
+        self.serve_until(addr, std::future::pending()).await
+    }
+
+    pub async fn serve_until<F>(self, addr: SocketAddr, shutdown: F) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        ensure_loopback(addr)?;
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding artifact server to {addr}"))?;
+        self.serve_listener(listener, shutdown).await
+    }
+
+    async fn serve_listener<F>(self, listener: TcpListener, shutdown: F) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        tokio::pin!(shutdown);
         loop {
-            let (stream, _) = listener.accept().await?;
-            let server = self.clone();
-            tokio::spawn(async move {
-                let _ = server.handle_connection(stream).await;
-            });
+            tokio::select! {
+                _ = &mut shutdown => return Ok(()),
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let server = self.clone();
+                    tokio::spawn(async move {
+                        let _ = server.handle_connection(stream).await;
+                    });
+                }
+            }
         }
     }
 
@@ -55,12 +83,15 @@ impl ArtifactServer {
         let mut parts = line.split_whitespace();
         let method = parts.next().unwrap_or_default();
         let target = parts.next().unwrap_or("/");
-        let response = if method == "GET" {
-            self.route(target).await
-        } else {
-            Response::text(405, "method not allowed")
-        };
+        let response = self.request(method, target).await;
         write_response(&mut stream, response).await
+    }
+
+    pub async fn request(&self, method: &str, target: &str) -> Response {
+        if method != "GET" {
+            return Response::text(405, "method not allowed");
+        }
+        self.route(target).await
     }
 
     pub async fn route(&self, target: &str) -> Response {
@@ -255,6 +286,16 @@ fn safe_segment(segment: &str) -> Result<String, ()> {
     Ok(segment.to_string())
 }
 
+fn ensure_loopback(addr: SocketAddr) -> Result<()> {
+    if addr.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "artifact server only accepts loopback bind addresses"
+        ))
+    }
+}
+
 fn render_page(title: &str, main: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -346,6 +387,11 @@ fn escape_attr(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::io::AsyncWriteExt;
 
     fn seed_store(root: &PathBuf) -> (Artifact, Revision) {
         let store =
@@ -443,5 +489,57 @@ mod tests {
         assert_eq!(response.content_type, "text/event-stream; charset=utf-8");
         assert!(body.contains("event: datastar-patch-elements"));
         assert!(body.contains("Deck Alpha"));
+    }
+
+    #[tokio::test]
+    async fn mutation_requests_are_rejected_at_the_server_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_store(&temp.path().to_path_buf());
+        let server = ArtifactServer::new(temp.path());
+
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let response = server.request(method, "/catalog").await;
+            assert_eq!(response.status, 405, "{method} must remain read-only");
+            assert_eq!(response.body, b"method not allowed");
+        }
+    }
+
+    #[test]
+    fn server_rejects_non_loopback_bind_addresses() {
+        let address = "0.0.0.0:8789".parse().unwrap();
+        let error = ensure_loopback(address).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "artifact server only accepts loopback bind addresses"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_owned_shutdown_stops_the_listener() {
+        let temp = tempfile::tempdir().unwrap();
+        seed_store(&temp.path().to_path_buf());
+        let server = ArtifactServer::new(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_signal = Arc::clone(&shutdown);
+
+        let task = tokio::spawn(server.serve_listener(listener, async move {
+            while !shutdown_signal.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }));
+
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /catalog HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = stream.shutdown().await;
+
+        shutdown.store(true, Ordering::Release);
+        task.await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
     }
 }
