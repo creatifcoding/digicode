@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{PiTaskerStore, ProjectPartition};
+use crate::{
+    PiTaskerStore, ProjectPartition, legacy_native_project_id_for_list,
+    native_project_id_for_partition,
+};
 
 const MAX_PROJECTION_LIMIT: usize = 500;
 const CONCURRENCY_SCHEMA_VERSION: i64 = 1;
@@ -202,6 +205,7 @@ impl ConcurrencyStore {
     pub fn open(partition: ProjectPartition) -> ConcurrencyResult<Self> {
         let mut conn = Connection::open(&partition.db_path)?;
         configure_and_migrate(&mut conn)?;
+        migrate_legacy_project_identity(&mut conn, &partition)?;
         Ok(Self { conn, partition })
     }
 
@@ -1406,6 +1410,70 @@ fn configure_and_migrate(conn: &mut Connection) -> ConcurrencyResult<()> {
     Ok(())
 }
 
+fn migrate_legacy_project_identity(
+    conn: &mut Connection,
+    partition: &ProjectPartition,
+) -> ConcurrencyResult<()> {
+    let legacy_id = legacy_native_project_id_for_list(&partition.list_id).to_string();
+    let current_id = native_project_id_for_partition(partition).to_string();
+    if legacy_id == current_id {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let legacy_revision = tx
+        .query_row(
+            "SELECT revision FROM concurrency_project_revisions WHERE project_id = ?1",
+            [&legacy_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let legacy_records = legacy_revision.is_some()
+        || tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM candidate_sets WHERE project_id = ?1)",
+            [&legacy_id],
+            |row| row.get::<_, bool>(0),
+        )?
+        || tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM promotion_intents WHERE project_id = ?1)",
+            [&legacy_id],
+            |row| row.get::<_, bool>(0),
+        )?
+        || tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM promotion_events WHERE project_id = ?1)",
+            [&legacy_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+    if !legacy_records {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    if let Some(legacy_revision) = legacy_revision {
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO concurrency_project_revisions(project_id, revision, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_id) DO UPDATE SET
+                 revision = MAX(revision, excluded.revision),
+                 updated_at = excluded.updated_at",
+            params![current_id, legacy_revision, now],
+        )?;
+        tx.execute(
+            "DELETE FROM concurrency_project_revisions WHERE project_id = ?1",
+            [&legacy_id],
+        )?;
+    }
+    for table in ["candidate_sets", "promotion_intents", "promotion_events"] {
+        tx.execute(
+            &format!("UPDATE {table} SET project_id = ?1 WHERE project_id = ?2"),
+            params![current_id, legacy_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn parse_candidate_set(value: Value) -> ConcurrencyResult<CandidateSetData> {
     let object = as_object(value, "candidate_set")?;
     let policy = required_value(&object, "policy")?;
@@ -2563,6 +2631,63 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn legacy_list_scoped_project_identity_migrates_to_database_partition_identity() {
+        let path = temp_path();
+        let partition = ProjectPartition::with_db_path_and_list_id(
+            &path,
+            "/repo/concurrency",
+            "list_migration",
+        );
+        let legacy_id = legacy_native_project_id_for_list(&partition.list_id).to_string();
+        let current_id = native_project_id_for_partition(&partition).to_string();
+        assert_ne!(legacy_id, current_id);
+
+        let mut conn = Connection::open(&path).unwrap();
+        configure_and_migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO concurrency_project_revisions(project_id, revision, updated_at)
+             VALUES (?1, 7, '2026-08-09T00:00:00Z')",
+            [&legacy_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO candidate_sets(
+                 id, project_id, task_id, base_revision, base_commit, acceptance_digest,
+                 policy_json, policy_version, state, created_at, updated_at
+             ) VALUES (
+                 'cset_legacy', ?1, 'task_legacy', 7, 'base', 'acceptance',
+                 '{\"kind\":\"speculative\",\"maxCandidates\":2}', 1, 'open',
+                 '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z'
+             )",
+            [&legacy_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = ConcurrencyStore::open(partition).unwrap();
+        assert_eq!(store.current_revision(&current_id).unwrap(), 7);
+        drop(store);
+
+        let conn = Connection::open(&path).unwrap();
+        let migrated_project: String = conn
+            .query_row(
+                "SELECT project_id FROM candidate_sets WHERE id = 'cset_legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_project, current_id);
+        let legacy_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM concurrency_project_revisions WHERE project_id = ?1",
+                [&legacy_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_rows, 0);
     }
 
     #[test]
