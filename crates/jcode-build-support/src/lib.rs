@@ -385,7 +385,7 @@ fn manifest_for_report(
     report: &BinaryVersionReport,
 ) -> Result<(ForkCapabilityManifest, bool)> {
     if let Some(manifest) = read_manifest_for_binary(binary)? {
-        let legacy = manifest.manifest_version.starts_with("legacy-");
+        let legacy = manifest.is_legacy();
         if !legacy {
             manifest.validate_baseline(&builtin_manifest()?)?;
             let version = report.manifest_version.as_deref().ok_or_else(|| {
@@ -446,7 +446,7 @@ fn validate_manifest_report_identity(
     report: &BinaryVersionReport,
     manifest: &ForkCapabilityManifest,
 ) -> Result<()> {
-    if manifest.manifest_version.starts_with("legacy-") {
+    if manifest.is_legacy() {
         return Ok(());
     }
 

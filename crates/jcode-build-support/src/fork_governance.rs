@@ -242,6 +242,17 @@ impl ForkCapabilityManifest {
         Ok(self)
     }
 
+    /// Pre-baseline manifests were written before recovery readiness became a
+    /// frozen contract. Treat those manifests as legacy during migration.
+    pub fn is_legacy(&self) -> bool {
+        self.manifest_version.starts_with("legacy-")
+            || (self.recovery_baseline.is_none()
+                && self
+                    .capabilities
+                    .iter()
+                    .all(|capability| capability.recovery_state.is_empty()))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != MANIFEST_SCHEMA_VERSION {
             anyhow::bail!(
@@ -387,7 +398,8 @@ impl ForkCapabilityManifest {
     /// release line. A manifest may remove one of these entries only when its
     /// own immutable retirement ledger contains the exact capability ID.
     pub fn validate_baseline(&self, baseline: &Self) -> Result<()> {
-        if let Some(expected) = &baseline.recovery_baseline {
+        let candidate_is_legacy = self.is_legacy();
+        if !candidate_is_legacy && let Some(expected) = &baseline.recovery_baseline {
             match &self.recovery_baseline {
                 Some(actual) if actual == expected => {}
                 Some(_) => {
@@ -403,6 +415,16 @@ impl ForkCapabilityManifest {
             .map(|record| record.capability_id.as_str())
             .collect::<HashSet<_>>();
         for capability in &baseline.capabilities {
+            if let Some(candidate) = active.get(capability.id.as_str())
+                && !candidate_is_legacy
+                && baseline.recovery_baseline.is_some()
+                && candidate.recovery_state != capability.recovery_state
+            {
+                anyhow::bail!(
+                    "candidate changed the frozen recovery state for capability {}",
+                    capability.id
+                );
+            }
             if !active.contains_key(capability.id.as_str())
                 && !retired.contains(capability.id.as_str())
             {
@@ -882,6 +904,42 @@ mod tests {
             error
                 .to_string()
                 .contains("changed the frozen recovery capability baseline")
+        );
+    }
+
+    #[test]
+    fn pre_baseline_manifest_is_accepted_during_migration() {
+        let baseline = builtin_manifest().unwrap();
+        let mut candidate = baseline.clone();
+        candidate.recovery_baseline = None;
+        for capability in &mut candidate.capabilities {
+            capability.recovery_state.clear();
+        }
+        let candidate = candidate.with_digest().unwrap();
+
+        assert!(candidate.is_legacy());
+        candidate
+            .validate_baseline(&baseline)
+            .expect("pre-baseline manifests must remain admissible during migration");
+    }
+
+    #[test]
+    fn candidate_cannot_change_frozen_recovery_state() {
+        let baseline = builtin_manifest().unwrap();
+        let mut candidate = baseline.clone();
+        candidate.capabilities[0].recovery_state =
+            if candidate.capabilities[0].recovery_state == "live" {
+                "source-only".to_string()
+            } else {
+                "live".to_string()
+            };
+        let error = candidate
+            .validate_baseline(&baseline)
+            .expect_err("capability recovery readiness drift must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("changed the frozen recovery state")
         );
     }
 
