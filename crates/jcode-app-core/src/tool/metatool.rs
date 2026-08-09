@@ -24,6 +24,7 @@ use jcode_tasker_orchestration::{CandidateExecutionReport, CandidateLaneLaunchRe
 use jcode_tasker_pi::{
     BatchOperation, CreateFeature, CreateTask, FeaturePlanFeature, FeaturePlanInput, NoteInput,
     PiTaskerStore, PlanTask, ProjectPartition, ResolveFeatureGate, UpdateFeature, UpdateTask,
+    resolve_project_partition,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -448,17 +449,29 @@ impl MetaTool {
             .map_err(anyhow::Error::new)
     }
 
-    fn tasker_store(&self, ctx: &ToolContext) -> Result<PiTaskerStore> {
+    fn tasker_partition(
+        &self,
+        ctx: &ToolContext,
+        requested_list_id: Option<&str>,
+    ) -> Result<ProjectPartition> {
+        if let Some(list_id) = requested_list_id {
+            return resolve_project_partition(self.tasker_database_path(), list_id)
+                .map_err(anyhow::Error::new);
+        }
+
         let root = ctx
             .working_dir
             .as_deref()
             .ok_or_else(|| anyhow!("Tasker codemode requires a session working directory"))?;
         let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        PiTaskerStore::open(ProjectPartition::with_db_path(
+        Ok(ProjectPartition::with_db_path(
             self.tasker_database_path(),
             canonical.to_string_lossy().into_owned(),
         ))
-        .map_err(anyhow::Error::new)
+    }
+
+    fn tasker_store(&self, partition: ProjectPartition) -> Result<PiTaskerStore> {
+        PiTaskerStore::open(partition).map_err(anyhow::Error::new)
     }
 }
 
@@ -732,6 +745,22 @@ fn tasker_change_digest(input: &TaskerEffectInput) -> Result<String> {
     ))
 }
 
+fn bind_tasker_effect_to_partition(
+    input: &mut TaskerEffectInput,
+    partition: &ProjectPartition,
+) -> Result<()> {
+    let selected_list_id = &partition.list_id;
+    if let Some(requested_list_id) = input.project_id.as_deref()
+        && requested_list_id != selected_list_id
+    {
+        return Err(anyhow!(
+            "Tasker capability project id {requested_list_id} does not match selected partition list id {selected_list_id}"
+        ));
+    }
+    input.project_id = Some(selected_list_id.clone());
+    Ok(())
+}
+
 fn validate_receipt_id(id: &str) -> Result<()> {
     if !id.starts_with(TASKER_RECEIPT_PREFIX)
         || id.len() > 64
@@ -840,10 +869,10 @@ fn prepare_candidate_lane_apply(
         ));
     }
 
-    // Candidate execution is always bound to the canonical project/list for
-    // this working directory. A guest-supplied project id is never used.
+    // Candidate execution is always bound to the partition selected by the
+    // host. A guest-supplied project id may not switch that scope.
+    bind_tasker_effect_to_partition(&mut input, store.partition())?;
     let canonical_project_id = store.partition().list_id.clone();
-    input.project_id = Some(canonical_project_id.clone());
     let (_, canonical_snapshot_hash) = tasker_snapshot_for_project(store, &canonical_project_id)?;
     if input.expected_snapshot_hash.as_deref() != Some(canonical_snapshot_hash.as_str()) {
         return Err(anyhow!(
@@ -1095,12 +1124,7 @@ fn reconcile_tasker_effects(
         ));
     }
     let mut input: TaskerEffectInput = serde_json::from_value(effect.input.clone())?;
-    input.project_id = Some(
-        input
-            .project_id
-            .clone()
-            .unwrap_or_else(|| store.partition().list_id.clone()),
-    );
+    bind_tasker_effect_to_partition(&mut input, store.partition())?;
     if input.mode != requested_mode {
         return Err(anyhow!(
             "Tasker capability mode {:?} does not match requested mode {:?}",
@@ -1967,14 +1991,13 @@ impl MetaTool {
                 let tasker_context = if params.tasker_mode == TaskerMode::Off {
                     None
                 } else {
-                    let store = self.tasker_store(&ctx)?;
-                    let project_id = params
-                        .tasker_project_id
-                        .clone()
-                        .unwrap_or_else(|| store.partition().list_id.clone());
+                    let partition =
+                        self.tasker_partition(&ctx, params.tasker_project_id.as_deref())?;
+                    let project_id = partition.list_id.clone();
+                    let store = self.tasker_store(partition.clone())?;
                     let (snapshot, snapshot_hash) =
                         tasker_snapshot_for_project(&store, &project_id)?;
-                    Some((snapshot, snapshot_hash, project_id))
+                    Some((partition, snapshot, snapshot_hash))
                 };
                 let artifact_context = if params.artifact_mode == ArtifactMode::Off {
                     None
@@ -1984,14 +2007,14 @@ impl MetaTool {
                 };
                 let capabilities = if tasker_context.is_some() || artifact_context.is_some() {
                     let mut capabilities = serde_json::Map::new();
-                    if let Some((snapshot, snapshot_hash, project_id)) = tasker_context.as_ref() {
+                    if let Some((partition, snapshot, snapshot_hash)) = tasker_context.as_ref() {
                         capabilities.insert(
                             "tasker".into(),
                             json!({
                                 "mode": params.tasker_mode,
                                 "snapshot": snapshot,
                                 "snapshot_hash": snapshot_hash,
-                                "project_id": project_id,
+                                "project_id": partition.list_id,
                             }),
                         );
                     }
@@ -2044,12 +2067,9 @@ impl MetaTool {
                     ));
                 }
                 let reconciliation = match tasker_context {
-                    Some((_, snapshot_hash, _)) => Some({
-                        let database_path = self.tasker_database_path();
+                    Some((partition, _, snapshot_hash)) => Some({
                         let receipt_root = self.tasker_receipt_root()?;
-                        let project_root = ctx.working_dir.clone().ok_or_else(|| {
-                            anyhow!("Tasker codemode requires a working directory")
-                        })?;
+                        let project_root = partition.project_root.clone();
                         let effects = tasker_effects.clone();
                         let mode = params.tasker_mode;
                         let requested_receipt = params.tasker_receipt.clone();
@@ -2059,19 +2079,12 @@ impl MetaTool {
                         if is_candidate_apply {
                             let (proposal, receipt, canonical_snapshot_hash) =
                                 tokio::task::spawn_blocking({
-                                    let database_path = database_path.clone();
+                                    let partition = partition.clone();
                                     let receipt_root = receipt_root.clone();
-                                    let project_root = project_root.clone();
                                     let effects = effects.clone();
                                     let requested_receipt = requested_receipt.clone();
                                     move || {
-                                        let canonical = std::fs::canonicalize(&project_root)
-                                            .unwrap_or(project_root);
-                                        let mut store =
-                                            PiTaskerStore::open(ProjectPartition::with_db_path(
-                                                database_path,
-                                                canonical.to_string_lossy().into_owned(),
-                                            ))?;
+                                        let mut store = PiTaskerStore::open(partition)?;
                                         prepare_candidate_lane_apply(
                                             &mut store,
                                             &effects,
@@ -2096,7 +2109,7 @@ impl MetaTool {
                                 id: next_candidate_request_id(),
                                 operation_id,
                                 session_id: ctx.session_id.clone(),
-                                working_dir: project_root.to_string_lossy().into_owned(),
+                                working_dir: project_root.clone(),
                                 expected_snapshot_hash: canonical_snapshot_hash.clone(),
                                 receipt_id: receipt.id.clone(),
                                 proposal: serde_json::to_value(proposal)?,
@@ -2136,13 +2149,7 @@ impl MetaTool {
                             })
                         } else {
                             tokio::task::spawn_blocking(move || {
-                                let canonical =
-                                    std::fs::canonicalize(&project_root).unwrap_or(project_root);
-                                let mut store =
-                                    PiTaskerStore::open(ProjectPartition::with_db_path(
-                                        database_path,
-                                        canonical.to_string_lossy().into_owned(),
-                                    ))?;
+                                let mut store = PiTaskerStore::open(partition)?;
                                 reconcile_tasker_effects(
                                     &mut store,
                                     &effects,
@@ -2973,6 +2980,217 @@ mod tests {
         let tasks = store.list_tasks(None).expect("list after apply");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Created through mt.tasker");
+    }
+
+    #[test]
+    fn selected_tasker_project_routes_every_operation_to_one_partition() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let root_a = workspace.path().join("project-a");
+        let root_b = workspace.path().join("project-b");
+        std::fs::create_dir_all(&root_a).expect("create project a");
+        std::fs::create_dir_all(&root_b).expect("create project b");
+        let database = workspace.path().join("tasks.db");
+        super::super::tasker::tests::install_pi_schema(&database);
+        let partition_a = ProjectPartition::with_db_path_and_list_id(
+            &database,
+            root_a.to_string_lossy().into_owned(),
+            "list_project_a",
+        );
+        let partition_b = ProjectPartition::with_db_path_and_list_id(
+            &database,
+            root_b.to_string_lossy().into_owned(),
+            "list_project_b",
+        );
+        let mut store_a = PiTaskerStore::open(partition_a.clone()).expect("open project a");
+        let task_a = store_a
+            .create_task(CreateTask {
+                title: "project a seed".into(),
+                ..Default::default()
+            })
+            .expect("create project a seed");
+        let mut store_b = PiTaskerStore::open(partition_b.clone()).expect("open project b");
+        let task_b = store_b
+            .create_task(CreateTask {
+                title: "project b seed".into(),
+                ..Default::default()
+            })
+            .expect("create project b seed");
+
+        store_a
+            .open_concurrency_store()
+            .expect("open project a concurrency store")
+            .create_candidate_set(
+                json!({
+                    "id": "cset-project-a",
+                    "projectId": "list_project_a",
+                    "taskId": task_a.id,
+                    "baseRevision": 0,
+                    "baseCommit": "base-a",
+                    "acceptanceDigest": "digest-a",
+                    "policy": {"kind": "ensemble", "candidateCount": 2, "quorum": 1},
+                    "policyVersion": 1,
+                    "state": "open",
+                    "createdAt": "2026-08-09T00:00:00Z",
+                    "updatedAt": "2026-08-09T00:00:00Z"
+                }),
+                0,
+            )
+            .expect("create project a candidate set");
+        store_b
+            .open_concurrency_store()
+            .expect("open project b concurrency store")
+            .create_candidate_set(
+                json!({
+                    "id": "cset-project-b",
+                    "projectId": "list_project_b",
+                    "taskId": task_b.id,
+                    "baseRevision": 0,
+                    "baseCommit": "base-b",
+                    "acceptanceDigest": "digest-b",
+                    "policy": {"kind": "ensemble", "candidateCount": 2, "quorum": 1},
+                    "policyVersion": 1,
+                    "state": "open",
+                    "createdAt": "2026-08-09T00:00:00Z",
+                    "updatedAt": "2026-08-09T00:00:00Z"
+                }),
+                0,
+            )
+            .expect("create project b candidate set");
+
+        let tool = MetaTool::with_store_and_tasker_roots(
+            workspace.path().join("metatool-store"),
+            database.clone(),
+        );
+        let context_a = context(&root_a);
+        let selected = tool
+            .tasker_partition(&context_a, Some(&partition_b.list_id))
+            .expect("resolve selected project partition");
+        assert_eq!(selected, partition_b);
+        let default = tool
+            .tasker_partition(&context_a, None)
+            .expect("resolve default working-dir partition");
+        assert_eq!(default.project_root, partition_a.project_root);
+
+        let mut selected_store = tool
+            .tasker_store(selected.clone())
+            .expect("open selected project store");
+        let (selected_snapshot, selected_hash) =
+            tasker_snapshot_for_project(&selected_store, &selected.list_id)
+                .expect("selected project snapshot");
+        assert_eq!(
+            selected_snapshot["tasks"]
+                .as_array()
+                .expect("selected tasks")
+                .iter()
+                .map(|task| task["title"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["project b seed"]
+        );
+        assert_eq!(
+            selected_snapshot["concurrency"]["candidateSets"][0]["projectId"],
+            partition_b.list_id
+        );
+
+        let effect = ExecutionEffect {
+            capability: "tasker".into(),
+            operation: "reconcile".into(),
+            input: json!({
+                "kind": "batch",
+                "mode": "plan",
+                "expected_snapshot_hash": selected_hash,
+                "payload": {
+                    "operations": [{
+                        "op": "create",
+                        "key": "selected",
+                        "title": "written to project b",
+                        "dependsOn": [],
+                        "notes": []
+                    }]
+                }
+            }),
+        };
+        let receipts = workspace.path().join("receipts");
+        let planned = reconcile_tasker_effects(
+            &mut selected_store,
+            std::slice::from_ref(&effect),
+            TaskerMode::Plan,
+            &selected_hash,
+            &receipts,
+            None,
+        )
+        .expect("plan selected project write");
+        let receipt = planned["receipt"]["id"]
+            .as_str()
+            .expect("selected receipt")
+            .to_owned();
+        assert_eq!(
+            selected_store
+                .list_tasks(None)
+                .expect("selected tasks after plan")
+                .len(),
+            1
+        );
+
+        let mut apply_effect = effect;
+        apply_effect.input["mode"] = json!("apply");
+        reconcile_tasker_effects(
+            &mut selected_store,
+            std::slice::from_ref(&apply_effect),
+            TaskerMode::Apply,
+            &selected_hash,
+            &receipts,
+            Some(&receipt),
+        )
+        .expect("apply selected project write");
+
+        let (selected_after, _) = tasker_snapshot_for_project(&selected_store, &selected.list_id)
+            .expect("selected project readback");
+        assert!(
+            selected_after["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|task| task["title"] == "written to project b")
+        );
+        assert_eq!(
+            selected_after["concurrency"]["candidateSets"][0]["projectId"],
+            partition_b.list_id
+        );
+
+        let (other_snapshot, _) = tasker_snapshot_for_project(&store_a, &partition_a.list_id)
+            .expect("other project readback");
+        assert!(
+            other_snapshot["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|task| task["title"] != "written to project b")
+        );
+        assert_eq!(
+            other_snapshot["concurrency"]["candidateSets"][0]["projectId"],
+            partition_a.list_id
+        );
+
+        let mut wrong_store = tool
+            .tasker_store(partition_a.clone())
+            .expect("open other project store");
+        let error = reconcile_tasker_effects(
+            &mut wrong_store,
+            &[apply_effect],
+            TaskerMode::Apply,
+            &selected_hash,
+            &receipts,
+            Some(&receipt),
+        )
+        .expect_err("selected receipt must not verify in another partition");
+        assert!(error.to_string().contains("scope mismatch"));
+        assert_eq!(
+            wrong_store
+                .list_tasks(None)
+                .expect("other project tasks after rejected apply")
+                .len(),
+            1
+        );
     }
 
     #[test]

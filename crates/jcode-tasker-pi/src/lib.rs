@@ -32,6 +32,15 @@ pub enum PiTaskerError {
     Json(#[from] serde_json::Error),
     #[error("schema preflight failed: {0}")]
     Schema(String),
+    #[error("project partition not found for list id {list_id}")]
+    ProjectPartitionNotFound { list_id: String },
+    #[error(
+        "project partition is ambiguous for list id {list_id}; project roots: {project_roots:?}"
+    )]
+    ProjectPartitionAmbiguous {
+        list_id: String,
+        project_roots: Vec<String>,
+    },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("invalid reference: {0}")]
@@ -58,10 +67,18 @@ impl ProjectPartition {
     pub fn with_db_path(db_path: impl Into<PathBuf>, project_root: impl Into<String>) -> Self {
         let project_root = project_root.into();
         let list_id = derive_list_id(&project_root);
+        Self::with_db_path_and_list_id(db_path, project_root, list_id)
+    }
+
+    pub fn with_db_path_and_list_id(
+        db_path: impl Into<PathBuf>,
+        project_root: impl Into<String>,
+        list_id: impl Into<String>,
+    ) -> Self {
         Self {
             db_path: db_path.into(),
-            project_root,
-            list_id,
+            project_root: project_root.into(),
+            list_id: list_id.into(),
         }
     }
 }
@@ -98,6 +115,51 @@ pub fn make_task_list_id(raw: &str) -> String {
         raw.to_owned()
     } else {
         format!("list_{raw}")
+    }
+}
+
+/// Resolve one exact Pi `list_id` to its unique project-root partition.
+///
+/// A list id is only safe to use as a partition selector when the database
+/// contains exactly one distinct project root for it. Unknown and ambiguous
+/// ids fail closed instead of guessing from the caller's working directory.
+pub fn resolve_project_partition(
+    db_path: impl AsRef<Path>,
+    list_id: &str,
+) -> Result<ProjectPartition> {
+    let list_id = list_id.trim();
+    if list_id.is_empty() {
+        return Err(PiTaskerError::InvalidReference(
+            "project partition list id must not be empty".into(),
+        ));
+    }
+
+    let db_path = db_path.as_ref().to_path_buf();
+    let conn = Connection::open(&db_path)?;
+    preflight(&conn)?;
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT project_root
+         FROM task_lists
+         WHERE list_id = ?1
+         ORDER BY project_root ASC",
+    )?;
+    let project_roots = statement
+        .query_map([list_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    match project_roots.as_slice() {
+        [] => Err(PiTaskerError::ProjectPartitionNotFound {
+            list_id: list_id.to_owned(),
+        }),
+        [project_root] => Ok(ProjectPartition::with_db_path_and_list_id(
+            db_path,
+            project_root.clone(),
+            list_id,
+        )),
+        _ => Err(PiTaskerError::ProjectPartitionAmbiguous {
+            list_id: list_id.to_owned(),
+            project_roots,
+        }),
     }
 }
 
@@ -3683,6 +3745,61 @@ mod tests {
         CREATE TABLE work_units (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, claim_id TEXT, list_id TEXT NOT NULL, project_root TEXT NOT NULL, agent_id TEXT NOT NULL, session_id TEXT NOT NULL, session_file TEXT, session_instance_id TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0, note TEXT, created_at INTEGER NOT NULL, dispatched_at INTEGER, completed_at INTEGER, cancelled_at INTEGER, scope_feature_id TEXT);
         CREATE TABLE visual_artifacts (id TEXT PRIMARY KEY, list_id TEXT NOT NULL, project_root TEXT NOT NULL, task_id TEXT, feature_id TEXT, work_unit_id TEXT, stage TEXT, kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, path TEXT NOT NULL, mime_type TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}', created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
         "#)
+    }
+
+    #[test]
+    fn resolves_exact_list_id_only_when_project_root_is_unique() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("tasks.db");
+        let conn = Connection::open(&path).unwrap();
+        install_schema(&conn).unwrap();
+        drop(conn);
+
+        let root_a = "/repo/alpha";
+        let root_b = "/repo/beta";
+        let selected = ProjectPartition::with_db_path_and_list_id(&path, root_a, "list_alpha");
+        let other = ProjectPartition::with_db_path_and_list_id(&path, root_b, "list_beta");
+        PiTaskerStore::open(selected.clone())
+            .unwrap()
+            .ensure_list_meta()
+            .unwrap();
+        PiTaskerStore::open(other.clone())
+            .unwrap()
+            .ensure_list_meta()
+            .unwrap();
+
+        let resolved = resolve_project_partition(&path, "list_beta").unwrap();
+        assert_eq!(resolved, other);
+        assert!(matches!(
+            resolve_project_partition(&path, "list_missing"),
+            Err(PiTaskerError::ProjectPartitionNotFound { list_id })
+                if list_id == "list_missing"
+        ));
+
+        let ambiguous_a = ProjectPartition::with_db_path_and_list_id(
+            &path,
+            "/repo/ambiguous-a",
+            "list_ambiguous",
+        );
+        let ambiguous_b = ProjectPartition::with_db_path_and_list_id(
+            &path,
+            "/repo/ambiguous-b",
+            "list_ambiguous",
+        );
+        PiTaskerStore::open(ambiguous_a)
+            .unwrap()
+            .ensure_list_meta()
+            .unwrap();
+        PiTaskerStore::open(ambiguous_b)
+            .unwrap()
+            .ensure_list_meta()
+            .unwrap();
+
+        assert!(matches!(
+            resolve_project_partition(&path, "list_ambiguous"),
+            Err(PiTaskerError::ProjectPartitionAmbiguous { list_id, project_roots })
+                if list_id == "list_ambiguous" && project_roots.len() == 2
+        ));
     }
 
     fn feature_input(title: &str) -> CreateFeature {
