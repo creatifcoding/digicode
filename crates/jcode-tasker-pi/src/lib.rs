@@ -1895,7 +1895,7 @@ impl PiTaskerStore {
         let mut key_map = BTreeMap::new();
         let mut features = Vec::new();
         let mut tasks = Vec::new();
-        let mut dependency_count = 0;
+        let mut task_dependencies = Vec::new();
 
         create_feature_plan_node_tx(
             &tx,
@@ -1906,8 +1906,10 @@ impl PiTaskerStore {
             &mut key_map,
             &mut features,
             &mut tasks,
-            &mut dependency_count,
+            &mut task_dependencies,
         )?;
+        let dependency_count =
+            wire_feature_plan_dependencies_tx(&tx, &self.partition, &key_map, &task_dependencies)?;
 
         let feature_count = features.len();
         let task_count = tasks.len();
@@ -3092,7 +3094,7 @@ fn create_feature_plan_node_tx(
     key_map: &mut BTreeMap<String, String>,
     features: &mut Vec<Feature>,
     tasks: &mut Vec<Task>,
-    dependency_count: &mut usize,
+    task_dependencies: &mut Vec<(String, Vec<String>)>,
 ) -> Result<()> {
     let feature = create_feature_tx(
         tx,
@@ -3143,7 +3145,7 @@ fn create_feature_plan_node_tx(
             key_map,
             features,
             tasks,
-            dependency_count,
+            task_dependencies,
         )?;
     }
 
@@ -3159,19 +3161,25 @@ fn create_feature_plan_node_tx(
         )?;
         append_task_notes_tx(tx, p, &task.id, &plan_task.notes)?;
         key_map.insert(plan_task.key.clone(), task.id.clone());
+        task_dependencies.push((task.id.clone(), plan_task.after.clone()));
         tasks.push(task);
     }
 
-    for plan_task in node.tasks() {
-        if plan_task.after.is_empty() {
+    Ok(())
+}
+
+fn wire_feature_plan_dependencies_tx(
+    tx: &rusqlite::Transaction<'_>,
+    p: &ProjectPartition,
+    key_map: &BTreeMap<String, String>,
+    task_dependencies: &[(String, Vec<String>)],
+) -> Result<usize> {
+    let mut dependency_count = 0;
+    for (task_id, dependency_keys) in task_dependencies {
+        if dependency_keys.is_empty() {
             continue;
         }
-        let task_id = key_map
-            .get(&plan_task.key)
-            .cloned()
-            .ok_or_else(|| PiTaskerError::InvalidReference(plan_task.key.clone()))?;
-        let dep_ids = plan_task
-            .after
+        let dep_ids = dependency_keys
             .iter()
             .map(|key| match key_map.get(key) {
                 Some(id) if id.starts_with("task_") => Ok(id.clone()),
@@ -3181,11 +3189,10 @@ fn create_feature_plan_node_tx(
                 None => Err(PiTaskerError::InvalidReference(key.clone())),
             })
             .collect::<Result<Vec<_>>>()?;
-        set_dependencies_tx(tx, p, &task_id, &dep_ids)?;
-        *dependency_count += dep_ids.len();
+        set_dependencies_tx(tx, p, task_id, &dep_ids)?;
+        dependency_count += dep_ids.len();
     }
-
-    Ok(())
+    Ok(dependency_count)
 }
 
 fn create_feature_tx(
@@ -3255,8 +3262,31 @@ fn normalize_feature_plan_gates(input: &[Value]) -> Value {
 
 fn validate_feature_plan_keys(root: &FeaturePlanFeature) -> Result<()> {
     let mut keys = BTreeSet::new();
-    let mut visited_task_keys = BTreeSet::new();
-    validate_feature_plan_root_keys(root, &mut keys, &mut visited_task_keys)
+    let mut feature_keys = BTreeSet::new();
+    let mut task_keys = BTreeSet::new();
+    let mut task_dependencies = BTreeMap::new();
+    collect_feature_plan_keys(
+        root,
+        &mut keys,
+        &mut feature_keys,
+        &mut task_keys,
+        &mut task_dependencies,
+    )?;
+
+    for dependencies in task_dependencies.values() {
+        for dependency in dependencies {
+            if feature_keys.contains(dependency) {
+                return Err(PiTaskerError::InvalidReference(format!(
+                    "feature key cannot be a task dependency: {dependency}"
+                )));
+            }
+            if !task_keys.contains(dependency) {
+                return Err(PiTaskerError::InvalidReference(dependency.clone()));
+            }
+        }
+    }
+
+    validate_feature_plan_task_dag(&task_dependencies)
 }
 
 fn insert_plan_key(keys: &mut BTreeSet<String>, key: &str) -> Result<()> {
@@ -3268,53 +3298,80 @@ fn insert_plan_key(keys: &mut BTreeSet<String>, key: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_feature_plan_root_keys(
+fn collect_feature_plan_keys(
     feature: &FeaturePlanFeature,
     keys: &mut BTreeSet<String>,
-    visited_task_keys: &mut BTreeSet<String>,
+    feature_keys: &mut BTreeSet<String>,
+    task_keys: &mut BTreeSet<String>,
+    task_dependencies: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<()> {
     insert_plan_key(keys, &feature.key)?;
+    feature_keys.insert(feature.key.clone());
     for child in &feature.children {
-        validate_feature_plan_child_keys(child, keys, visited_task_keys)?;
+        collect_feature_plan_child_keys(child, keys, feature_keys, task_keys, task_dependencies)?;
     }
-    validate_feature_plan_tasks(&feature.tasks, keys, visited_task_keys)
+    collect_feature_plan_tasks(&feature.tasks, keys, task_keys, task_dependencies)
 }
 
-fn validate_feature_plan_child_keys(
+fn collect_feature_plan_child_keys(
     feature: &FeaturePlanChild,
     keys: &mut BTreeSet<String>,
-    visited_task_keys: &mut BTreeSet<String>,
+    feature_keys: &mut BTreeSet<String>,
+    task_keys: &mut BTreeSet<String>,
+    task_dependencies: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<()> {
     insert_plan_key(keys, &feature.key)?;
+    feature_keys.insert(feature.key.clone());
     for child in &feature.children {
-        validate_feature_plan_child_keys(child, keys, visited_task_keys)?;
+        collect_feature_plan_child_keys(child, keys, feature_keys, task_keys, task_dependencies)?;
     }
-    validate_feature_plan_tasks(&feature.tasks, keys, visited_task_keys)
+    collect_feature_plan_tasks(&feature.tasks, keys, task_keys, task_dependencies)
 }
 
-fn validate_feature_plan_tasks(
+fn collect_feature_plan_tasks(
     tasks: &[FeaturePlanTask],
     keys: &mut BTreeSet<String>,
-    visited_task_keys: &mut BTreeSet<String>,
+    task_keys: &mut BTreeSet<String>,
+    task_dependencies: &mut BTreeMap<String, Vec<String>>,
 ) -> Result<()> {
     for task in tasks {
         insert_plan_key(keys, &task.key)?;
+        task_keys.insert(task.key.clone());
+        task_dependencies.insert(task.key.clone(), task.after.clone());
     }
-    for task in tasks {
-        for dependency in &task.after {
-            if keys.contains(dependency) && !visited_task_keys.contains(dependency) {
-                return Err(PiTaskerError::InvalidReference(format!(
-                    "feature key cannot be a task dependency: {dependency}"
-                )));
-            }
-            if !visited_task_keys.contains(dependency) {
-                return Err(PiTaskerError::InvalidReference(dependency.clone()));
-            }
+    Ok(())
+}
+
+fn validate_feature_plan_task_dag(task_dependencies: &BTreeMap<String, Vec<String>>) -> Result<()> {
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for task_key in task_dependencies.keys() {
+        visit_feature_plan_task(task_key, task_dependencies, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn visit_feature_plan_task(
+    task_key: &str,
+    task_dependencies: &BTreeMap<String, Vec<String>>,
+    visiting: &mut BTreeSet<String>,
+    visited: &mut BTreeSet<String>,
+) -> Result<()> {
+    if visited.contains(task_key) {
+        return Ok(());
+    }
+    if !visiting.insert(task_key.to_owned()) {
+        return Err(PiTaskerError::InvalidReference(format!(
+            "cyclic task dependency: {task_key}"
+        )));
+    }
+    if let Some(dependencies) = task_dependencies.get(task_key) {
+        for dependency in dependencies {
+            visit_feature_plan_task(dependency, task_dependencies, visiting, visited)?;
         }
     }
-    for task in tasks {
-        visited_task_keys.insert(task.key.clone());
-    }
+    visiting.remove(task_key);
+    visited.insert(task_key.to_owned());
     Ok(())
 }
 
@@ -4765,6 +4822,69 @@ mod tests {
     }
 
     #[test]
+    fn feature_plan_import_accepts_same_feature_task_dependencies() {
+        let mut store = temp_store();
+        let mut plan = feature_plan_fixture();
+        plan.feature.tasks.push(FeaturePlanTask {
+            key: "polish".into(),
+            title: "Polish".into(),
+            description: None,
+            state: None,
+            after: vec!["finish".into()],
+            notes: vec![],
+            indexes: None,
+        });
+
+        let result = store.feature_plan_import(plan).unwrap();
+        assert_eq!(result.dependency_count, 4);
+        let dependencies = store.list_dependencies().unwrap();
+        assert!(dependencies.iter().any(|dependency| {
+            dependency.task_id == result.key_map["polish"]
+                && dependency.depends_on_id == result.key_map["finish"]
+        }));
+    }
+
+    #[test]
+    fn feature_plan_import_accepts_forward_cross_feature_dependencies() {
+        let mut store = temp_store();
+        let mut plan = feature_plan_fixture();
+        plan.feature.children[0].tasks.push(FeaturePlanTask {
+            key: "early".into(),
+            title: "Early sibling task".into(),
+            description: None,
+            state: None,
+            after: vec!["later".into()],
+            notes: vec![],
+            indexes: None,
+        });
+        plan.feature.children.push(FeaturePlanChild {
+            key: "later-feature".into(),
+            title: "Later feature".into(),
+            description: None,
+            priority: None,
+            tags: vec![],
+            gates: vec![],
+            children: vec![],
+            tasks: vec![FeaturePlanTask {
+                key: "later".into(),
+                title: "Later sibling task".into(),
+                description: None,
+                state: None,
+                after: vec![],
+                notes: vec![],
+                indexes: None,
+            }],
+        });
+
+        let result = store.feature_plan_import(plan).unwrap();
+        let dependencies = store.list_dependencies().unwrap();
+        assert!(dependencies.iter().any(|dependency| {
+            dependency.task_id == result.key_map["early"]
+                && dependency.depends_on_id == result.key_map["later"]
+        }));
+    }
+
+    #[test]
     fn feature_plan_import_rejects_duplicate_global_keys() {
         let mut store = temp_store();
         let mut plan = feature_plan_fixture();
@@ -4799,19 +4919,52 @@ mod tests {
     }
 
     #[test]
-    fn feature_plan_import_rolls_back_when_late_dependency_wiring_fails() {
+    fn feature_plan_import_rejects_task_dependency_cycles() {
         let mut store = temp_store();
         let mut plan = feature_plan_fixture();
-        plan.feature.children[0].tasks[0].after = vec!["root".into()];
-        assert!(validate_feature_plan_keys(&plan.feature).is_err());
+        plan.feature.tasks = vec![
+            FeaturePlanTask {
+                key: "cycle-a".into(),
+                title: "Cycle A".into(),
+                description: None,
+                state: None,
+                after: vec!["cycle-b".into()],
+                notes: vec![],
+                indexes: None,
+            },
+            FeaturePlanTask {
+                key: "cycle-b".into(),
+                title: "Cycle B".into(),
+                description: None,
+                state: None,
+                after: vec!["cycle-a".into()],
+                notes: vec![],
+                indexes: None,
+            },
+        ];
+
+        let err = store.feature_plan_import(plan).unwrap_err();
+        assert!(
+            matches!(err, PiTaskerError::InvalidReference(message) if message.contains("cyclic task dependency"))
+        );
+        let snapshot = store.snapshot().unwrap();
+        assert!(snapshot.features.is_empty());
+        assert!(snapshot.tasks.is_empty());
+        assert!(snapshot.dependencies.is_empty());
+    }
+
+    #[test]
+    fn feature_plan_import_rolls_back_when_late_dependency_wiring_fails() {
+        let mut store = temp_store();
+        let plan = feature_plan_fixture();
 
         let tx = store.conn.transaction().unwrap();
         ensure_list_meta_tx(&tx, &store.partition).unwrap();
         let mut key_map = BTreeMap::new();
         let mut features = Vec::new();
         let mut tasks = Vec::new();
-        let mut dependency_count = 0;
-        let err = create_feature_plan_node_tx(
+        let mut task_dependencies = Vec::new();
+        create_feature_plan_node_tx(
             &tx,
             &store.partition,
             FeaturePlanNode::Root(&plan.feature),
@@ -4820,9 +4973,13 @@ mod tests {
             &mut key_map,
             &mut features,
             &mut tasks,
-            &mut dependency_count,
+            &mut task_dependencies,
         )
-        .unwrap_err();
+        .unwrap();
+        task_dependencies.push((key_map["finish"].clone(), vec!["root".into()]));
+        let err =
+            wire_feature_plan_dependencies_tx(&tx, &store.partition, &key_map, &task_dependencies)
+                .unwrap_err();
         assert!(
             matches!(err, PiTaskerError::InvalidReference(message) if message.contains("feature key cannot be a task dependency: root"))
         );
