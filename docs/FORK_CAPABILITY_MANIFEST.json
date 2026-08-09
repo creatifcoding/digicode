@@ -2,6 +2,31 @@
   "schema_version": 1,
   "manifest_version": "1.0.0",
   "generated_from_commit": "1d54c4579cc5742216551c078bef002eecf72d82",
+  "recovery_baseline": {
+    "schema_version": 1,
+    "baseline_id": "fork-capability-recovery-2026-08-08",
+    "scope": "source-presence-and-readiness",
+    "indexed_documents": [
+      "recovery:digicode-fork-capability-recovery.md",
+      "recovery:jcode-tui-rendering-and-alt-m-workspace.md",
+      "recovery:jcode-workstream-control-board.md"
+    ],
+    "capability_ids": [
+      "ag-ui",
+      "artifact-library",
+      "artifact-server",
+      "artifact-store",
+      "candidate-lanes",
+      "fork-governance",
+      "linux-computer-use",
+      "mobile-gateway",
+      "mt",
+      "native-vcs-maintenance",
+      "session-search",
+      "swarm-coordination",
+      "tasker"
+    ]
+  },
   "capabilities": [
     {
       "id": "ag-ui",
@@ -9,6 +34,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "3d2404ba07269468192ed5af4d74a45c35c56afc",
       "lifecycle": "active",
+      "recovery_state": "proposed",
       "source_paths": [
         "apps/mobile/app/_layout.tsx",
         "apps/mobile/app/index.tsx",
@@ -77,6 +103,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "dc46cf169da5a941b5f734b789b2ff78086e6a37",
       "lifecycle": "active",
+      "recovery_state": "source-live",
       "source_paths": [
         "docs/artifacts/psr-candidate-type-001/README.md",
         "docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
@@ -150,6 +177,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "70c63eee37c122b8f77680bfaacb5d8b132e64d6",
       "lifecycle": "active",
+      "recovery_state": "standalone",
       "source_paths": [
         "crates/jcode-artifact-server/Cargo.toml",
         "crates/jcode-artifact-server/src/lib.rs",
@@ -210,6 +238,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "532d9733b466a50ce69f5c235848c958e75a5833",
       "lifecycle": "active",
+      "recovery_state": "source-live",
       "source_paths": [
         "crates/jcode-artifact-store/Cargo.toml",
         "crates/jcode-artifact-store/src/lib.rs",
@@ -270,6 +299,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "b803212db8308c0d9a44ab8f08b1b8cefd37fbce",
       "lifecycle": "active",
+      "recovery_state": "partial-gated",
       "source_paths": [
         "crates/jcode-app-core/src/server/candidate.rs",
         "crates/jcode-tasker-promotion/src/lib.rs",
@@ -335,6 +365,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "9631300544b8e108be75c8d297511c261ff2b0f3",
       "lifecycle": "active",
+      "recovery_state": "source-live",
       "source_paths": [
         "crates/jcode-app-core/src/build.rs",
         "crates/jcode-app-core/src/update.rs",
@@ -399,6 +430,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "1167d124fc62e4a384d249c23054801ba573358d",
       "lifecycle": "active",
+      "recovery_state": "live",
       "source_paths": [
         "crates/jcode-app-core/src/tool/linux_computer.rs",
         "crates/jcode-computer-use-linux/src/abs_pointer.rs",
@@ -479,6 +511,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "8112656960ca0360ef82f91af1106258d6ad71bc",
       "lifecycle": "active",
+      "recovery_state": "source-only",
       "source_paths": [
         "apps/mobile/app/_layout.tsx",
         "apps/mobile/app/index.tsx",
@@ -553,6 +586,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "1429eb617585732d3fdf037a51e43afca6561b2e",
       "lifecycle": "active",
+      "recovery_state": "source-live",
       "source_paths": [
         "crates/jcode-app-core/src/tool/metatool.rs",
         "crates/jcode-metatool-runtime/src/lib.rs",
@@ -627,6 +661,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "3d4669a346cff935fe0ae5afd0e0fa1c4e6a19b3",
       "lifecycle": "active",
+      "recovery_state": "live",
       "source_paths": [
         "crates/jcode-app-core/src/build.rs",
         "crates/jcode-app-core/src/update.rs",
@@ -694,6 +729,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "023a62a95351dbc313e1b5c29c8e02151d855faf",
       "lifecycle": "active",
+      "recovery_state": "live",
       "source_paths": [
         "crates/jcode-app-core/src/tool/session_search.rs",
         "crates/jcode-app-core/src/tool/session_search_index.rs",
@@ -760,6 +796,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "4c9b3eb1252c93bcea91ba8958b2202d0193a41b",
       "lifecycle": "active",
+      "recovery_state": "live",
       "source_paths": [
         "crates/jcode-app-core/src/server/swarm.rs",
         "crates/jcode-app-core/src/server/swarm_channels.rs",
@@ -829,6 +866,7 @@
       "owner": "maintained-fork",
       "introduced_commit": "a618ed43caef2a4d4b8abd67d82f0ed920e4fde9",
       "lifecycle": "active",
+      "recovery_state": "live",
       "source_paths": [
         "crates/jcode-app-core/src/tool/tasker.rs",
         "crates/jcode-tasker-git/src/lib.rs",
@@ -896,5 +934,5 @@
     }
   ],
   "retirements": [],
-  "sha256": "e92adc68735af2eecef8bef24b9a7ff39fb5fe9ecfddb51bf4c4d9a45c79007d"
+  "sha256": "f2f97e1287ec461ee704dd9a96516dcc84846a201be61d91954c370e296c96fc"
 }

@@ -42,9 +42,9 @@ use std::time::{Duration, Instant};
 
 pub use fork_governance::{
     CapabilityManifestEntry, ContractSpec, ForkCapabilityManifest, MANIFEST_FILE_NAME,
-    MANIFEST_SCHEMA_VERSION, RetirementRecord, builtin_capability_ids, builtin_manifest,
-    digest_bytes, load_manifest_or_legacy, manifest_path_for_binary, read_manifest_for_binary,
-    write_immutable_manifest,
+    MANIFEST_SCHEMA_VERSION, RECOVERY_BASELINE_SCHEMA_VERSION, RecoveryBaseline, RetirementRecord,
+    builtin_capability_ids, builtin_manifest, digest_bytes, load_manifest_or_legacy,
+    manifest_path_for_binary, read_manifest_for_binary, write_immutable_manifest,
 };
 pub use jcode_selfdev_types::{
     BinaryChoice, BinaryVersionReport, BuildInfo, CanaryStatus, CrashInfo, DevBinarySourceMetadata,
