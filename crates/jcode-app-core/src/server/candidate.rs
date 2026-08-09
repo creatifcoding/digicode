@@ -100,6 +100,7 @@ pub(super) struct CandidateLaneJob {
     pub tasker_list_id: String,
     pub working_dir_claim: PathBuf,
     pub expected_snapshot_hash: String,
+    pub receipt_id: String,
     pub proposal: CandidateLaneLaunchRequest,
 }
 
@@ -138,6 +139,7 @@ impl CandidateLaneJob {
             tasker_list_id: request.tasker_list_id,
             working_dir_claim: PathBuf::from(request.working_dir),
             expected_snapshot_hash: request.expected_snapshot_hash,
+            receipt_id: request.receipt_id,
             proposal,
         })
     }
@@ -146,6 +148,7 @@ impl CandidateLaneJob {
 #[derive(Debug, Clone)]
 struct ResolvedCandidateLaneJob {
     job: CandidateLaneJob,
+    partition: ProjectPartition,
     project_root: PathBuf,
     project_id: ProjectId,
     task_id: TaskId,
@@ -263,6 +266,14 @@ impl ServerCandidateLaneHost {
         if snapshot_hash != job.expected_snapshot_hash {
             bail!("candidate authority rejected: Tasker snapshot changed before execution");
         }
+        crate::tool::verify_candidate_lane_receipt(
+            &configured_database.with_extension("receipts"),
+            &job.receipt_id,
+            &store,
+            &snapshot_hash,
+            &job.proposal,
+        )
+        .context("candidate authority rejected: verify Tasker plan receipt")?;
 
         let task_reference = job
             .proposal
@@ -293,6 +304,7 @@ impl ServerCandidateLaneHost {
 
         Ok(ResolvedCandidateLaneJob {
             job,
+            partition: store.partition().clone(),
             project_root: authoritative_dir.clone(),
             project_id,
             task_id,
@@ -323,12 +335,23 @@ impl ServerCandidateLaneHost {
                 .build()
                 .context("build candidate execution runtime")?;
             runtime.block_on(async move {
-                let partition = ProjectPartition::with_db_path(
-                    host.database_path.clone(),
-                    resolved.project_root.to_string_lossy().into_owned(),
-                );
-                let store =
-                    PiTaskerStore::open(partition).context("reopen canonical Tasker project")?;
+                let store = PiTaskerStore::open(resolved.partition.clone())
+                    .context("reopen canonical Tasker project")?;
+                let (_, reopened_snapshot_hash) = crate::tool::tasker_snapshot_for_project(
+                    &store,
+                    &resolved.project_id.to_string(),
+                )?;
+                if reopened_snapshot_hash != resolved.job.expected_snapshot_hash {
+                    bail!("candidate authority rejected: Tasker snapshot changed before execution");
+                }
+                crate::tool::verify_candidate_lane_receipt(
+                    &resolved.partition.db_path.with_extension("receipts"),
+                    &resolved.job.receipt_id,
+                    &store,
+                    &reopened_snapshot_hash,
+                    &resolved.job.proposal,
+                )
+                .context("candidate authority rejected: reverify Tasker plan receipt")?;
                 let concurrency = store.open_concurrency_store()?;
                 let git = jcode_tasker_git::GitCandidateAdapter::try_new(&resolved.project_root)?;
                 let mut orchestrator = CandidateOrchestrator::new(concurrency, git)?;
@@ -922,6 +945,36 @@ mod tests {
             policy: serde_json::Value,
             lanes: u16,
         ) -> CandidateLaneHostRequest {
+            let proposal = json!({
+                "taskReference": format!("#{}", self.task_display_id),
+                "policy": policy,
+                "laneCount": lanes,
+                "acceptance": {
+                    "validationCommands": [{"program": "true", "args": []}],
+                    "acceptanceCriteria": "headless candidate must commit and pass host validation",
+                    "resourceIntents": [{
+                        "kind": "file",
+                        "selector": "candidate-output.txt",
+                        "access": "propose_write",
+                        "rationale": "candidate implementation output"
+                    }]
+                },
+                "prompt": "Deterministically write and commit candidate-output.txt, then return the required JSON.",
+                "limits": {"maxLanes": lanes, "laneTimeoutMs": 15000}
+            });
+            let partition =
+                jcode_tasker_pi::resolve_project_partition(&self.database, &self.tasker_list_id)
+                    .expect("resolve candidate test partition");
+            let store = PiTaskerStore::open(partition).expect("open candidate test store");
+            let decoded_proposal: CandidateLaneLaunchRequest =
+                serde_json::from_value(proposal.clone()).expect("decode candidate test proposal");
+            let receipt_id = crate::tool::issue_candidate_lane_receipt_for_test(
+                &self.database.with_extension("receipts"),
+                &store,
+                &self.snapshot_hash,
+                &decoded_proposal,
+            )
+            .expect("issue candidate test receipt");
             CandidateLaneHostRequest {
                 id: 42,
                 operation_id: operation_id.to_string(),
@@ -930,24 +983,8 @@ mod tests {
                 tasker_list_id: self.tasker_list_id.clone(),
                 working_dir: self.repository.to_string_lossy().into_owned(),
                 expected_snapshot_hash: self.snapshot_hash.clone(),
-                receipt_id: format!("receipt-{operation_id}"),
-                proposal: json!({
-                    "taskReference": format!("#{}", self.task_display_id),
-                    "policy": policy,
-                    "laneCount": lanes,
-                    "acceptance": {
-                        "validationCommands": [{"program": "true", "args": []}],
-                        "acceptanceCriteria": "headless candidate must commit and pass host validation",
-                        "resourceIntents": [{
-                            "kind": "file",
-                            "selector": "candidate-output.txt",
-                            "access": "propose_write",
-                            "rationale": "candidate implementation output"
-                        }]
-                    },
-                    "prompt": "Deterministically write and commit candidate-output.txt, then return the required JSON.",
-                    "limits": {"maxLanes": lanes, "laneTimeoutMs": 15000}
-                }),
+                receipt_id,
+                proposal,
             }
         }
         fn mark_candidates_eligible(
@@ -1576,6 +1613,37 @@ mod tests {
                 .to_string()
                 .contains("resolve selected Tasker partition")
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_authority_requires_a_matching_host_issued_receipt() {
+        let fixture = DogfoodFixture::new(2).await;
+
+        let mut missing_receipt = fixture.request(
+            "missing-receipt",
+            json!({"kind": "speculative", "max_candidates": 2}),
+            2,
+        );
+        missing_receipt.receipt_id = "tpr_missing".into();
+        let error = fixture
+            .host
+            .resolve_job(CandidateLaneJob::from_request(missing_receipt).unwrap())
+            .await
+            .expect_err("unknown receipt must fail closed");
+        assert!(format!("{error:#}").contains("Tasker plan receipt not found"));
+
+        let mut changed_proposal = fixture.request(
+            "changed-proposal",
+            json!({"kind": "speculative", "max_candidates": 2}),
+            2,
+        );
+        changed_proposal.proposal["prompt"] = json!("different work after planning");
+        let error = fixture
+            .host
+            .resolve_job(CandidateLaneJob::from_request(changed_proposal).unwrap())
+            .await
+            .expect_err("receipt must bind the exact candidate proposal");
+        assert!(format!("{error:#}").contains("change-set mismatch"));
     }
 
     #[test]

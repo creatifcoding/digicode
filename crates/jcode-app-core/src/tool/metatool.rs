@@ -705,6 +705,7 @@ struct ArtifactBundleInput {
 struct TaskerPlanReceipt {
     version: u8,
     id: String,
+    database_path: String,
     project_root: String,
     list_id: String,
     snapshot_hash: String,
@@ -713,6 +714,13 @@ struct TaskerPlanReceipt {
     concurrency_project_id: Option<String>,
     issued_at: u64,
     expires_at: u64,
+}
+
+fn canonical_receipt_database_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn unix_timestamp() -> Result<u64> {
@@ -796,8 +804,9 @@ fn issue_tasker_receipt(
     let issued_at = unix_timestamp()?;
     let partition = store.partition();
     let receipt = TaskerPlanReceipt {
-        version: 1,
+        version: 2,
         id: format!("{TASKER_RECEIPT_PREFIX}{}", uuid::Uuid::now_v7()),
+        database_path: canonical_receipt_database_path(&partition.db_path),
         project_root: partition.project_root.clone(),
         list_id: partition.list_id.clone(),
         snapshot_hash: snapshot_hash.to_owned(),
@@ -829,8 +838,9 @@ fn verify_tasker_receipt(
         serde_json::from_slice(&std::fs::read(path).context("Tasker plan receipt not found")?)
             .context("parse Tasker plan receipt")?;
     let partition = store.partition();
-    if receipt.version != 1
+    if receipt.version != 2
         || receipt.id != id
+        || receipt.database_path != canonical_receipt_database_path(&partition.db_path)
         || receipt.project_root != partition.project_root
         || receipt.list_id != partition.list_id
     {
@@ -851,6 +861,43 @@ fn verify_tasker_receipt(
         return Err(anyhow!("Tasker plan receipt change-set mismatch"));
     }
     Ok(receipt)
+}
+
+fn candidate_lane_effect_input(
+    store: &PiTaskerStore,
+    snapshot_hash: &str,
+    proposal: &CandidateLaneLaunchRequest,
+) -> Result<TaskerEffectInput> {
+    Ok(TaskerEffectInput {
+        kind: CANDIDATE_LANE_COMPATIBILITY_KIND.to_string(),
+        payload: serde_json::to_value(proposal).context("serialize candidate lane proposal")?,
+        mode: TaskerMode::Apply,
+        expected_snapshot_hash: Some(snapshot_hash.to_string()),
+        project_id: Some(store.partition().list_id.clone()),
+    })
+}
+
+pub(crate) fn verify_candidate_lane_receipt(
+    receipt_root: &Path,
+    receipt_id: &str,
+    store: &PiTaskerStore,
+    snapshot_hash: &str,
+    proposal: &CandidateLaneLaunchRequest,
+) -> Result<()> {
+    let input = candidate_lane_effect_input(store, snapshot_hash, proposal)?;
+    verify_tasker_receipt(receipt_root, receipt_id, store, snapshot_hash, &input)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn issue_candidate_lane_receipt_for_test(
+    receipt_root: &Path,
+    store: &PiTaskerStore,
+    snapshot_hash: &str,
+    proposal: &CandidateLaneLaunchRequest,
+) -> Result<String> {
+    let input = candidate_lane_effect_input(store, snapshot_hash, proposal)?;
+    Ok(issue_tasker_receipt(receipt_root, store, snapshot_hash, &input)?.id)
 }
 
 fn prepare_candidate_lane_apply(
@@ -2953,6 +3000,55 @@ mod tests {
         )
         .expect_err("apply without a receipt must fail");
         assert!(missing.to_string().contains("receipt"));
+
+        let receipt_record_path = receipt_path(&receipts, &receipt).expect("receipt path");
+        let receipt_record_bytes =
+            std::fs::read(&receipt_record_path).expect("read planned receipt");
+        let mut incompatible_record: TaskerPlanReceipt =
+            serde_json::from_slice(&receipt_record_bytes).expect("parse planned receipt");
+        incompatible_record.version = 1;
+        std::fs::write(
+            &receipt_record_path,
+            serde_json::to_vec_pretty(&incompatible_record)
+                .expect("serialize incompatible receipt"),
+        )
+        .expect("write incompatible receipt");
+        let incompatible = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&apply_effect),
+            TaskerMode::Apply,
+            &snapshot_hash,
+            &receipts,
+            Some(&receipt),
+        )
+        .expect_err("legacy receipt versions must fail closed");
+        assert!(format!("{incompatible:#}").contains("scope mismatch"));
+
+        let mut wrong_database_record: TaskerPlanReceipt =
+            serde_json::from_slice(&receipt_record_bytes).expect("parse planned receipt again");
+        wrong_database_record.database_path = workspace
+            .path()
+            .join("other-tasks.db")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(
+            &receipt_record_path,
+            serde_json::to_vec_pretty(&wrong_database_record)
+                .expect("serialize wrong-database receipt"),
+        )
+        .expect("write wrong-database receipt");
+        let wrong_database = reconcile_tasker_effects(
+            &mut store,
+            std::slice::from_ref(&apply_effect),
+            TaskerMode::Apply,
+            &snapshot_hash,
+            &receipts,
+            Some(&receipt),
+        )
+        .expect_err("receipt must bind the exact Tasker database");
+        assert!(format!("{wrong_database:#}").contains("scope mismatch"));
+        std::fs::write(&receipt_record_path, receipt_record_bytes)
+            .expect("restore planned receipt");
 
         let expired = reconcile_tasker_effects(
             &mut store,

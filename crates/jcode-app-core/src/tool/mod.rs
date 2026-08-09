@@ -54,9 +54,11 @@ use tokio::sync::RwLock;
 pub(crate) use jcode_tool_core::intent_schema_property;
 pub use jcode_tool_core::{StdinInputRequest, Tool, ToolContext, ToolExecutionMode};
 pub use jcode_tool_types::{ToolImage, ToolOutput};
+#[cfg(test)]
+pub(crate) use metatool::issue_candidate_lane_receipt_for_test;
 pub(crate) use metatool::{
     CandidateLaneHost, CandidateLaneHostRequest, CandidateLaneHostResponse,
-    SocketCandidateLaneHost, tasker_snapshot_for_project,
+    SocketCandidateLaneHost, tasker_snapshot_for_project, verify_candidate_lane_receipt,
 };
 pub(crate) use session_search::spawn_recent_index_warmup;
 
