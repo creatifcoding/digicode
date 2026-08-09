@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("rust_cache_gc.py")
 SPEC = importlib.util.spec_from_file_location("rust_cache_gc", MODULE_PATH)
@@ -104,6 +105,17 @@ class RustCacheGcTests(unittest.TestCase):
             self.assertEqual(modified, target.stat().st_mtime)
             self.assertTrue(rust_cache_gc.path_recently_modified(target, time.time() - 60))
             self.assertFalse(rust_cache_gc.path_recently_modified(target, time.time() + 60))
+
+    def test_directory_stats_normalizes_disappearing_target_as_oserror(self):
+        target = Path("/worktree/target")
+        failure = subprocess.CalledProcessError(
+            1,
+            ["du", "-sb", "--apparent-size", str(target)],
+            stderr="du: cannot access target: No such file or directory\n",
+        )
+        with mock.patch.object(rust_cache_gc.subprocess, "run", side_effect=failure):
+            with self.assertRaisesRegex(OSError, "No such file or directory"):
+                rust_cache_gc.directory_stats(target)
 
     def test_active_process_matches_target_or_project_working_directory(self):
         target = Path("/repo/project/target")

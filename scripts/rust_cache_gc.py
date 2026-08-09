@@ -134,12 +134,17 @@ def discover_targets(roots: Iterable[Path]) -> list[Path]:
 
 
 def directory_stats(path: Path) -> tuple[int, float]:
-    result = subprocess.run(
-        ["du", "-sb", "--apparent-size", str(path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["du", "-sb", "--apparent-size", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() if isinstance(error.stderr, str) else ""
+        message = detail or f"du exited with status {error.returncode}"
+        raise OSError(f"cannot measure {path}: {message}") from error
     total = int(result.stdout.split(maxsplit=1)[0])
     return total, path.stat().st_mtime
 
