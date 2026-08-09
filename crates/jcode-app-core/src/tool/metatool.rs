@@ -25,6 +25,7 @@ use jcode_tasker_pi::{
     BatchOperation, CreateFeature, CreateTask, FeaturePlanFeature, FeaturePlanInput, NoteInput,
     PiTaskerStore, PlanTask, ProjectPartition, ResolveFeatureGate, UpdateFeature, UpdateTask,
 };
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -448,17 +449,53 @@ impl MetaTool {
             .map_err(anyhow::Error::new)
     }
 
-    fn tasker_store(&self, ctx: &ToolContext) -> Result<PiTaskerStore> {
+    fn default_tasker_partition(&self, ctx: &ToolContext) -> Result<ProjectPartition> {
         let root = ctx
             .working_dir
             .as_deref()
             .ok_or_else(|| anyhow!("Tasker codemode requires a session working directory"))?;
         let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        PiTaskerStore::open(ProjectPartition::with_db_path(
+        Ok(ProjectPartition::with_db_path(
             self.tasker_database_path(),
             canonical.to_string_lossy().into_owned(),
         ))
-        .map_err(anyhow::Error::new)
+    }
+
+    fn tasker_partition(
+        &self,
+        ctx: &ToolContext,
+        tasker_project_id: Option<&str>,
+    ) -> Result<ProjectPartition> {
+        let default = self.default_tasker_partition(ctx)?;
+        let Some(project_id) = tasker_project_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            return Ok(default);
+        };
+        if project_id == default.list_id {
+            return Ok(default);
+        }
+
+        let conn = Connection::open(&default.db_path)
+            .with_context(|| format!("open Tasker database {}", default.db_path.display()))?;
+        let mut stmt = conn.prepare(
+            "SELECT project_root FROM task_lists WHERE list_id=?1 ORDER BY project_root",
+        )?;
+        let roots = stmt
+            .query_map(params![project_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        match roots.as_slice() {
+            [] => Err(anyhow!(
+                "unknown Tasker project partition: {project_id}; run the Tasker tool in that project first"
+            )),
+            [project_root] => Ok(ProjectPartition {
+                db_path: default.db_path,
+                project_root: project_root.clone(),
+                list_id: project_id.to_owned(),
+            }),
+            _ => Err(anyhow!(
+                "ambiguous Tasker project partition: {project_id} maps to {} project roots",
+                roots.len()
+            )),
+        }
     }
 }
 
@@ -1967,14 +2004,14 @@ impl MetaTool {
                 let tasker_context = if params.tasker_mode == TaskerMode::Off {
                     None
                 } else {
-                    let store = self.tasker_store(&ctx)?;
-                    let project_id = params
-                        .tasker_project_id
-                        .clone()
-                        .unwrap_or_else(|| store.partition().list_id.clone());
+                    let partition =
+                        self.tasker_partition(&ctx, params.tasker_project_id.as_deref())?;
+                    let store =
+                        PiTaskerStore::open(partition.clone()).map_err(anyhow::Error::new)?;
+                    let project_id = partition.list_id.clone();
                     let (snapshot, snapshot_hash) =
                         tasker_snapshot_for_project(&store, &project_id)?;
-                    Some((snapshot, snapshot_hash, project_id))
+                    Some((snapshot, snapshot_hash, partition))
                 };
                 let artifact_context = if params.artifact_mode == ArtifactMode::Off {
                     None
@@ -1984,14 +2021,14 @@ impl MetaTool {
                 };
                 let capabilities = if tasker_context.is_some() || artifact_context.is_some() {
                     let mut capabilities = serde_json::Map::new();
-                    if let Some((snapshot, snapshot_hash, project_id)) = tasker_context.as_ref() {
+                    if let Some((snapshot, snapshot_hash, partition)) = tasker_context.as_ref() {
                         capabilities.insert(
                             "tasker".into(),
                             json!({
                                 "mode": params.tasker_mode,
                                 "snapshot": snapshot,
                                 "snapshot_hash": snapshot_hash,
-                                "project_id": project_id,
+                                "project_id": partition.list_id,
                             }),
                         );
                     }
@@ -2044,12 +2081,8 @@ impl MetaTool {
                     ));
                 }
                 let reconciliation = match tasker_context {
-                    Some((_, snapshot_hash, _)) => Some({
-                        let database_path = self.tasker_database_path();
+                    Some((_, snapshot_hash, partition)) => Some({
                         let receipt_root = self.tasker_receipt_root()?;
-                        let project_root = ctx.working_dir.clone().ok_or_else(|| {
-                            anyhow!("Tasker codemode requires a working directory")
-                        })?;
                         let effects = tasker_effects.clone();
                         let mode = params.tasker_mode;
                         let requested_receipt = params.tasker_receipt.clone();
@@ -2059,19 +2092,12 @@ impl MetaTool {
                         if is_candidate_apply {
                             let (proposal, receipt, canonical_snapshot_hash) =
                                 tokio::task::spawn_blocking({
-                                    let database_path = database_path.clone();
+                                    let partition = partition.clone();
                                     let receipt_root = receipt_root.clone();
-                                    let project_root = project_root.clone();
                                     let effects = effects.clone();
                                     let requested_receipt = requested_receipt.clone();
                                     move || {
-                                        let canonical = std::fs::canonicalize(&project_root)
-                                            .unwrap_or(project_root);
-                                        let mut store =
-                                            PiTaskerStore::open(ProjectPartition::with_db_path(
-                                                database_path,
-                                                canonical.to_string_lossy().into_owned(),
-                                            ))?;
+                                        let mut store = PiTaskerStore::open(partition)?;
                                         prepare_candidate_lane_apply(
                                             &mut store,
                                             &effects,
@@ -2096,7 +2122,7 @@ impl MetaTool {
                                 id: next_candidate_request_id(),
                                 operation_id,
                                 session_id: ctx.session_id.clone(),
-                                working_dir: project_root.to_string_lossy().into_owned(),
+                                working_dir: partition.project_root.clone(),
                                 expected_snapshot_hash: canonical_snapshot_hash.clone(),
                                 receipt_id: receipt.id.clone(),
                                 proposal: serde_json::to_value(proposal)?,
@@ -2136,13 +2162,7 @@ impl MetaTool {
                             })
                         } else {
                             tokio::task::spawn_blocking(move || {
-                                let canonical =
-                                    std::fs::canonicalize(&project_root).unwrap_or(project_root);
-                                let mut store =
-                                    PiTaskerStore::open(ProjectPartition::with_db_path(
-                                        database_path,
-                                        canonical.to_string_lossy().into_owned(),
-                                    ))?;
+                                let mut store = PiTaskerStore::open(partition)?;
                                 reconcile_tasker_effects(
                                     &mut store,
                                     &effects,
@@ -2973,6 +2993,100 @@ mod tests {
         let tasks = store.list_tasks(None).expect("list after apply");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Created through mt.tasker");
+    }
+
+    #[test]
+    fn tasker_project_id_routes_reconciliation_without_default_partition_leakage() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let default_root = workspace.path().join("session-default");
+        let selected_root = workspace.path().join("selected-project");
+        std::fs::create_dir_all(&default_root).expect("default root");
+        std::fs::create_dir_all(&selected_root).expect("selected root");
+        let database = workspace.path().join("tasks.db");
+        super::super::tasker::tests::install_pi_schema(&database);
+
+        let tool = MetaTool::with_store_and_tasker_roots(
+            workspace.path().join("metatool-store"),
+            database.clone(),
+        );
+        let ctx = context(&default_root);
+        let default_partition = tool
+            .default_tasker_partition(&ctx)
+            .expect("default partition");
+        let selected_partition =
+            ProjectPartition::with_db_path(&database, selected_root.to_string_lossy().into_owned());
+        let selected_project_id = selected_partition.list_id.clone();
+        PiTaskerStore::open(default_partition.clone())
+            .expect("seed default partition")
+            .ensure_list_meta()
+            .expect("default list meta");
+        PiTaskerStore::open(selected_partition.clone())
+            .expect("seed selected partition")
+            .ensure_list_meta()
+            .expect("selected list meta");
+
+        let resolved = tool
+            .tasker_partition(&ctx, Some(&selected_project_id))
+            .expect("resolve selected partition");
+        assert_eq!(resolved.list_id, selected_partition.list_id);
+        assert_eq!(resolved.project_root, selected_partition.project_root);
+        assert_ne!(resolved.list_id, default_partition.list_id);
+
+        let mut selected_store = PiTaskerStore::open(resolved).expect("open selected store");
+        let (_, snapshot_hash) = tasker_snapshot(&selected_store).expect("selected snapshot");
+        let receipts = workspace.path().join("receipts");
+        let effect = ExecutionEffect {
+            capability: "tasker".into(),
+            operation: "reconcile".into(),
+            input: json!({
+                "kind": "batch",
+                "mode": "plan",
+                "expected_snapshot_hash": snapshot_hash,
+                "payload": {
+                    "operations": [{
+                        "op": "create",
+                        "key": "selected",
+                        "title": "Selected partition only",
+                        "dependsOn": [],
+                        "notes": []
+                    }]
+                }
+            }),
+        };
+
+        let planned = reconcile_tasker_effects(
+            &mut selected_store,
+            std::slice::from_ref(&effect),
+            TaskerMode::Plan,
+            &snapshot_hash,
+            &receipts,
+            None,
+        )
+        .expect("plan selected write");
+        let receipt = planned["receipt"]["id"].as_str().expect("receipt id");
+        let mut apply_effect = effect;
+        apply_effect.input["mode"] = json!("apply");
+        reconcile_tasker_effects(
+            &mut selected_store,
+            &[apply_effect],
+            TaskerMode::Apply,
+            &snapshot_hash,
+            &receipts,
+            Some(receipt),
+        )
+        .expect("apply selected write");
+
+        let selected_tasks = selected_store.list_tasks(None).expect("selected tasks");
+        assert_eq!(selected_tasks.len(), 1);
+        assert_eq!(selected_tasks[0].title, "Selected partition only");
+        let default_store = PiTaskerStore::open(default_partition).expect("open default store");
+        assert!(
+            default_store
+                .list_tasks(None)
+                .expect("default tasks")
+                .is_empty(),
+            "selected tasker_project_id write leaked into the session-default partition"
+        );
     }
 
     #[test]
