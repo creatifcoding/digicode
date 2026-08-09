@@ -242,15 +242,26 @@ impl ForkCapabilityManifest {
         Ok(self)
     }
 
-    /// Pre-baseline manifests were written before recovery readiness became a
-    /// frozen contract. Treat those manifests as legacy during migration.
+    /// Return whether this manifest uses the host-generated legacy marker.
+    ///
+    /// This is descriptive only. A manifest cannot grant itself legacy
+    /// admission by choosing this marker; callers must supply a host-owned
+    /// migration context before treating it as trusted.
     pub fn is_legacy(&self) -> bool {
         self.manifest_version.starts_with("legacy-")
-            || (self.recovery_baseline.is_none()
-                && self
-                    .capabilities
-                    .iter()
-                    .all(|capability| capability.recovery_state.is_empty()))
+    }
+
+    /// Return whether this manifest has the shape of a real pre-baseline
+    /// manifest. The shape is useful only after a host-owned migration path
+    /// has established provenance. It must never be used as an admission
+    /// decision on its own because all of these fields are attacker-controlled
+    /// in an installed sidecar.
+    pub fn is_pre_baseline_shape(&self) -> bool {
+        self.recovery_baseline.is_none()
+            && self
+                .capabilities
+                .iter()
+                .all(|capability| capability.recovery_state.is_empty())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -398,8 +409,7 @@ impl ForkCapabilityManifest {
     /// release line. A manifest may remove one of these entries only when its
     /// own immutable retirement ledger contains the exact capability ID.
     pub fn validate_baseline(&self, baseline: &Self) -> Result<()> {
-        let candidate_is_legacy = self.is_legacy();
-        if !candidate_is_legacy && let Some(expected) = &baseline.recovery_baseline {
+        if let Some(expected) = &baseline.recovery_baseline {
             match &self.recovery_baseline {
                 Some(actual) if actual == expected => {}
                 Some(_) => {
@@ -416,7 +426,6 @@ impl ForkCapabilityManifest {
             .collect::<HashSet<_>>();
         for capability in &baseline.capabilities {
             if let Some(candidate) = active.get(capability.id.as_str())
-                && !candidate_is_legacy
                 && baseline.recovery_baseline.is_some()
                 && candidate.recovery_state != capability.recovery_state
             {
@@ -908,19 +917,25 @@ mod tests {
     }
 
     #[test]
-    fn pre_baseline_manifest_is_accepted_during_migration() {
+    fn stripped_modern_manifest_is_rejected_by_baseline_validation() {
         let baseline = builtin_manifest().unwrap();
         let mut candidate = baseline.clone();
         candidate.recovery_baseline = None;
         for capability in &mut candidate.capabilities {
             capability.recovery_state.clear();
+            capability.evidence.clear();
         }
         let candidate = candidate.with_digest().unwrap();
 
-        assert!(candidate.is_legacy());
-        candidate
+        assert!(!candidate.is_legacy());
+        let error = candidate
             .validate_baseline(&baseline)
-            .expect("pre-baseline manifests must remain admissible during migration");
+            .expect_err("stripped modern manifests must not bypass the frozen baseline");
+        assert!(
+            error
+                .to_string()
+                .contains("omitted the frozen recovery capability baseline")
+        );
     }
 
     #[test]

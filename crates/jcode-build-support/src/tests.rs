@@ -745,10 +745,34 @@ fn write_test_admission(
     capabilities: &[&str],
 ) {
     let binary = version_binary_path(version).expect("version path");
-    let git_hash = read_binary_version_report(&binary)
-        .ok()
-        .and_then(|report| report.git_hash)
+    let report = read_binary_version_report(&binary).ok();
+    let git_hash = report
+        .as_ref()
+        .and_then(|report| report.git_hash.clone())
         .unwrap_or_else(|| format!("hash-{version}"));
+    let capabilities = if capabilities.is_empty() {
+        report
+            .as_ref()
+            .map(|report| report.capabilities.clone())
+            .unwrap_or_default()
+    } else {
+        capabilities
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect()
+    };
+    let manifest_trust = report
+        .as_ref()
+        .filter(|report| report.manifest_version.is_none() && report.manifest_sha256.is_none())
+        .map(|_| ManifestTrust::TrustedLegacyMigration)
+        .unwrap_or(ManifestTrust::Modern);
+    if manifest_trust == ManifestTrust::Modern && !manifest_path_for_binary(&binary).exists() {
+        write_immutable_manifest(
+            &binary,
+            &builtin_manifest().expect("builtin capability manifest"),
+        )
+        .expect("write modern test manifest sidecar");
+    }
     let admission = ForkBuildAdmission {
         version: version.to_string(),
         git_hash,
@@ -757,10 +781,8 @@ fn write_test_admission(
         predecessor: predecessor.map(str::to_string),
         source_fingerprint: None,
         source: None,
-        capabilities: capabilities
-            .iter()
-            .map(|value| (*value).to_string())
-            .collect(),
+        manifest_trust,
+        capabilities,
         admitted_at: chrono::Utc::now(),
     };
     jcode_storage::write_json(
@@ -825,6 +847,21 @@ fn write_report_binary_without_version(version: &str, git_hash: &str) -> PathBuf
 
 #[cfg(unix)]
 fn write_governed_report_binary(version: &str, git_hash: &str) -> PathBuf {
+    let manifest = builtin_manifest().expect("builtin capability manifest");
+    let capabilities = manifest
+        .capabilities
+        .iter()
+        .map(|capability| capability.id.as_str())
+        .collect::<Vec<_>>();
+    write_governed_report_binary_with_capabilities(version, git_hash, &capabilities)
+}
+
+#[cfg(unix)]
+fn write_governed_report_binary_with_capabilities(
+    version: &str,
+    git_hash: &str,
+    capabilities: &[&str],
+) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let manifest = builtin_manifest().expect("builtin capability manifest");
@@ -833,11 +870,7 @@ fn write_governed_report_binary(version: &str, git_hash: &str) -> PathBuf {
     let report = serde_json::json!({
         "version": format!("v{version} ({git_hash})"),
         "git_hash": git_hash,
-        "capabilities": manifest
-            .capabilities
-            .iter()
-            .map(|capability| capability.id.clone())
-            .collect::<Vec<_>>(),
+        "capabilities": capabilities,
         "manifest_version": manifest.manifest_version.clone(),
         "manifest_sha256": manifest.digest().expect("manifest digest"),
     });
@@ -1095,7 +1128,7 @@ fn canonical_release_descendant_and_verified_merge_can_be_admitted() {
         let canonical_version = "0.70.0";
         source_fixture_git(repo.path(), &["checkout", CANONICAL_FORK_RELEASE_BRANCH]);
         write_report_binary(canonical_version, &canonical[..7], &["mt", "tasker"]);
-        admit_installed_canonical_source_build(
+        admit_installed_legacy_canonical_source_build(
             canonical_version,
             repo.path(),
             &canonical,
@@ -1109,7 +1142,7 @@ fn canonical_release_descendant_and_verified_merge_can_be_admitted() {
         let merge_version = "0.71.0";
         source_fixture_git(repo.path(), &["checkout", "merge-candidate"]);
         write_report_binary(merge_version, &merge[..7], &["mt", "tasker"]);
-        let admission = admit_installed_canonical_source_build(
+        let admission = admit_installed_legacy_canonical_source_build(
             merge_version,
             repo.path(),
             &merge,
@@ -1143,26 +1176,26 @@ fn canonical_release_descendant_and_verified_merge_can_be_admitted() {
 fn higher_semver_non_descendant_and_upstream_builds_are_rejected() {
     with_temp_jcode_home(|| {
         let head = "0.68.1";
-        write_report_binary(head, "head", &["mt", "tasker"]);
+        write_governed_report_binary(head, "head");
         write_test_admission(
             head,
             &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
             None,
-            &["mt", "tasker"],
+            &[],
         );
         update_stable_symlink(head).expect("publish release-line head");
 
         let unrelated = "0.68.2";
-        write_report_binary(unrelated, "unrelated", &["mt", "tasker"]);
+        write_governed_report_binary(unrelated, "unrelated");
         write_test_admission(
             unrelated,
             &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
             None,
-            &["mt", "tasker"],
+            &[],
         );
 
         let non_descendant = "0.69.0";
-        write_report_binary(non_descendant, "non-descendant", &["mt", "tasker"]);
+        write_governed_report_binary(non_descendant, "non-descendant");
         let error = admit_installed_fork_build(
             non_descendant,
             &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
@@ -1177,7 +1210,7 @@ fn higher_semver_non_descendant_and_upstream_builds_are_rejected() {
         );
 
         let upstream = "0.70.0";
-        write_report_binary(upstream, "upstream", &["mt", "tasker"]);
+        write_governed_report_binary(upstream, "upstream");
         let error = admit_installed_fork_build(
             upstream,
             &format!("github:{UPSTREAM_SOURCE_REPOSITORY}:release"),
@@ -1193,17 +1226,17 @@ fn higher_semver_non_descendant_and_upstream_builds_are_rejected() {
 fn capability_losing_build_is_rejected() {
     with_temp_jcode_home(|| {
         let predecessor = "0.68.1";
-        write_report_binary(predecessor, "head", &["mt", "tasker"]);
+        write_governed_report_binary(predecessor, "head");
         write_test_admission(
             predecessor,
             &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
             None,
-            &["mt", "tasker"],
+            &[],
         );
         update_stable_symlink(predecessor).expect("publish predecessor");
 
         let candidate = "0.69.0";
-        write_report_binary(candidate, "candidate", &["mt"]);
+        write_governed_report_binary_with_capabilities(candidate, "candidate", &["mt"]);
         let error = admit_installed_fork_build(
             candidate,
             &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
@@ -1224,17 +1257,17 @@ fn capability_losing_build_is_rejected() {
 fn admitted_descendant_is_accepted() {
     with_temp_jcode_home(|| {
         let predecessor = "0.68.1";
-        write_report_binary(predecessor, "head", &["mt", "tasker"]);
+        write_governed_report_binary(predecessor, "head");
         write_test_admission(
             predecessor,
             &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
             None,
-            &["mt", "tasker"],
+            &[],
         );
         update_stable_symlink(predecessor).expect("publish predecessor");
 
         let candidate = "0.69.0";
-        write_report_binary(candidate, "candidate", &["mt", "tasker"]);
+        write_governed_report_binary(candidate, "candidate");
         let admission = admit_installed_fork_build(
             candidate,
             &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
@@ -1280,6 +1313,95 @@ fn governed_manifest_admission_preserves_exact_predecessor_digest() {
         );
         assert_eq!(second.predecessor.as_deref(), Some(predecessor));
         require_admitted_fork_build(candidate).expect("candidate manifest must remain admitted");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn stripped_rehashed_modern_candidate_is_rejected_by_full_admission() {
+    with_temp_jcode_home(|| {
+        let authority = format!("github:{CANONICAL_FORK_REPOSITORY}:release");
+        let predecessor = "0.68.1";
+        write_governed_report_binary(predecessor, "governed-head");
+        admit_installed_fork_build(predecessor, &authority, None)
+            .expect("modern predecessor should be admitted");
+        update_stable_symlink(predecessor).expect("publish modern predecessor");
+
+        let candidate = "0.69.0";
+        let binary = write_governed_report_binary(candidate, "governed-candidate");
+        let mut stripped = builtin_manifest().expect("builtin capability manifest");
+        stripped.recovery_baseline = None;
+        for capability in &mut stripped.capabilities {
+            capability.recovery_state.clear();
+            capability.evidence.clear();
+        }
+        write_immutable_manifest(&binary, &stripped.with_digest().unwrap())
+            .expect("write stripped modern sidecar fixture");
+
+        let error = admit_installed_fork_build(candidate, &authority, Some(predecessor))
+            .expect_err("stripped modern candidate must fail full admission");
+        assert!(
+            error
+                .to_string()
+                .contains("omitted the frozen recovery capability baseline"),
+            "unexpected admission error: {error:#}"
+        );
+        assert!(
+            read_build_admission(candidate)
+                .expect("read rejected admission")
+                .is_none()
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn historical_prebaseline_manifest_requires_the_trusted_migration_path() {
+    with_temp_jcode_home(|| {
+        let (repo, canonical, _upstream, _merge) = canonical_source_fixture();
+        source_fixture_git(repo.path(), &["checkout", CANONICAL_FORK_RELEASE_BRANCH]);
+
+        let version = "0.70.0";
+        let capabilities = builtin_capability_ids().expect("builtin capability IDs");
+        let capability_refs = capabilities.iter().map(String::as_str).collect::<Vec<_>>();
+        let binary = write_report_binary(version, &canonical[..7], &capability_refs);
+        let mut historical = builtin_manifest().expect("builtin capability manifest");
+        historical.recovery_baseline = None;
+        for capability in &mut historical.capabilities {
+            capability.recovery_state.clear();
+        }
+        write_immutable_manifest(&binary, &historical.with_digest().unwrap())
+            .expect("write historical pre-baseline sidecar fixture");
+
+        let authority =
+            format!("local-fork:{CANONICAL_FORK_REPOSITORY}:{CANONICAL_FORK_RELEASE_BRANCH}");
+        let normal_error = admit_installed_fork_build(version, &authority, None)
+            .expect_err("normal admission must not infer legacy from missing baseline fields");
+        assert!(
+            normal_error
+                .to_string()
+                .contains("omitted the frozen recovery capability baseline"),
+            "unexpected normal admission error: {normal_error:#}"
+        );
+        assert!(
+            read_build_admission(version)
+                .expect("read rejected normal admission")
+                .is_none()
+        );
+
+        let migrated = admit_installed_legacy_canonical_source_build(
+            version,
+            repo.path(),
+            &canonical,
+            None,
+            None,
+        )
+        .expect("verified canonical provenance should authorize historical migration");
+        assert_eq!(
+            migrated.manifest_trust,
+            ManifestTrust::TrustedLegacyMigration
+        );
+        require_admitted_fork_build(version).expect("trusted historical migration remains valid");
     });
 }
 
