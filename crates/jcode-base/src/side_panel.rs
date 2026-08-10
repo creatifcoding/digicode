@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
 pub use jcode_side_panel_types::{
-    PersistedSidePanelPage, PersistedSidePanelState, SidePanelPage, SidePanelPageFormat,
-    SidePanelPageSource, SidePanelSnapshot, snapshot_is_empty,
+    CanonicalProjectRoot, PageDocumentRecord, PageId, PageOwnershipError, PageScope, PageSource,
+    PageViewState, PersistedSidePanelPage, PersistedSidePanelState, ScopedPageId, SessionId,
+    SidePanelPage, SidePanelPageDocumentRecord, SidePanelPageFormat, SidePanelPageReference,
+    SidePanelPageScope, SidePanelPageSource, SidePanelPageViewState, SidePanelScope,
+    SidePanelSnapshot, SidePanelWorkspaceState, UserProfileId, WorkspacePageReference,
+    snapshot_is_empty,
 };
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
