@@ -15,3 +15,4 @@ npm run typecheck
 Start the gateway on a reachable LAN or Tailscale address, run `jcode pair` there, then use the generated host, port, and pairing code in the mobile app.
 
 See [docs/setup-and-security.md](docs/setup-and-security.md) for connection and token handling details.
+See [docs/baseline-validation.md](docs/baseline-validation.md) for the source-live/shipped disposition and validation evidence.

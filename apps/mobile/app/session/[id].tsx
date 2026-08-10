@@ -4,11 +4,11 @@ import { Button, KeyboardAvoidingView, Platform, SafeAreaView, ScrollView, Style
 import { useMobile } from '../../src/ui/mobile-context';
 
 export default function SessionTranscript() {
-  const { id } = useLocalSearchParams<{ id: string }>();
+  const { id, working_dir } = useLocalSearchParams<{ id: string; working_dir?: string }>();
   const { selectSession, sendMessage, state } = useMobile();
   const [draft, setDraft] = useState('');
 
-  useEffect(() => { if (id) selectSession(id); }, [id, selectSession]);
+  useEffect(() => { if (id) selectSession(id, working_dir); }, [id, selectSession, working_dir]);
   const submit = () => { const text = draft.trim(); if (!text) return; setDraft(''); sendMessage(text); };
 
   return <KeyboardAvoidingView style={styles.root} behavior={Platform.select({ ios: 'padding', default: undefined })}>

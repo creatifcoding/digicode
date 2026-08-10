@@ -24,7 +24,7 @@ function Pairing() {
   return <SafeAreaView style={styles.screen}><View style={styles.card}>
     <Text style={styles.eyebrow}>SECURE DEVICE PAIRING</Text><Text style={styles.title}>Connect to Jcode</Text>
     <Text style={styles.help}>Run jcode pair on your host, then enter its reachable LAN or Tailscale address and one-time code.</Text>
-    <TextInput style={styles.input} value={gateway} onChangeText={setGateway} autoCapitalize="none" autoCorrect={false} placeholder="http://jcode-host:8787" placeholderTextColor="#7f899c" accessibilityLabel="Gateway address" />
+    <TextInput style={styles.input} value={gateway} onChangeText={setGateway} autoCapitalize="none" autoCorrect={false} placeholder="http://jcode-host:7643" placeholderTextColor="#7f899c" accessibilityLabel="Gateway address" />
     <TextInput style={styles.input} value={code} onChangeText={setCode} autoCapitalize="characters" autoCorrect={false} placeholder="Pairing code" placeholderTextColor="#7f899c" accessibilityLabel="Pairing code" />
     <TextInput style={styles.input} value={deviceName} onChangeText={setDeviceName} placeholder="Device name" placeholderTextColor="#7f899c" accessibilityLabel="Device name" />
     {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -42,7 +42,7 @@ function Sessions() {
   {state.swarmStatus ? <Text style={styles.notice}>Swarm: {state.swarmStatus}</Text> : null}
   <FlatList data={state.sessions} keyExtractor={(item) => item.session_id} contentContainerStyle={state.sessions.length ? styles.list : styles.emptyList}
     ListEmptyComponent={<View><Text style={styles.emptyTitle}>No sessions received</Text><Text style={styles.help}>Reconnect or refresh after the gateway reports session_list.</Text></View>}
-    renderItem={({ item }) => <View style={styles.session}><View style={styles.sessionText}><Text style={styles.sessionTitle} numberOfLines={1}>{item.title || item.session_id}</Text><Text style={styles.sessionMeta} numberOfLines={1}>{item.status || 'idle'} · {item.working_dir || 'unknown workspace'}</Text></View><Button title="Open" onPress={() => router.push({ pathname: '/session/[id]', params: { id: item.session_id } })} /></View>}
+    renderItem={({ item }) => <View style={styles.session}><View style={styles.sessionText}><Text style={styles.sessionTitle} numberOfLines={1}>{item.title || item.session_id}</Text><Text style={styles.sessionMeta} numberOfLines={1}>{item.status || 'idle'} · {item.working_dir || 'unknown workspace'}</Text></View><Button title="Open" onPress={() => router.push({ pathname: '/session/[id]', params: { id: item.session_id, working_dir: item.working_dir || '/' } })} /></View>}
   />
   <View style={styles.footer}><Button title="Refresh" onPress={refreshSessions} /><Button title="Forget device" color="#dc6b72" onPress={() => void forgetDevice()} /></View>
   </SafeAreaView>;
