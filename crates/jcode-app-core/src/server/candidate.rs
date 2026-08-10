@@ -11,11 +11,13 @@ use jcode_tasker_orchestration::{
 };
 use jcode_tasker_pi::{PiTaskerStore, ProjectPartition};
 use jcode_tasker_types::{ProjectId, TaskId};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, hash_map::Entry};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +25,8 @@ use tokio_util::sync::CancellationToken;
 use super::{SessionAgents, SessionInterruptQueues, SwarmMember, VersionedPlan};
 
 const CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
+const TASKER_RECEIPT_PREFIX: &str = "tpr_";
+const CANDIDATE_EFFECT_KIND: &str = "execute_candidate_lanes";
 const ALLOWED_VALIDATOR_PROGRAMS: &[&str] = &[
     "cargo",
     "cargo-nextest",
@@ -98,6 +102,8 @@ pub(super) struct CandidateLaneJob {
     pub session_id: String,
     pub working_dir_claim: PathBuf,
     pub expected_snapshot_hash: String,
+    receipt_id: String,
+    raw_proposal: Value,
     pub proposal: CandidateLaneLaunchRequest,
 }
 
@@ -118,8 +124,10 @@ impl CandidateLaneJob {
         if request.receipt_id.trim().is_empty() {
             bail!("candidate authority rejected: Tasker plan receipt is required");
         }
-        let proposal: CandidateLaneLaunchRequest =
-            serde_json::from_value(request.proposal).context("decode guest candidate proposal")?;
+        validate_receipt_id(&request.receipt_id)?;
+        let raw_proposal = request.proposal;
+        let proposal: CandidateLaneLaunchRequest = serde_json::from_value(raw_proposal.clone())
+            .context("decode guest candidate proposal")?;
         proposal
             .validate()
             .map_err(|error| anyhow!("candidate proposal rejected: {error}"))?;
@@ -128,9 +136,66 @@ impl CandidateLaneJob {
             session_id: request.session_id,
             working_dir_claim: PathBuf::from(request.working_dir),
             expected_snapshot_hash: request.expected_snapshot_hash,
+            receipt_id: request.receipt_id,
+            raw_proposal,
             proposal,
         })
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HostTaskerPlanReceipt {
+    version: u8,
+    id: String,
+    project_root: String,
+    list_id: String,
+    snapshot_hash: String,
+    change_digest: String,
+    #[serde(default)]
+    concurrency_project_id: Option<String>,
+    issued_at: u64,
+    expires_at: u64,
+}
+
+fn validate_receipt_id(id: &str) -> Result<()> {
+    if !id.starts_with(TASKER_RECEIPT_PREFIX)
+        || id.len() > 64
+        || !id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        bail!("candidate authority rejected: invalid Tasker plan receipt id");
+    }
+    Ok(())
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json(value)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn candidate_receipt_change_digest(proposal: &Value, pi_list_id: &str) -> Result<String> {
+    let canonical = canonical_json(&serde_json::json!({
+        "kind": CANDIDATE_EFFECT_KIND,
+        "payload": proposal,
+        "project_id": pi_list_id,
+    }));
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&canonical).context("serialize candidate receipt input")?
+        )
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +259,55 @@ impl ServerCandidateLaneHost {
         }
     }
 
+    fn verify_receipt(
+        &self,
+        job: &CandidateLaneJob,
+        project_root: &Path,
+        pi_list_id: &str,
+        snapshot_hash: &str,
+    ) -> Result<()> {
+        let receipt_root = crate::storage::jcode_dir()
+            .context("resolve host Tasker receipt root")?
+            .join("tasker-plan-receipts");
+        let receipt_path = receipt_root.join(format!("{}.json", job.receipt_id));
+        let receipt: HostTaskerPlanReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).with_context(|| {
+                format!(
+                    "candidate authority rejected: Tasker plan receipt not found at {}",
+                    receipt_path.display()
+                )
+            })?)
+            .context("candidate authority rejected: parse Tasker plan receipt")?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("candidate authority rejected: system clock is before Unix epoch")?
+            .as_secs();
+        if receipt.version != 1
+            || receipt.id != job.receipt_id
+            || receipt.project_root != project_root.to_string_lossy()
+            || receipt.list_id != pi_list_id
+        {
+            bail!("candidate authority rejected: Tasker plan receipt scope mismatch");
+        }
+        if receipt.issued_at > now
+            || receipt.expires_at < now
+            || receipt.expires_at < receipt.issued_at
+        {
+            bail!("candidate authority rejected: Tasker plan receipt expired or not yet valid");
+        }
+        if receipt.snapshot_hash != snapshot_hash {
+            bail!("candidate authority rejected: Tasker plan receipt snapshot mismatch");
+        }
+        if receipt.concurrency_project_id.as_deref() != Some(pi_list_id) {
+            bail!("candidate authority rejected: Tasker plan receipt concurrency project mismatch");
+        }
+        let expected_digest = candidate_receipt_change_digest(&job.raw_proposal, pi_list_id)?;
+        if receipt.change_digest != expected_digest {
+            bail!("candidate authority rejected: Tasker plan receipt change-set mismatch");
+        }
+        Ok(())
+    }
+
     pub(crate) async fn execute_request(
         &self,
         request: CandidateLaneHostRequest,
@@ -254,6 +368,7 @@ impl ServerCandidateLaneHost {
         if snapshot_hash != job.expected_snapshot_hash {
             bail!("candidate authority rejected: Tasker snapshot changed before execution");
         }
+        self.verify_receipt(&job, &authoritative_dir, &pi_list_id, &snapshot_hash)?;
 
         let task_reference = job
             .proposal
@@ -448,7 +563,26 @@ impl ServerCandidateExecutor {
 
     async fn finish_child(&self, candidate_id: String, session_id: &str) {
         self.active.lock().await.remove(&candidate_id);
+        let swarm_id = self
+            .host
+            .swarm_members
+            .write()
+            .await
+            .remove(session_id)
+            .and_then(|member| member.swarm_id);
+        if let Some(swarm_id) = swarm_id {
+            super::remove_session_from_swarm(
+                session_id,
+                &swarm_id,
+                &self.host.swarm_members,
+                &self.host.swarms_by_id,
+                &self.host.swarm_coordinators,
+                &self.host.swarm_plans,
+            )
+            .await;
+        }
         let removed_agent = super::remove_session_entry(&self.host.sessions, session_id).await;
+        super::remove_background_tool_signal(session_id);
         if let Some(agent) = removed_agent
             && let Ok(mut agent) = agent.try_lock()
         {
@@ -517,24 +651,41 @@ impl CandidateExecutor for ServerCandidateExecutor {
             .ok_or_else(|| {
                 CandidateExecutorError::Failed("headless child did not return a session id".into())
             })?;
-        let agent = self
-            .host
-            .sessions
-            .read()
-            .await
-            .get(&session_id)
-            .cloned()
-            .ok_or_else(|| {
-                CandidateExecutorError::Failed("headless child was not registered".into())
-            })?;
+        let candidate_id = request.lane.candidate_id.to_string();
+        let agent = match self.host.sessions.read().await.get(&session_id).cloned() {
+            Some(agent) => agent,
+            None => {
+                self.finish_child(candidate_id.clone(), &session_id).await;
+                return Err(CandidateExecutorError::Failed(
+                    "headless child was not registered".into(),
+                ));
+            }
+        };
         let shutdown = agent.lock().await.graceful_shutdown_signal();
-        self.active.lock().await.insert(
-            request.lane.candidate_id.to_string(),
-            ChildLaneControl {
-                session_id: session_id.clone(),
-                shutdown: shutdown.clone(),
-            },
-        );
+        if cancellation.is_cancelled() {
+            shutdown.fire();
+            self.finish_child(candidate_id, &session_id).await;
+            return Err(CandidateExecutorError::Cancelled);
+        }
+        {
+            let mut active = self.active.lock().await;
+            match active.entry(candidate_id.clone()) {
+                Entry::Occupied(_) => {
+                    shutdown.fire();
+                    drop(active);
+                    self.finish_child(candidate_id, &session_id).await;
+                    return Err(CandidateExecutorError::Failed(
+                        "candidate lane already has an active child".into(),
+                    ));
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(ChildLaneControl {
+                        session_id: session_id.clone(),
+                        shutdown: shutdown.clone(),
+                    });
+                }
+            }
+        }
 
         let mut turn = Box::pin(async {
             let mut agent = agent.lock().await;
@@ -562,8 +713,7 @@ impl CandidateExecutor for ServerCandidateExecutor {
             Err(CandidateExecutorError::Failed(reason)) if reason.contains("not acknowledged")
         );
         if !termination_failed {
-            self.finish_child(request.lane.candidate_id.to_string(), &session_id)
-                .await;
+            self.finish_child(candidate_id, &session_id).await;
         }
         result
     }
@@ -574,12 +724,14 @@ impl CandidateExecutor for ServerCandidateExecutor {
     ) -> std::result::Result<(), CandidateExecutorError> {
         let control = {
             let active = self.active.lock().await;
-            active
-                .get(&request.lane.candidate_id.to_string())
-                .cloned()
-                .ok_or_else(|| {
-                    CandidateExecutorError::Failed("candidate child is not active".into())
-                })?
+            active.get(&request.lane.candidate_id.to_string()).cloned()
+        };
+        let Some(control) = control else {
+            // Cancellation is a best-effort idempotent operation. The child
+            // may have completed, or may not have registered yet; in either
+            // case there is no live control to fire and no termination debt to
+            // report to the orchestrator.
+            return Ok(());
         };
         control.shutdown.fire();
         self.finish_child(request.lane.candidate_id.to_string(), &control.session_id)
@@ -785,6 +937,7 @@ mod tests {
         host: ServerCandidateLaneHost,
         sessions: SessionAgents,
         task_display_id: i64,
+        pi_list_id: String,
         snapshot_hash: String,
         project_id: ProjectId,
         task_id: TaskId,
@@ -895,6 +1048,7 @@ mod tests {
                 host,
                 sessions,
                 task_display_id: task.display_id,
+                pi_list_id,
                 snapshot_hash,
                 project_id,
                 task_id,
@@ -909,31 +1063,62 @@ mod tests {
             policy: serde_json::Value,
             lanes: u16,
         ) -> CandidateLaneHostRequest {
+            let proposal = json!({
+                "taskReference": format!("#{}", self.task_display_id),
+                "policy": policy,
+                "laneCount": lanes,
+                "acceptance": {
+                    "validationCommands": [{"program": "true", "args": []}],
+                    "acceptanceCriteria": "headless candidate must commit and pass host validation",
+                    "resourceIntents": [{
+                        "kind": "file",
+                        "selector": "candidate-output.txt",
+                        "access": "propose_write",
+                        "rationale": "candidate implementation output"
+                    }]
+                },
+                "prompt": "Deterministically write and commit candidate-output.txt, then return the required JSON.",
+                "limits": {"maxLanes": lanes, "laneTimeoutMs": 15000}
+            });
+            let receipt_id = format!("tpr_dogfood_{operation_id}");
+            self.write_receipt(&receipt_id, &proposal);
             CandidateLaneHostRequest {
                 id: 42,
                 operation_id: operation_id.to_string(),
                 session_id: self.origin_session_id.clone(),
                 working_dir: self.repository.to_string_lossy().into_owned(),
                 expected_snapshot_hash: self.snapshot_hash.clone(),
-                receipt_id: format!("receipt-{operation_id}"),
-                proposal: json!({
-                    "taskReference": format!("#{}", self.task_display_id),
-                    "policy": policy,
-                    "laneCount": lanes,
-                    "acceptance": {
-                        "validationCommands": [{"program": "true", "args": []}],
-                        "acceptanceCriteria": "headless candidate must commit and pass host validation",
-                        "resourceIntents": [{
-                            "kind": "file",
-                            "selector": "candidate-output.txt",
-                            "access": "propose_write",
-                            "rationale": "candidate implementation output"
-                        }]
-                    },
-                    "prompt": "Deterministically write and commit candidate-output.txt, then return the required JSON.",
-                    "limits": {"maxLanes": lanes, "laneTimeoutMs": 15000}
-                }),
+                receipt_id,
+                proposal,
             }
+        }
+
+        fn write_receipt(&self, id: &str, proposal: &Value) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("dogfood system clock")
+                .as_secs();
+            let root = crate::storage::jcode_dir()
+                .expect("dogfood receipt root")
+                .join("tasker-plan-receipts");
+            std::fs::create_dir_all(&root).expect("create dogfood receipt root");
+            let receipt = HostTaskerPlanReceipt {
+                version: 1,
+                id: id.to_string(),
+                project_root: self.repository.to_string_lossy().into_owned(),
+                list_id: self.pi_list_id.clone(),
+                snapshot_hash: self.snapshot_hash.clone(),
+                change_digest: candidate_receipt_change_digest(proposal, &self.pi_list_id)
+                    .expect("dogfood receipt digest"),
+                concurrency_project_id: Some(self.pi_list_id.clone()),
+                issued_at: now,
+                expires_at: now + 1800,
+            };
+            std::fs::write(
+                root.join(format!("{id}.json")),
+                serde_json::to_vec_pretty(&receipt).expect("serialize dogfood receipt"),
+            )
+            .expect("write dogfood receipt");
         }
         fn mark_candidates_eligible(
             &self,
@@ -1136,6 +1321,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn real_headless_candidate_rejects_tampered_receipt_input_without_spawning_children() {
+        let fixture = DogfoodFixture::new(1).await;
+        let mut request = fixture.request(
+            "tampered-receipt-input",
+            json!({"kind": "speculative", "max_candidates": 1}),
+            1,
+        );
+        request.proposal["prompt"] = json!("guest changed the approved effect");
+        let error = fixture
+            .host
+            .execute_request(request, CancellationToken::new())
+            .await
+            .expect_err("tampered candidate receipt input must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Tasker plan receipt change-set mismatch"),
+            "unexpected receipt rejection: {error:#}"
+        );
+        assert_eq!(fixture.provider_state.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.sessions.read().await.len(), 1);
+        assert!(fixture.host.swarm_members.read().await.is_empty());
+        assert!(fixture.host.swarms_by_id.read().await.is_empty());
+        assert_eq!(
+            git(&fixture.repository, &["rev-parse", CANONICAL_REF]),
+            fixture.base_commit,
+            "receipt rejection must not move the canonical ref"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_headless_speculative_lanes_overlap_and_record_host_derived_evidence() {
         let fixture = DogfoodFixture::new(2).await;
@@ -1198,6 +1415,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![fixture.origin_session_id.clone()],
             "successful child sessions must be removed from the host registry"
+        );
+        assert!(
+            fixture.host.swarm_members.read().await.is_empty(),
+            "successful child cleanup must remove swarm member state"
+        );
+        assert!(
+            fixture.host.swarms_by_id.read().await.is_empty(),
+            "successful child cleanup must remove swarm membership indexes"
         );
         assert_eq!(
             git(&fixture.repository, &["rev-parse", CANONICAL_REF]),
@@ -1408,6 +1633,14 @@ mod tests {
             vec![fixture.origin_session_id.clone()],
             "acknowledged headless cancellation must remove the child from the host registry"
         );
+        assert!(
+            fixture.host.swarm_members.read().await.is_empty(),
+            "cancellation cleanup must remove swarm member state"
+        );
+        assert!(
+            fixture.host.swarms_by_id.read().await.is_empty(),
+            "cancellation cleanup must remove swarm membership indexes"
+        );
         assert_eq!(
             git(&fixture.repository, &["rev-parse", CANONICAL_REF]),
             fixture.base_commit,
@@ -1519,5 +1752,30 @@ mod tests {
         assert!(cancel_operation("session-a", "candidate-op-authority"));
         assert!(cancellation.is_cancelled());
         unregister_cancellation("candidate-op-authority");
+    }
+
+    #[test]
+    fn candidate_job_rejects_malformed_receipt_id() {
+        let request = CandidateLaneHostRequest {
+            id: 1,
+            operation_id: "op-receipt".into(),
+            session_id: "session-receipt".into(),
+            working_dir: ".".into(),
+            expected_snapshot_hash: "sha256:host".into(),
+            receipt_id: "guest-controlled/path".into(),
+            proposal: json!({
+                "policy": {"kind": "speculative", "max_candidates": 1},
+                "laneCount": 1,
+                "acceptance": {
+                    "validationCommands": [{"program": "true", "args": []}],
+                    "acceptanceCriteria": "pass",
+                    "resourceIntents": []
+                },
+                "prompt": "work",
+                "limits": {"maxLanes": 1, "laneTimeoutMs": 1000}
+            }),
+        };
+        let error = CandidateLaneJob::from_request(request).expect_err("receipt path must reject");
+        assert!(error.to_string().contains("invalid Tasker plan receipt id"));
     }
 }
