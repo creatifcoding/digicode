@@ -1559,6 +1559,7 @@ async fn empty_post_tool_response_is_retried_in_shared_helper() {
 }
 
 include!("agent_tests/retention_readiness.rs");
+include!("agent_tests/runtime_retention_smokes.rs");
 
 /// Provider that reproduces the DeepSWE Opus 5 incident: the first response
 /// ends with `stop_reason: "tool_use"` while carrying no tool-use block at all,
