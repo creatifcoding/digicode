@@ -401,30 +401,44 @@ fn manifest_for_report(
     binary: &Path,
     report: &BinaryVersionReport,
     manifest_trust: ManifestTrust,
+    manifest_root: &Path,
 ) -> Result<(ForkCapabilityManifest, bool)> {
     if let Some(manifest) = read_manifest_for_binary(binary)? {
-        let legacy = match manifest_trust {
-            ManifestTrust::TrustedLegacyMigration if manifest.is_legacy() => {
-                let expected = fork_governance::legacy_manifest(
-                    &report.capabilities,
-                    report.git_hash.as_deref().unwrap_or("legacy"),
-                )?;
-                if manifest != expected {
-                    anyhow::bail!(
-                        "legacy capability manifest {} is not the host-generated migration manifest",
-                        binary.display()
-                    );
-                }
-                true
+        let legacy = if manifest.is_legacy() {
+            if manifest.schema_version != LEGACY_MANIFEST_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "legacy capability manifest {} uses unsupported schema {}; only the host-generated schema {} migration manifest is trusted",
+                    binary.display(),
+                    manifest.schema_version,
+                    LEGACY_MANIFEST_SCHEMA_VERSION
+                );
             }
-            ManifestTrust::TrustedLegacyMigration if manifest.is_pre_baseline_shape() => true,
-            _ if manifest.is_legacy() => {
+            if manifest_trust != ManifestTrust::TrustedLegacyMigration {
                 anyhow::bail!(
                     "legacy capability manifest {} requires an explicit host-owned migration context",
                     binary.display()
                 );
             }
-            _ => false,
+            let expected = fork_governance::legacy_manifest(
+                &report.capabilities,
+                report.git_hash.as_deref().unwrap_or("legacy"),
+            )?;
+            if manifest != expected {
+                anyhow::bail!(
+                    "legacy capability manifest {} is not the host-generated migration manifest",
+                    binary.display()
+                );
+            }
+            true
+        } else if manifest.schema_version == LEGACY_MANIFEST_SCHEMA_VERSION {
+            anyhow::bail!(
+                "schema {} capability manifest {} requires the host-generated legacy migration manifest and an explicit host-owned migration context",
+                LEGACY_MANIFEST_SCHEMA_VERSION,
+                binary.display()
+            );
+        } else {
+            manifest_trust == ManifestTrust::TrustedLegacyMigration
+                && manifest.is_pre_baseline_shape()
         };
         if !legacy {
             manifest.validate_baseline(&builtin_manifest()?)?;
@@ -448,6 +462,14 @@ fn manifest_for_report(
                 )
             })?;
             manifest.validate_freshness(digest)?;
+            manifest
+                .validate_generated_commit(manifest_root)
+                .with_context(|| {
+                    format!(
+                        "post-governance binary {} has an unverifiable generated manifest commit",
+                        binary.display()
+                    )
+                })?;
         }
         return Ok((manifest, legacy));
     }
@@ -467,6 +489,7 @@ fn manifest_for_report(
                 binary.display()
             );
         }
+        generated.validate_generated_commit(manifest_root)?;
         return Ok((generated, false));
     }
 
@@ -618,6 +641,14 @@ fn build_admission_path(version: &str) -> Result<PathBuf> {
     Ok(directory.join("fork-admission.json"))
 }
 
+fn admission_manifest_root(explicit: Option<&Path>) -> Result<PathBuf> {
+    explicit.map(Path::to_path_buf).or_else(get_repo_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot admit a modern fork build without a canonical repository checkout to verify the generated manifest commit"
+        )
+    })
+}
+
 pub fn read_build_admission(version: &str) -> Result<Option<ForkBuildAdmission>> {
     let path = build_admission_path(version)?;
     if !path.exists() {
@@ -631,6 +662,16 @@ pub fn admit_installed_fork_build(
     authority: &str,
     predecessor: Option<&str>,
 ) -> Result<ForkBuildAdmission> {
+    let manifest_root = admission_manifest_root(None)?;
+    admit_installed_fork_build_with_root(version, authority, predecessor, &manifest_root)
+}
+
+fn admit_installed_fork_build_with_root(
+    version: &str,
+    authority: &str,
+    predecessor: Option<&str>,
+    manifest_root: &Path,
+) -> Result<ForkBuildAdmission> {
     admit_installed_fork_build_inner(
         version,
         authority,
@@ -638,6 +679,7 @@ pub fn admit_installed_fork_build(
         None,
         false,
         ManifestTrust::Modern,
+        manifest_root,
     )
 }
 
@@ -696,7 +738,7 @@ fn admit_installed_canonical_source_build_with_manifest_trust(
     let authority = format!("local-fork:{}:{}", source.repository, source.branch);
     let binary = version_binary_path(version)?;
     let report = read_binary_version_report(&binary)?;
-    let (manifest, legacy) = manifest_for_report(&binary, &report, manifest_trust)?;
+    let (manifest, legacy) = manifest_for_report(&binary, &report, manifest_trust, repo_dir)?;
     if !legacy {
         manifest.validate_source_paths(repo_dir)?;
     }
@@ -707,6 +749,7 @@ fn admit_installed_canonical_source_build_with_manifest_trust(
         Some(source),
         false,
         manifest_trust,
+        repo_dir,
     )
 }
 
@@ -717,6 +760,7 @@ fn admit_installed_fork_build_inner(
     source: Option<ForkBuildSource>,
     initial_reseed: bool,
     manifest_trust: ManifestTrust,
+    manifest_root: &Path,
 ) -> Result<ForkBuildAdmission> {
     if initial_reseed && (predecessor.is_some() || any_fork_admission_receipt_exists()?) {
         anyhow::bail!("refusing initial fork reseed after an admitted release line exists");
@@ -745,12 +789,12 @@ fn admit_installed_fork_build_inner(
     }
     let git_hash = report.git_hash.clone().unwrap_or_default();
     let (mut candidate_manifest, candidate_legacy) =
-        manifest_for_report(&binary, &report, manifest_trust)?;
+        manifest_for_report(&binary, &report, manifest_trust, manifest_root)?;
     if let Some(source) = source.as_ref() {
         validate_recorded_source(source, &git_hash)?;
     }
     let predecessor_admission = predecessor
-        .map(require_admitted_fork_build)
+        .map(|predecessor| require_admitted_fork_build_with_root(predecessor, manifest_root))
         .transpose()
         .map_err(|error| {
             anyhow::anyhow!("build {version} does not extend an admitted fork release: {error}")
@@ -764,6 +808,7 @@ fn admit_installed_fork_build_inner(
             &predecessor_binary,
             &predecessor_report,
             predecessor_admission.manifest_trust,
+            manifest_root,
         )?;
         predecessor_legacy = legacy;
         Some(manifest)
@@ -824,7 +869,7 @@ fn admit_installed_fork_build_inner(
     // Version directories and their admission receipts are immutable. A
     // repeated install is idempotent only when every identity field matches.
     if let Some(existing) = read_build_admission(version)? {
-        require_admitted_fork_build(version)?;
+        require_admitted_fork_build_with_root(version, manifest_root)?;
         if existing.git_hash == git_hash
             && existing.authority == authority
             && existing.binary_sha256 == binary_sha256
@@ -867,12 +912,21 @@ fn admit_installed_fork_build_inner(
 }
 
 pub fn require_admitted_fork_build(version: &str) -> Result<ForkBuildAdmission> {
-    require_admitted_fork_build_inner(version, &mut HashSet::new())
+    let manifest_root = admission_manifest_root(None)?;
+    require_admitted_fork_build_with_root(version, &manifest_root)
+}
+
+fn require_admitted_fork_build_with_root(
+    version: &str,
+    manifest_root: &Path,
+) -> Result<ForkBuildAdmission> {
+    require_admitted_fork_build_inner(version, &mut HashSet::new(), manifest_root)
 }
 
 fn require_admitted_fork_build_inner(
     version: &str,
     seen: &mut HashSet<String>,
+    manifest_root: &Path,
 ) -> Result<ForkBuildAdmission> {
     if !seen.insert(version.to_string()) {
         anyhow::bail!("fork admission predecessor cycle includes {version}");
@@ -916,7 +970,7 @@ fn require_admitted_fork_build_inner(
     let report = read_binary_version_report(&binary)?;
     let manifest_sidecar_exists = manifest_path_for_binary(&binary).exists();
     let (manifest, legacy_manifest) =
-        manifest_for_report(&binary, &report, admission.manifest_trust)?;
+        manifest_for_report(&binary, &report, admission.manifest_trust, manifest_root)?;
     if !manifest_sidecar_exists && !legacy_manifest {
         anyhow::bail!(
             "admitted fork build {version} is missing its post-governance capability manifest sidecar"
@@ -982,8 +1036,12 @@ fn require_admitted_fork_build_inner(
                 )
             })?
             .manifest_trust;
-        let (predecessor_manifest, predecessor_legacy) =
-            manifest_for_report(&predecessor_binary, &predecessor_report, predecessor_trust)?;
+        let (predecessor_manifest, predecessor_legacy) = manifest_for_report(
+            &predecessor_binary,
+            &predecessor_report,
+            predecessor_trust,
+            manifest_root,
+        )?;
         if !predecessor_legacy {
             ForkCapabilityManifest::validate_transition(&predecessor_manifest, &manifest, version)?;
         }
@@ -999,7 +1057,7 @@ fn require_admitted_fork_build_inner(
             .collect::<Vec<_>>()
     };
     if let Some(predecessor) = admission.predecessor.as_deref() {
-        let predecessor = require_admitted_fork_build_inner(predecessor, seen)?;
+        let predecessor = require_admitted_fork_build_inner(predecessor, seen, manifest_root)?;
         validate_transition_metadata(
             version,
             &admission.authority,
@@ -1184,7 +1242,7 @@ pub fn bootstrap_legacy_fork_build(repo_dir: &Path) -> Result<Option<ForkBuildAd
         admitted_at: Utc::now(),
     };
     storage::write_json(&build_admission_path(&version)?, &admission)?;
-    require_admitted_fork_build(&version)?;
+    require_admitted_fork_build_with_root(&version, repo_dir)?;
     Ok(Some(admission))
 }
 
@@ -1211,6 +1269,7 @@ fn admit_initial_local_fork_build(
         None,
         true,
         ManifestTrust::Modern,
+        repo_dir,
     )
 }
 
@@ -2148,13 +2207,14 @@ pub fn publish_local_current_build_for_source(
         let predecessor = predecessor.ok_or_else(|| {
             anyhow::anyhow!("admitted fork receipts exist without a configured release-line head")
         })?;
-        admit_installed_fork_build(
+        admit_installed_fork_build_with_root(
             &source.version_label,
             &format!(
                 "local-fork:{CANONICAL_FORK_REPOSITORY}:{}",
                 source.repo_scope
             ),
             Some(&predecessor),
+            repo_dir,
         )?;
     }
     let current_link = update_current_to_admitted_fork_build(&source.version_label)?;
@@ -2429,10 +2489,11 @@ pub fn install_local_release(repo_dir: &std::path::Path) -> Result<PathBuf> {
 
     let versioned = install_binary_at_version(&source, &version)?;
     let predecessor = admitted_release_line_head()?;
-    admit_installed_fork_build(
+    admit_installed_fork_build_with_root(
         &version,
         &format!("local-fork:{CANONICAL_FORK_REPOSITORY}:release"),
         predecessor.as_deref(),
+        repo_dir,
     )?;
     update_stable_to_admitted_fork_build(&version)?;
     update_current_to_admitted_fork_build(&version)?;

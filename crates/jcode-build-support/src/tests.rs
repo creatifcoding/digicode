@@ -848,12 +848,26 @@ fn write_report_binary_without_version(version: &str, git_hash: &str) -> PathBuf
 #[cfg(unix)]
 fn write_governed_report_binary(version: &str, git_hash: &str) -> PathBuf {
     let manifest = builtin_manifest().expect("builtin capability manifest");
+    write_governed_report_binary_with_manifest(version, git_hash, &manifest)
+}
+
+#[cfg(unix)]
+fn write_governed_report_binary_with_manifest(
+    version: &str,
+    git_hash: &str,
+    manifest: &ForkCapabilityManifest,
+) -> PathBuf {
     let capabilities = manifest
         .capabilities
         .iter()
         .map(|capability| capability.id.as_str())
         .collect::<Vec<_>>();
-    write_governed_report_binary_with_capabilities(version, git_hash, &capabilities)
+    write_governed_report_binary_with_manifest_and_capabilities(
+        version,
+        git_hash,
+        manifest,
+        &capabilities,
+    )
 }
 
 #[cfg(unix)]
@@ -862,9 +876,24 @@ fn write_governed_report_binary_with_capabilities(
     git_hash: &str,
     capabilities: &[&str],
 ) -> PathBuf {
+    let manifest = builtin_manifest().expect("builtin capability manifest");
+    write_governed_report_binary_with_manifest_and_capabilities(
+        version,
+        git_hash,
+        &manifest,
+        capabilities,
+    )
+}
+
+#[cfg(unix)]
+fn write_governed_report_binary_with_manifest_and_capabilities(
+    version: &str,
+    git_hash: &str,
+    manifest: &ForkCapabilityManifest,
+    capabilities: &[&str],
+) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
-    let manifest = builtin_manifest().expect("builtin capability manifest");
     let path = version_binary_path(version).expect("version path");
     std::fs::create_dir_all(path.parent().expect("version parent")).expect("version directory");
     let report = serde_json::json!({
@@ -1348,6 +1377,85 @@ fn stripped_rehashed_modern_candidate_is_rejected_by_full_admission() {
         );
         assert!(
             read_build_admission(candidate)
+                .expect("read rejected admission")
+                .is_none()
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_schema_one_manifest_cannot_use_modern_admission() {
+    with_temp_jcode_home(|| {
+        let version = "0.68.1";
+        let mut schema_one = builtin_manifest().expect("builtin capability manifest");
+        schema_one.schema_version = LEGACY_MANIFEST_SCHEMA_VERSION;
+        schema_one.manifest_version = "1.0.0".to_string();
+        for capability in &mut schema_one.capabilities {
+            capability.kind.clear();
+            capability.boundary.clear();
+            capability.disposition.clear();
+            capability.runtime_smoke = None;
+            capability.relationships.clear();
+        }
+        let schema_one = schema_one.with_digest().expect("schema-one digest");
+        let binary =
+            write_governed_report_binary_with_manifest(version, "schema-one-bypass", &schema_one);
+        write_immutable_manifest(&binary, &schema_one).expect("write schema-one sidecar");
+
+        let error = admit_installed_fork_build(
+            version,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+        )
+        .expect_err("ordinary schema-one manifest must not use modern admission");
+        assert!(
+            error.to_string().contains("schema 1"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            error.to_string().contains("host-generated"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            read_build_admission(version)
+                .expect("read rejected admission")
+                .is_none()
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn generic_admission_rejects_a_missing_generated_manifest_commit() {
+    with_temp_jcode_home(|| {
+        let version = "0.68.1";
+        let mut missing_commit = builtin_manifest().expect("builtin capability manifest");
+        missing_commit.generated_from_commit =
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        let missing_commit = missing_commit
+            .with_digest()
+            .expect("missing-commit manifest digest");
+        let binary = write_governed_report_binary_with_manifest(
+            version,
+            "missing-generated-commit",
+            &missing_commit,
+        );
+        write_immutable_manifest(&binary, &missing_commit).expect("write missing-commit sidecar");
+
+        let error = admit_installed_fork_build(
+            version,
+            &format!("github:{CANONICAL_FORK_REPOSITORY}:release"),
+            None,
+        )
+        .expect_err("generic admission must verify the generated manifest commit");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("generated manifest commit") && rendered.contains("not present"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            read_build_admission(version)
                 .expect("read rejected admission")
                 .is_none()
         );
