@@ -510,10 +510,18 @@ fn model_routes_memo_serves_repeats_and_invalidates_on_auth_and_model_changes() 
         // memo stale even within the TTL window (verified behaviorally by the
         // oauth/api state-space test above; here we check the memo mechanism).
         let generation_before = crate::provider::pricing::auth_pricing_generation();
+        let mut invalidation_events = crate::provider::catalog_invalidation::subscribe();
         crate::auth::AuthStatus::invalidate_cache();
         assert!(
             crate::provider::pricing::auth_pricing_generation() > generation_before,
             "auth invalidation must advance the pricing generation"
+        );
+        assert!(
+            std::iter::from_fn(|| invalidation_events.try_recv().ok()).any(|event| {
+                event.source
+                    == crate::provider::catalog_invalidation::ProviderCatalogInvalidationSource::AuthChanged
+            }),
+            "auth invalidation must publish a typed provider catalog event"
         );
 
         // A model switch drops the memo outright.

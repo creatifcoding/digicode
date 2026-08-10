@@ -1326,10 +1326,18 @@ fn default_sponsors_section_is_not_written_back() {
 #[test]
 fn config_reload_generation_increments_on_cache_invalidation() {
     let before = crate::config::config_reload_generation();
+    let mut invalidation_events = crate::provider::catalog_invalidation::subscribe();
     crate::config::invalidate_config_cache();
     let after = crate::config::config_reload_generation();
     assert!(
         after > before,
         "invalidate_config_cache must bump the reload generation ({before} -> {after})"
+    );
+    assert!(
+        std::iter::from_fn(|| invalidation_events.try_recv().ok()).any(|event| {
+            event.source
+                == crate::provider::catalog_invalidation::ProviderCatalogInvalidationSource::ConfigReload
+        }),
+        "config cache invalidation must publish a typed provider catalog event"
     );
 }

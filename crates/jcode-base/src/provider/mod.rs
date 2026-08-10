@@ -4,6 +4,7 @@ pub mod activation;
 pub mod anthropic;
 pub mod antigravity;
 pub mod bedrock;
+pub mod catalog_invalidation;
 mod catalog_routes;
 pub mod catalog_scheduler;
 pub mod claude;
@@ -45,6 +46,9 @@ use registry::ProviderRegistry;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
+pub use catalog_invalidation::{
+    ProviderCatalogInvalidationEvent, ProviderCatalogInvalidationSource,
+};
 pub use catalog_routes::{
     append_simplified_anthropic_model_routes, remote_current_openai_compatible_route_for_model,
     remote_model_is_server_copilot_only, remote_model_routes_fallback,
@@ -440,7 +444,9 @@ fn catalog_generation() -> u64 {
 /// backstop rather than the mechanism: a completed refresh is reflected on the
 /// next render instead of waiting for the memo to expire.
 pub fn bump_catalog_generation() {
-    CATALOG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = catalog_invalidation::invalidate(
+        catalog_invalidation::ProviderCatalogInvalidationSource::CatalogRefresh,
+    );
 }
 
 impl MultiProvider {
@@ -460,7 +466,9 @@ impl MultiProvider {
     /// connect bursts and would otherwise defeat the shared memo.
     fn invalidate_routes_memo_globally(&self) {
         self.invalidate_routes_memo();
-        CATALOG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = catalog_invalidation::invalidate(
+            catalog_invalidation::ProviderCatalogInvalidationSource::CatalogRefresh,
+        );
     }
 
     /// Key identifying the instance-specific state that feeds the route
@@ -1258,8 +1266,10 @@ impl MultiProvider {
     fn handle_auth_changed(&self, preserve_existing_openrouter_profile: bool) {
         crate::logging::auth_event("auth_changed_received", "multi-provider", &[]);
         // Credentials feed route availability/pricing, so every memoized
-        // catalog in the process is stale the moment auth changes.
-        self.invalidate_routes_memo_globally();
+        // catalog in this instance is stale the moment auth changes. The
+        // AuthStatus invalidation below advances the shared generation and
+        // publishes the single typed AuthChanged event for every instance.
+        self.invalidate_routes_memo();
         // Auth just changed, so discard any stale full/fast snapshots before
         // using cheap local probes to hot-initialize newly configured providers.
         crate::auth::AuthStatus::invalidate_cache();

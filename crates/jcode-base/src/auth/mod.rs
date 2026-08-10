@@ -896,6 +896,9 @@ impl AuthStatus {
         Self::invalidate_cached_status();
         crate::auth::copilot::invalidate_github_token_cache();
         crate::provider::pricing::invalidate_auth_pricing_memos();
+        let _ = crate::provider::catalog_invalidation::invalidate(
+            crate::provider::catalog_invalidation::ProviderCatalogInvalidationSource::AuthChanged,
+        );
         crate::memory_rerank::clear_failure_backoff();
         crate::logging::auth_event("auth_status_cache_invalidated", "all", &[]);
     }

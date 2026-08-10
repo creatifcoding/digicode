@@ -410,6 +410,9 @@ pub fn invalidate_config_cache() {
 
 fn notify_config_reloaded() {
     CONFIG_RELOAD_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = crate::provider::catalog_invalidation::invalidate(
+        crate::provider::catalog_invalidation::ProviderCatalogInvalidationSource::ConfigReload,
+    );
     for listener in CONFIG_RELOAD_LISTENERS
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
