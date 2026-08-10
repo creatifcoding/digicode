@@ -41,8 +41,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub use fork_governance::{
-    CapabilityManifestEntry, ContractSpec, ForkCapabilityManifest, MANIFEST_FILE_NAME,
-    MANIFEST_SCHEMA_VERSION, RECOVERY_BASELINE_SCHEMA_VERSION, RecoveryBaseline, RetirementRecord,
+    CapabilityManifestEntry, CapabilityRelationship, ContractSpec, ForkCapabilityManifest,
+    LEGACY_MANIFEST_SCHEMA_VERSION, MANIFEST_FILE_NAME, MANIFEST_SCHEMA_VERSION,
+    RECOVERY_BASELINE_SCHEMA_VERSION, RecoveryBaseline, RetirementRecord, RuntimeSmokeSpec,
     builtin_capability_ids, builtin_manifest, digest_bytes, load_manifest_or_legacy,
     manifest_path_for_binary, read_manifest_for_binary, write_immutable_manifest,
 };

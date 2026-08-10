@@ -1,10 +1,10 @@
 {
-  "schema_version": 1,
-  "manifest_version": "1.0.0",
-  "generated_from_commit": "1d54c4579cc5742216551c078bef002eecf72d82",
+  "schema_version": 2,
+  "manifest_version": "2.0.0",
+  "generated_from_commit": "225620818a668108e951d37f296d2f77132fdef7",
   "recovery_baseline": {
     "schema_version": 1,
-    "baseline_id": "fork-capability-recovery-2026-08-08",
+    "baseline_id": "fork-capability-recovery-2026-08-10",
     "scope": "source-presence-and-readiness",
     "indexed_documents": [
       "recovery:digicode-fork-capability-recovery.md",
@@ -17,12 +17,18 @@
       "artifact-server",
       "artifact-store",
       "candidate-lanes",
+      "entity-mentions",
       "fork-governance",
+      "graph-viewport",
       "linux-computer-use",
+      "metatool-observability",
       "mobile-gateway",
       "mt",
       "native-vcs-maintenance",
+      "nous-provider-catalog-refresh",
+      "rust-cache-gc",
       "session-search",
+      "side-panel-workspace",
       "swarm-coordination",
       "tasker"
     ]
@@ -35,6 +41,27 @@
       "introduced_commit": "3d2404ba07269468192ed5af4d74a45c35c56afc",
       "lifecycle": "active",
       "recovery_state": "proposed",
+      "kind": "proposal",
+      "boundary": "Proposed AG-UI adapter contract only; excludes the shipped bespoke mobile transport and does not claim AG-UI runtime compliance.",
+      "disposition": "proposed",
+      "components": [
+        "session-event-shapes",
+        "transport-adapter",
+        "react-native-host"
+      ],
+      "runtime_smoke": {
+        "required": false,
+        "command": "blocked: no AG-UI runtime package is present",
+        "assertions": [
+          "proposal remains explicitly non-executable"
+        ]
+      },
+      "relationships": [
+        {
+          "relation": "proposes-for",
+          "capability_id": "mobile-gateway"
+        }
+      ],
       "source_paths": [
         "apps/mobile/app/_layout.tsx",
         "apps/mobile/app/index.tsx",
@@ -104,6 +131,29 @@
       "introduced_commit": "dc46cf169da5a941b5f734b789b2ff78086e6a37",
       "lifecycle": "active",
       "recovery_state": "source-live",
+      "kind": "conformance-fixture",
+      "boundary": "Reviewable artifact packet and admission fixture; excludes durable storage ownership and HTTP presentation lifecycle.",
+      "disposition": "shipped",
+      "components": [
+        "artifact-manifest",
+        "candidate-manifest",
+        "rendered-packet",
+        "admission-request"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "governed artifacts.admit_bundle fixture smoke",
+        "assertions": [
+          "packet manifests parse",
+          "rendered and request assets remain paired"
+        ]
+      },
+      "relationships": [
+        {
+          "relation": "fixture-for",
+          "capability_id": "artifact-store"
+        }
+      ],
       "source_paths": [
         "docs/artifacts/psr-candidate-type-001/README.md",
         "docs/artifacts/psr-candidate-type-001/artifact.manifest.json",
@@ -178,6 +228,29 @@
       "introduced_commit": "70c63eee37c122b8f77680bfaacb5d8b132e64d6",
       "lifecycle": "active",
       "recovery_state": "standalone",
+      "kind": "adapter",
+      "boundary": "Standalone loopback HTTP/SSE presentation for admitted artifacts; excludes ordinary app-core startup and artifact admission policy.",
+      "disposition": "standalone",
+      "components": [
+        "catalog-route",
+        "revision-route",
+        "raw-asset-route",
+        "sse-route"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "cargo run -p jcode-artifact-server -- --help",
+        "assertions": [
+          "server binary remains independently runnable",
+          "loopback presentation stays outside ordinary app-core startup"
+        ]
+      },
+      "relationships": [
+        {
+          "relation": "serves",
+          "capability_id": "artifact-store"
+        }
+      ],
       "source_paths": [
         "crates/jcode-artifact-server/Cargo.toml",
         "crates/jcode-artifact-server/src/lib.rs",
@@ -239,6 +312,22 @@
       "introduced_commit": "532d9733b466a50ce69f5c235848c958e75a5833",
       "lifecycle": "active",
       "recovery_state": "source-live",
+      "kind": "supporting-operation",
+      "boundary": "Durable artifact bundle and revision persistence used by governed admission; excludes packet authoring and HTTP presentation.",
+      "disposition": "shipped",
+      "components": [
+        "bundle-admission",
+        "revision-history",
+        "asset-retrieval"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "cargo test -p jcode-artifact-store",
+        "assertions": [
+          "admitted bundle can be read back",
+          "revision identity remains stable"
+        ]
+      },
       "source_paths": [
         "crates/jcode-artifact-store/Cargo.toml",
         "crates/jcode-artifact-store/src/lib.rs",
@@ -300,6 +389,29 @@
       "introduced_commit": "b803212db8308c0d9a44ab8f08b1b8cefd37fbce",
       "lifecycle": "active",
       "recovery_state": "partial-gated",
+      "kind": "supporting-operation",
+      "boundary": "Tasker extension for candidate refs, adjudication, promotion, cleanup, and quarantine; excludes ordinary Tasker task storage and host executor activation.",
+      "disposition": "gated",
+      "components": [
+        "candidate-refs",
+        "adjudication",
+        "promotion",
+        "quarantine-cleanup"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode mt tasker.candidate_lanes --json",
+        "assertions": [
+          "fail-closed host executor state is visible",
+          "exact-commit promotion does not bypass governance"
+        ]
+      },
+      "relationships": [
+        {
+          "relation": "operation-of",
+          "capability_id": "tasker"
+        }
+      ],
       "source_paths": [
         "crates/jcode-app-core/src/server/candidate.rs",
         "crates/jcode-tasker-promotion/src/lib.rs",
@@ -360,12 +472,102 @@
       ]
     },
     {
+      "id": "entity-mentions",
+      "display_name": "Structured entity mentions",
+      "owner": "maintained-fork",
+      "introduced_commit": "c81b0741f1636a5cffdad605593ea35e066a6f14",
+      "lifecycle": "proposed",
+      "recovery_state": "proposed",
+      "kind": "proposal",
+      "boundary": "Proposed resolver-backed references for files, folders, sessions, tasks, initiatives, peers, and URLs; excludes prompt reparsing and executable entity support until contracts land.",
+      "disposition": "proposed",
+      "components": [
+        "mention-reference",
+        "resolver",
+        "preview",
+        "authorization"
+      ],
+      "runtime_smoke": {
+        "required": false,
+        "command": "blocked: no executable EntityMention implementation exists",
+        "assertions": [
+          "proposal remains separate from current prompt and MetaTool parsing"
+        ]
+      },
+      "relationships": [
+        {
+          "relation": "proposes-for",
+          "capability_id": "mt"
+        }
+      ],
+      "source_paths": [
+        "docs/proposals/ENTITY_MENTIONS_SCOPE.md",
+        "docs/proposals/NATIVE_METATOOL.md",
+        "docs/proposals/NATIVE_TASKER.md"
+      ],
+      "asset_paths": [],
+      "schema_contract": {
+        "summary": "schema: A mention carries a typed entity kind, canonical identity, and bounded display metadata.",
+        "references": [
+          "docs/proposals/ENTITY_MENTIONS_SCOPE.md"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: Resolver, preview, authorization, and explanation operations are proposed as explicit contracts.",
+        "references": [
+          "docs/proposals/ENTITY_MENTIONS_SCOPE.md",
+          "docs/proposals/NATIVE_METATOOL.md"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Expansion is bounded, read-only by default, and authorization-aware before any action is proposed.",
+        "references": [
+          "docs/proposals/ENTITY_MENTIONS_SCOPE.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Historical prompt text and imported MetaTool calls remain evidence and are not silently re-executed as mentions.",
+        "references": [
+          "docs/proposals/NATIVE_METATOOL.md"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: The durable proposal is the reviewable source of the not-yet-executable contract.",
+        "references": [
+          "docs/proposals/ENTITY_MENTIONS_SCOPE.md"
+        ]
+      },
+      "evidence": [
+        "docs:docs/proposals/ENTITY_MENTIONS_SCOPE.md",
+        "docs:docs/proposals/NATIVE_METATOOL.md",
+        "source:none:proposal-only"
+      ]
+    },
+    {
       "id": "fork-governance",
       "display_name": "Fork capability preservation governance",
       "owner": "maintained-fork",
       "introduced_commit": "9631300544b8e108be75c8d297511c261ff2b0f3",
       "lifecycle": "active",
       "recovery_state": "source-live",
+      "kind": "supporting-operation",
+      "boundary": "Manifest, source provenance, immutable sidecars, admission receipts, and channel integrity; excludes upstream intake ownership and global activation.",
+      "disposition": "shipped",
+      "components": [
+        "manifest-admission",
+        "source-provenance",
+        "channel-integrity",
+        "legacy-migration"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "cargo test -p jcode-build-support",
+        "assertions": [
+          "manifest digest and baseline are enforced",
+          "runtime version smoke remains required",
+          "trusted legacy migration remains host-authorized"
+        ]
+      },
       "source_paths": [
         "crates/jcode-app-core/src/build.rs",
         "crates/jcode-app-core/src/update.rs",
@@ -425,12 +627,112 @@
       ]
     },
     {
+      "id": "graph-viewport",
+      "display_name": "Shared zoomable graph viewport",
+      "owner": "maintained-fork",
+      "introduced_commit": "d63f735acd8b7f3d99b6c60f2d1f5be0b14a10e3",
+      "lifecycle": "proposed",
+      "recovery_state": "proposed",
+      "kind": "proposal",
+      "boundary": "Proposed renderer-neutral pan, zoom, fit, reset, minimap, and per-page viewport state; current Mermaid viewport is an implementation anchor, not the shared GraphViewport contract.",
+      "disposition": "proposed",
+      "components": [
+        "viewport-reducer",
+        "pan-zoom-input",
+        "fit-reset",
+        "minimap",
+        "coordinate-transform"
+      ],
+      "runtime_smoke": {
+        "required": false,
+        "command": "blocked: no shared GraphViewport implementation exists",
+        "assertions": [
+          "existing Mermaid viewport remains the documented adapter source",
+          "swarm and Tasker graph consumers stay renderer-neutral"
+        ]
+      },
+      "relationships": [
+        {
+          "relation": "proposes-for",
+          "capability_id": "swarm-coordination"
+        },
+        {
+          "relation": "proposes-for",
+          "capability_id": "side-panel-workspace"
+        }
+      ],
+      "source_paths": [
+        "crates/jcode-tui-mermaid/src/mermaid_viewport.rs",
+        "crates/jcode-tui-mermaid/src/mermaid_widget.rs",
+        "crates/jcode-tui-mermaid/src/mermaid_model.rs",
+        "docs/plans/DESKTOP_BUILD_OUT_PLAN.md",
+        "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md"
+      ],
+      "asset_paths": [],
+      "schema_contract": {
+        "summary": "schema: A viewport owns scale, translation, focus, and coordinate transforms independently of a graph renderer.",
+        "references": [
+          "crates/jcode-tui-mermaid/src/mermaid_viewport.rs",
+          "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: Pan, zoom, fit, reset, and input-routing operations are proposed for shared graph consumers.",
+        "references": [
+          "crates/jcode-tui-mermaid/src/mermaid_viewport.rs",
+          "docs/plans/DESKTOP_BUILD_OUT_PLAN.md"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Nested scroll, drag capture, keyboard focus, and terminal-image fallback must remain coherent across pages.",
+        "references": [
+          "crates/jcode-tui-mermaid/src/mermaid_widget.rs",
+          "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Existing Mermaid viewport behavior is extended through an adapter instead of replaced by a disconnected control.",
+        "references": [
+          "crates/jcode-tui-mermaid/src/mermaid_viewport.rs"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Diagram cache and terminal image assets remain owned by existing Mermaid rendering until the proposal is implemented.",
+        "references": [
+          "crates/jcode-tui-mermaid/src/mermaid_cache_render.rs"
+        ]
+      },
+      "evidence": [
+        "source:crates/jcode-tui-mermaid/src/mermaid_viewport.rs",
+        "docs:docs/plans/DESKTOP_BUILD_OUT_PLAN.md",
+        "source:none:shared-proposal"
+      ]
+    },
+    {
       "id": "linux-computer-use",
       "display_name": "Linux computer-use backend",
       "owner": "maintained-fork",
       "introduced_commit": "1167d124fc62e4a384d249c23054801ba573358d",
       "lifecycle": "active",
       "recovery_state": "live",
+      "kind": "product-capability",
+      "boundary": "In-process Linux desktop observation and input tool; excludes non-Linux backends and unrelated desktop automation policy.",
+      "disposition": "shipped",
+      "components": [
+        "at-spi",
+        "niri",
+        "portal-screenshot",
+        "portal-input",
+        "ydotool"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode computer-use doctor",
+        "assertions": [
+          "desktop backends report readiness",
+          "read-only diagnostics do not mutate the desktop"
+        ]
+      },
       "source_paths": [
         "crates/jcode-app-core/src/tool/linux_computer.rs",
         "crates/jcode-computer-use-linux/src/abs_pointer.rs",
@@ -506,12 +808,107 @@
       ]
     },
     {
+      "id": "metatool-observability",
+      "display_name": "MetaTool observability and maintenance evidence",
+      "owner": "maintained-fork",
+      "introduced_commit": "ea04de44a260e954160ee93af99c6e9392b0c13e",
+      "lifecycle": "active",
+      "recovery_state": "source-live",
+      "kind": "supporting-operation",
+      "boundary": "Privacy-preserving local traces, failure-only diagnostics, findings, triage, and issue proposals for MetaTool maintenance; excludes external issue filing and raw source or secret persistence.",
+      "disposition": "shipped",
+      "components": [
+        "trace-records",
+        "diagnostic-dumps",
+        "findings",
+        "triage",
+        "local-issue-proposals"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode mt --json observability smoke",
+        "assertions": [
+          "successful calls record bounded traces",
+          "failures record redacted diagnostics only",
+          "finding proposals remain local-only"
+        ]
+      },
+      "relationships": [
+        {
+          "relation": "observes",
+          "capability_id": "mt"
+        }
+      ],
+      "source_paths": [
+        "crates/jcode-app-core/src/metatool_observability.rs",
+        "crates/jcode-app-core/src/tool/metatool.rs",
+        "crates/jcode-app-core/src/tool/mod.rs",
+        "crates/jcode-metatool-runtime/src/lib.rs",
+        "crates/jcode-metatool-runtime/assets/guide.json"
+      ],
+      "asset_paths": [],
+      "schema_contract": {
+        "summary": "schema: Trace, diagnostic, finding, triage, and issue-proposal records use bounded versioned shapes.",
+        "references": [
+          "crates/jcode-app-core/src/metatool_observability.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: Native MetaTool observability actions expose report, list, show, triage, and proposal operations.",
+        "references": [
+          "crates/jcode-app-core/src/tool/metatool.rs",
+          "crates/jcode-metatool-runtime/assets/guide.json"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Every invocation is traceable without persisting raw code, prompts, outputs, filenames, or secrets.",
+        "references": [
+          "crates/jcode-app-core/src/metatool_observability.rs",
+          "crates/jcode-app-core/src/tool/metatool.rs"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Observability is additive and local-only; historical MetaTool evidence is never silently executed or externally filed.",
+        "references": [
+          "crates/jcode-metatool-runtime/src/lib.rs"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Durable trace and finding files live under the hardened local MetaTool observability directory.",
+        "references": [
+          "crates/jcode-app-core/src/metatool_observability.rs"
+        ]
+      },
+      "evidence": [
+        "commit:ea04de44a260e954160ee93af99c6e9392b0c13e",
+        "source:crates/jcode-app-core/src/metatool_observability.rs",
+        "test:crates/jcode-app-core/src/tool/metatool.rs"
+      ]
+    },
+    {
       "id": "mobile-gateway",
       "display_name": "Expo mobile session gateway",
       "owner": "maintained-fork",
       "introduced_commit": "8112656960ca0360ef82f91af1106258d6ad71bc",
       "lifecycle": "active",
       "recovery_state": "source-only",
+      "kind": "adapter",
+      "boundary": "Source-only Expo companion gateway using the bespoke Jcode pairing and session protocol; excludes AG-UI compliance and Rust release-binary startup.",
+      "disposition": "gated",
+      "components": [
+        "pairing",
+        "transport",
+        "session-reducer",
+        "secure-storage"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "npm --prefix apps/mobile test && npm --prefix apps/mobile run typecheck",
+        "assertions": [
+          "pairing and reconnect tests pass",
+          "gateway disposition remains explicit outside the Rust release binary"
+        ]
+      },
       "source_paths": [
         "apps/mobile/app/_layout.tsx",
         "apps/mobile/app/index.tsx",
@@ -587,6 +984,24 @@
       "introduced_commit": "1429eb617585732d3fdf037a51e43afca6561b2e",
       "lifecycle": "active",
       "recovery_state": "source-live",
+      "kind": "product-capability",
+      "boundary": "Native MetaTool execution and governed effects exposed to agents; excludes local observability persistence, which is tracked as a supporting operation.",
+      "disposition": "shipped",
+      "components": [
+        "codemode",
+        "tasker-effects",
+        "artifact-effects",
+        "swarm-effects"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode mt --json",
+        "assertions": [
+          "native actions are discoverable",
+          "governed effects remain fail-closed",
+          "artifact and Tasker receipts are observable"
+        ]
+      },
       "source_paths": [
         "crates/jcode-app-core/src/tool/metatool.rs",
         "crates/jcode-metatool-runtime/src/lib.rs",
@@ -662,6 +1077,22 @@
       "introduced_commit": "3d4669a346cff935fe0ae5afd0e0fa1c4e6a19b3",
       "lifecycle": "active",
       "recovery_state": "live",
+      "kind": "supporting-operation",
+      "boundary": "Maintained-fork source update, build, and release provenance helpers; excludes upstream repository ownership and operator activation.",
+      "disposition": "shipped",
+      "components": [
+        "source-update",
+        "fork-ancestry",
+        "release-metadata"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "fork source-provenance admission smoke",
+        "assertions": [
+          "upstream is intake-only",
+          "canonical fork ancestry is verified before admission"
+        ]
+      },
       "source_paths": [
         "crates/jcode-app-core/src/build.rs",
         "crates/jcode-app-core/src/update.rs",
@@ -724,12 +1155,177 @@
       ]
     },
     {
+      "id": "nous-provider-catalog-refresh",
+      "display_name": "Nous provider and live catalog refresh",
+      "owner": "maintained-fork",
+      "introduced_commit": "cbc2bb4441a735f3023b06f8f0e6f9658c2eb2a4",
+      "lifecycle": "active",
+      "recovery_state": "partial-gated",
+      "kind": "product-capability",
+      "boundary": "User-visible Nous/openai-compatible profile discovery, live model cache refresh, and picker invalidation; excludes provider transport implementation and credential ownership.",
+      "disposition": "gated",
+      "components": [
+        "profile-roster",
+        "live-model-cache",
+        "catalog-scheduler",
+        "picker-invalidation"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode /refresh-model-list then /model",
+        "assertions": [
+          "configured Nous profiles appear without restarting the session",
+          "stale catalog state is replaced or reported",
+          "a selected model routes through the configured provider"
+        ]
+      },
+      "source_paths": [
+        "crates/jcode-base/src/provider_catalog.rs",
+        "crates/jcode-base/src/provider/catalog_routes.rs",
+        "crates/jcode-base/src/provider/catalog_scheduler.rs",
+        "crates/jcode-base/src/provider/mod.rs",
+        "crates/jcode-base/src/provider/tests.rs",
+        "crates/jcode-base/src/provider_catalog_tests.rs",
+        "crates/jcode-base/src/auth/lifecycle.rs"
+      ],
+      "asset_paths": [],
+      "schema_contract": {
+        "summary": "schema: Provider profiles, cached model catalogs, route metadata, and generation markers remain profile-scoped.",
+        "references": [
+          "crates/jcode-base/src/provider_catalog.rs",
+          "crates/jcode-base/src/provider/mod.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: Catalog routes and refresh scheduling expose configured profile models to picker and routing consumers.",
+        "references": [
+          "crates/jcode-base/src/provider/catalog_routes.rs",
+          "crates/jcode-base/src/provider/catalog_scheduler.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Refresh preserves configured profile models, filters non-chat entries, and makes stale picker state observable.",
+        "references": [
+          "crates/jcode-base/src/provider/tests.rs",
+          "crates/jcode-base/src/provider_catalog_tests.rs"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Existing static profile lists remain a safe fallback while live catalog generations refresh in place.",
+        "references": [
+          "crates/jcode-base/src/provider/catalog_routes.rs",
+          "crates/jcode-base/src/provider/catalog_scheduler.rs"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Provider profile configuration and disk-backed catalog caches remain user-owned inputs, not manifest-owned secrets.",
+        "references": [
+          "crates/jcode-base/src/provider_catalog.rs",
+          "crates/jcode-base/src/auth/lifecycle.rs"
+        ]
+      },
+      "evidence": [
+        "source:crates/jcode-base/src/provider/catalog_scheduler.rs",
+        "test:crates/jcode-base/src/provider/tests.rs",
+        "review:Nous provider is live but picker refresh is gated"
+      ]
+    },
+    {
+      "id": "rust-cache-gc",
+      "display_name": "Rust build-cache garbage collection",
+      "owner": "maintained-fork",
+      "introduced_commit": "740bde6a6cde9bb38971dc4d6ef41e3db841b08e",
+      "lifecycle": "active",
+      "recovery_state": "live",
+      "kind": "supporting-operation",
+      "boundary": "Conservative discovery, sizing, locking, reporting, and optional deletion of Cargo target caches; excludes active build targets, user source, and unrelated cache directories.",
+      "disposition": "shipped",
+      "components": [
+        "bounded-discovery",
+        "active-target-protection",
+        "reserve-budget-selection",
+        "timer-installation"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "python3 scripts/rust_cache_gc.py --json",
+        "assertions": [
+          "active and recent targets are protected",
+          "report mode is non-destructive",
+          "lock contention exits safely"
+        ]
+      },
+      "source_paths": [
+        "scripts/rust_cache_gc.py",
+        "scripts/test_rust_cache_gc.py",
+        "scripts/install_rust_cache_gc.sh",
+        "scripts/dev_cargo.sh",
+        "docs/plans/COMPILE_PERFORMANCE_PLAN.md"
+      ],
+      "asset_paths": [],
+      "schema_contract": {
+        "summary": "schema: Candidate records include path, size, modification time, active/recent flags, and deletion priority.",
+        "references": [
+          "scripts/rust_cache_gc.py"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: Report, root selection, budget, lock, and apply options are explicit CLI inputs.",
+        "references": [
+          "scripts/rust_cache_gc.py",
+          "scripts/install_rust_cache_gc.sh"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Discovery is bounded and conservative; active, recent, and locked targets are never selected.",
+        "references": [
+          "scripts/rust_cache_gc.py",
+          "scripts/test_rust_cache_gc.py"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Installation is additive and exposes a user timer without changing Cargo project ownership.",
+        "references": [
+          "scripts/install_rust_cache_gc.sh",
+          "docs/plans/COMPILE_PERFORMANCE_PLAN.md"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: The collector script, installer, tests, and optional roots configuration are the maintained operational assets.",
+        "references": [
+          "scripts/rust_cache_gc.py",
+          "scripts/install_rust_cache_gc.sh"
+        ]
+      },
+      "evidence": [
+        "script:scripts/rust_cache_gc.py",
+        "test:scripts/test_rust_cache_gc.py",
+        "docs:docs/plans/COMPILE_PERFORMANCE_PLAN.md"
+      ]
+    },
+    {
       "id": "session-search",
       "display_name": "Cross-session search and inspection",
       "owner": "maintained-fork",
       "introduced_commit": "023a62a95351dbc313e1b5c29c8e02151d855faf",
       "lifecycle": "active",
       "recovery_state": "live",
+      "kind": "product-capability",
+      "boundary": "Read-only session discovery and resumable hit inspection; excludes transcript mutation and agent execution unless an explicit resume action is selected.",
+      "disposition": "shipped",
+      "components": [
+        "session-discovery",
+        "hit-inspection",
+        "agent-open-resume"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode session-search --json",
+        "assertions": [
+          "manual hit inspection remains read-only",
+          "agent-open resume semantics remain distinct"
+        ]
+      },
       "source_paths": [
         "crates/jcode-app-core/src/tool/session_search.rs",
         "crates/jcode-app-core/src/tool/session_search_index.rs",
@@ -791,12 +1387,108 @@
       ]
     },
     {
+      "id": "side-panel-workspace",
+      "display_name": "Side-panel multi-page workspace and ownership scopes",
+      "owner": "maintained-fork",
+      "introduced_commit": "4aec863e2481c33ce7eb1beed98a935f92c90d08",
+      "lifecycle": "active",
+      "recovery_state": "partial-gated",
+      "kind": "product-capability",
+      "boundary": "One Alt+M page workspace with session-scoped persistence today and gated Project/Global ownership catalogs plus per-session focus, scroll, search, and viewport state; excludes the shared GraphViewport implementation.",
+      "disposition": "gated",
+      "components": [
+        "session-pages",
+        "project-scope",
+        "global-scope",
+        "page-picker",
+        "per-session-view-state"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode run --no-update side-panel write/focus/reopen smoke",
+        "assertions": [
+          "managed and linked pages survive the current session boundary",
+          "Project/Global scopes remain visibly gated rather than inferred",
+          "page focus and view state remain session-local"
+        ]
+      },
+      "source_paths": [
+        "crates/jcode-side-panel-types/src/lib.rs",
+        "crates/jcode-base/src/side_panel.rs",
+        "crates/jcode-base/src/side_panel_tests.rs",
+        "crates/jcode-app-core/src/tool/side_panel.rs",
+        "crates/jcode-app-core/src/tool/side_panel_tests.rs",
+        "crates/jcode-tui/src/tui/app.rs",
+        "crates/jcode-tui/src/tui/app/input.rs",
+        "crates/jcode-tui/src/tui/app/navigation.rs",
+        "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md",
+        "docs/TUISTATE_TRAIT_DECOMPOSITION.md"
+      ],
+      "asset_paths": [],
+      "schema_contract": {
+        "summary": "schema: Persisted pages carry identity, title, source, format, timestamps, and focused-page state; future scope catalogs are explicit migrations.",
+        "references": [
+          "crates/jcode-side-panel-types/src/lib.rs",
+          "crates/jcode-base/src/side_panel.rs"
+        ]
+      },
+      "api_contract": {
+        "summary": "api: Agent-facing write, append, load, focus, refresh, delete, and status operations publish side-panel snapshots.",
+        "references": [
+          "crates/jcode-app-core/src/tool/side_panel.rs",
+          "crates/jcode-base/src/side_panel.rs"
+        ]
+      },
+      "behavior_contract": {
+        "summary": "behavior: Managed, linked, and ephemeral pages render through one progressive Alt+M workspace while scope ownership remains explicit.",
+        "references": [
+          "crates/jcode-tui/src/tui/app.rs",
+          "crates/jcode-base/src/side_panel_tests.rs"
+        ]
+      },
+      "migration_contract": {
+        "summary": "migration: Existing session_id storage is the trusted boundary; Project and Global catalogs must migrate without collapsing per-session view state.",
+        "references": [
+          "crates/jcode-base/src/side_panel.rs",
+          "docs/MULTI_SESSION_CLIENT_ARCHITECTURE.md"
+        ]
+      },
+      "asset_contract": {
+        "summary": "asset: Markdown pages and side-panel snapshots are durable local assets; no global scope is claimed until its catalog exists.",
+        "references": [
+          "crates/jcode-base/src/side_panel.rs",
+          "crates/jcode-tui/src/tui/app.rs"
+        ]
+      },
+      "evidence": [
+        "source:crates/jcode-base/src/side_panel.rs",
+        "source:crates/jcode-side-panel-types/src/lib.rs",
+        "review:session-only persistence with Project/Global scopes proposed"
+      ]
+    },
+    {
       "id": "swarm-coordination",
       "display_name": "Multi-agent swarm coordination",
       "owner": "maintained-fork",
       "introduced_commit": "4c9b3eb1252c93bcea91ba8958b2202d0193a41b",
       "lifecycle": "active",
       "recovery_state": "live",
+      "kind": "product-capability",
+      "boundary": "Swarm coordination API and semantic graph reads; excludes a shared zoomable graph renderer, which remains a separate proposal.",
+      "disposition": "shipped",
+      "components": [
+        "agent-coordination",
+        "semantic-graph-reads",
+        "task-graph-projections"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode mt swarm --json",
+        "assertions": [
+          "coordination reads are available",
+          "graph reads remain renderer-neutral"
+        ]
+      },
       "source_paths": [
         "crates/jcode-app-core/src/server/swarm.rs",
         "crates/jcode-app-core/src/server/swarm_channels.rs",
@@ -867,6 +1559,24 @@
       "introduced_commit": "a618ed43caef2a4d4b8abd67d82f0ed920e4fde9",
       "lifecycle": "active",
       "recovery_state": "live",
+      "kind": "product-capability",
+      "boundary": "Durable Pi-compatible task and feature API with governed plan/apply effects; excludes candidate-lane host execution, which is a gated extension.",
+      "disposition": "shipped",
+      "components": [
+        "ordinary-api",
+        "feature-tree",
+        "dependency-graph",
+        "plan-apply-receipts"
+      ],
+      "runtime_smoke": {
+        "required": true,
+        "command": "jcode tasker status --json",
+        "assertions": [
+          "ordinary reads and writes remain durable",
+          "plan/apply receipts remain governed",
+          "dependency projections remain consistent"
+        ]
+      },
       "source_paths": [
         "crates/jcode-app-core/src/tool/tasker.rs",
         "crates/jcode-tasker-git/src/lib.rs",
@@ -934,5 +1644,5 @@
     }
   ],
   "retirements": [],
-  "sha256": "f2f97e1287ec461ee704dd9a96516dcc84846a201be61d91954c370e296c96fc"
+  "sha256": "2625bbb89a2d915de1856e3994a5a96122ca554cfe2aa27eb5de259835355405"
 }

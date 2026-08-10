@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const RECOVERY_BASELINE_SCHEMA_VERSION: u32 = 1;
 pub const MANIFEST_FILE_NAME: &str = "capability-manifest.json";
 pub const MANIFEST_SOURCE: &str = include_str!("../../../docs/FORK_CAPABILITY_MANIFEST.json");
@@ -33,6 +35,20 @@ impl ContractSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSmokeSpec {
+    pub required: bool,
+    pub command: String,
+    #[serde(default)]
+    pub assertions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityRelationship {
+    pub relation: String,
+    pub capability_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityManifestEntry {
     pub id: String,
     pub display_name: String,
@@ -44,6 +60,24 @@ pub struct CapabilityManifestEntry {
     /// entry can still be source-only, standalone, or gated.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub recovery_state: String,
+    /// Canonical ontology for this maintained surface. Legacy manifests omit
+    /// these fields and are admitted only through the explicit migration path.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// Human-readable ownership boundary. Source paths alone are not a
+    /// boundary because they do not state what the entry excludes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boundary: String,
+    /// Canonical release disposition. `recovery_state` remains frozen for
+    /// baseline compatibility and is mapped to this field for schema v2.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub disposition: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_smoke: Option<RuntimeSmokeSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<CapabilityRelationship>,
     #[serde(default)]
     pub source_paths: Vec<String>,
     #[serde(default)]
@@ -130,6 +164,12 @@ impl CapabilityManifestEntry {
             introduced_commit: "legacy".to_string(),
             lifecycle: "legacy-migrated".to_string(),
             recovery_state: String::new(),
+            kind: String::new(),
+            boundary: String::new(),
+            disposition: String::new(),
+            components: Vec::new(),
+            runtime_smoke: None,
+            relationships: Vec::new(),
             source_paths: Vec::new(),
             asset_paths: Vec::new(),
             schema_contract: contract.clone(),
@@ -152,6 +192,24 @@ impl CapabilityManifestEntry {
             &self.recovery_state,
             &self.source_paths,
             &self.asset_paths,
+        ))
+    }
+
+    fn has_governance_metadata(&self) -> bool {
+        !self.kind.trim().is_empty()
+            && !self.boundary.trim().is_empty()
+            && !self.disposition.trim().is_empty()
+            && self.runtime_smoke.is_some()
+    }
+
+    fn governance_fingerprint(&self) -> Result<String> {
+        digest_json(&(
+            &self.kind,
+            &self.boundary,
+            &self.disposition,
+            &self.components,
+            &self.runtime_smoke,
+            &self.relationships,
         ))
     }
 }
@@ -265,7 +323,9 @@ impl ForkCapabilityManifest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != MANIFEST_SCHEMA_VERSION {
+        let legacy_schema = self.schema_version == LEGACY_MANIFEST_SCHEMA_VERSION;
+        let modern_schema = self.schema_version == MANIFEST_SCHEMA_VERSION;
+        if !legacy_schema && !modern_schema {
             anyhow::bail!(
                 "unsupported fork capability manifest schema {} (expected {})",
                 self.schema_version,
@@ -283,6 +343,7 @@ impl ForkCapabilityManifest {
         }
 
         let has_recovery_baseline = self.recovery_baseline.is_some();
+        let pre_baseline_shape = self.is_pre_baseline_shape();
         let mut ids = HashSet::new();
         for capability in &self.capabilities {
             validate_id(&capability.id, "capability")?;
@@ -332,6 +393,23 @@ impl ForkCapabilityManifest {
                     anyhow::bail!("capability {} has an empty {name} contract", capability.id);
                 }
             }
+            if modern_schema && !pre_baseline_shape {
+                validate_governance_metadata(capability, &self.capabilities)?;
+            }
+        }
+
+        if modern_schema && !pre_baseline_shape && !is_hex_commit(&self.generated_from_commit) {
+            anyhow::bail!(
+                "fork capability manifest generated_from_commit is not a commit hash: {}",
+                self.generated_from_commit
+            );
+        }
+        if modern_schema && !pre_baseline_shape && !self.manifest_version.starts_with("2.") {
+            anyhow::bail!(
+                "fork capability manifest version {} is not compatible with schema {}",
+                self.manifest_version,
+                MANIFEST_SCHEMA_VERSION
+            );
         }
 
         let mut retirement_ids = HashSet::new();
@@ -486,6 +564,9 @@ impl ForkCapabilityManifest {
     /// cannot pass admission merely by retaining a capability name.
     pub fn validate_source_paths(&self, root: &Path) -> Result<()> {
         self.validate()?;
+        if !self.is_pre_baseline_shape() {
+            self.validate_generated_commit(root)?;
+        }
         for capability in &self.capabilities {
             for path in capability
                 .source_paths
@@ -501,6 +582,63 @@ impl ForkCapabilityManifest {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Validate that the manifest was generated from a real commit already in
+    /// the canonical checkout's history. The generated commit is intentionally
+    /// an ancestor rather than the moving worktree HEAD, so a manifest can be
+    /// committed once and remain valid in later descendants without predicting
+    /// its own commit hash.
+    pub fn validate_generated_commit(&self, root: &Path) -> Result<()> {
+        if self.is_pre_baseline_shape() {
+            return Ok(());
+        }
+        let commit = self.generated_from_commit.trim();
+        if !is_hex_commit(commit) {
+            anyhow::bail!(
+                "fork capability manifest generated_from_commit is not a commit hash: {commit}"
+            );
+        }
+
+        let object = Command::new("git")
+            .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .current_dir(root)
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to verify generated manifest commit {commit} in {}",
+                    root.display()
+                )
+            })?;
+        if !object.status.success() {
+            anyhow::bail!(
+                "generated manifest commit {commit} is not present in {}",
+                root.display()
+            );
+        }
+
+        let head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .with_context(|| format!("failed to read git HEAD in {}", root.display()))?;
+        if !head.status.success() {
+            anyhow::bail!("could not read git HEAD in {}", root.display());
+        }
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let ancestry = Command::new("git")
+            .args(["merge-base", "--is-ancestor", commit, &head])
+            .current_dir(root)
+            .output()
+            .with_context(|| {
+                format!("failed to verify generated manifest ancestry {commit}..{head}")
+            })?;
+        if !ancestry.status.success() {
+            anyhow::bail!(
+                "generated manifest commit {commit} is not an ancestor of checkout HEAD {head}"
+            );
         }
         Ok(())
     }
@@ -539,6 +677,16 @@ impl ForkCapabilityManifest {
                             "capability {} contract changed without immutable retirement",
                             previous.id
                         );
+                    }
+                    if previous.has_governance_metadata() && current.has_governance_metadata() {
+                        let previous_governance = previous.governance_fingerprint()?;
+                        let current_governance = current.governance_fingerprint()?;
+                        if previous_governance != current_governance {
+                            anyhow::bail!(
+                                "capability {} governance metadata changed without immutable retirement",
+                                previous.id
+                            );
+                        }
                     }
                 }
                 None => match retirements.get(previous.id.as_str()) {
@@ -617,7 +765,7 @@ pub fn legacy_manifest(capabilities: &[String], commit: &str) -> Result<ForkCapa
     ids.sort();
     ids.dedup();
     ForkCapabilityManifest {
-        schema_version: MANIFEST_SCHEMA_VERSION,
+        schema_version: LEGACY_MANIFEST_SCHEMA_VERSION,
         manifest_version: "legacy-1".to_string(),
         generated_from_commit: if commit.trim().is_empty() {
             "legacy".to_string()
@@ -708,6 +856,148 @@ const RECOVERY_STATES: &[&str] = &[
     "superseded",
 ];
 
+const ENTRY_KINDS: &[&str] = &[
+    "product-capability",
+    "supporting-operation",
+    "adapter",
+    "conformance-fixture",
+    "proposal",
+];
+
+const DISPOSITIONS: &[&str] = &["shipped", "gated", "standalone", "proposed", "retired"];
+
+const RELATION_KINDS: &[&str] = &[
+    "adapter-for",
+    "component-of",
+    "fixture-for",
+    "operation-of",
+    "observes",
+    "proposes-for",
+    "serves",
+];
+
+fn is_hex_commit(value: &str) -> bool {
+    let value = value.trim();
+    (7..=64).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn disposition_for_recovery_state(recovery_state: &str) -> Option<&'static str> {
+    match recovery_state {
+        "live" | "source-live" => Some("shipped"),
+        "partial-gated" | "source-only" => Some("gated"),
+        "standalone" => Some("standalone"),
+        "proposed" => Some("proposed"),
+        "superseded" => Some("retired"),
+        _ => None,
+    }
+}
+
+fn validate_governance_metadata(
+    capability: &CapabilityManifestEntry,
+    capabilities: &[CapabilityManifestEntry],
+) -> Result<()> {
+    if !ENTRY_KINDS.contains(&capability.kind.as_str()) {
+        anyhow::bail!(
+            "capability {} has unsupported kind {:?}",
+            capability.id,
+            capability.kind
+        );
+    }
+    if capability.boundary.trim().is_empty() {
+        anyhow::bail!(
+            "capability {} omitted its ownership boundary",
+            capability.id
+        );
+    }
+    if !DISPOSITIONS.contains(&capability.disposition.as_str()) {
+        anyhow::bail!(
+            "capability {} has unsupported disposition {:?}",
+            capability.id,
+            capability.disposition
+        );
+    }
+    if capability.disposition == "retired" {
+        anyhow::bail!(
+            "active capability {} cannot use retired disposition; add a retirement record",
+            capability.id
+        );
+    }
+    if let Some(expected) = disposition_for_recovery_state(&capability.recovery_state)
+        && capability.disposition != expected
+    {
+        anyhow::bail!(
+            "capability {} disposition {} does not map from recovery state {} (expected {})",
+            capability.id,
+            capability.disposition,
+            capability.recovery_state,
+            expected
+        );
+    }
+
+    let smoke = capability.runtime_smoke.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "capability {} omitted its runtime-smoke obligation",
+            capability.id
+        )
+    })?;
+    if smoke.command.trim().is_empty() {
+        anyhow::bail!(
+            "capability {} has an empty runtime-smoke command",
+            capability.id
+        );
+    }
+    if smoke.assertions.is_empty()
+        || smoke
+            .assertions
+            .iter()
+            .any(|assertion| assertion.trim().is_empty())
+    {
+        anyhow::bail!(
+            "capability {} omitted runtime-smoke assertions",
+            capability.id
+        );
+    }
+    if capability.disposition != "proposed" && !smoke.required {
+        anyhow::bail!(
+            "capability {} must require a runtime smoke for disposition {}",
+            capability.id,
+            capability.disposition
+        );
+    }
+
+    for component in &capability.components {
+        if component.trim().is_empty() {
+            anyhow::bail!("capability {} contains an empty component", capability.id);
+        }
+    }
+
+    let known_ids = capabilities
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    for relationship in &capability.relationships {
+        if !RELATION_KINDS.contains(&relationship.relation.as_str()) {
+            anyhow::bail!(
+                "capability {} has unsupported relationship {:?}",
+                capability.id,
+                relationship.relation
+            );
+        }
+        validate_id(&relationship.capability_id, "relationship capability")?;
+        if relationship.capability_id == capability.id {
+            anyhow::bail!("capability {} cannot relate to itself", capability.id);
+        }
+        if !known_ids.contains(relationship.capability_id.as_str()) {
+            anyhow::bail!(
+                "capability {} references unknown related capability {}",
+                capability.id,
+                relationship.capability_id
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_paths(paths: &[String], kind: &str, capability: &str) -> Result<()> {
     for path in paths {
         let path = Path::new(path);
@@ -737,6 +1027,16 @@ mod tests {
             introduced_commit: "abc1234".to_string(),
             lifecycle: "active".to_string(),
             recovery_state: String::new(),
+            kind: "product-capability".to_string(),
+            boundary: "test capability boundary".to_string(),
+            disposition: "shipped".to_string(),
+            components: vec!["test-component".to_string()],
+            runtime_smoke: Some(RuntimeSmokeSpec {
+                required: true,
+                command: "test-smoke".to_string(),
+                assertions: vec!["test assertion".to_string()],
+            }),
+            relationships: Vec::new(),
             source_paths: vec![format!("src/{id}.rs")],
             asset_paths: vec![format!("assets/{id}.json")],
             schema_contract: ContractSpec::named("schema", "stable schema"),
@@ -759,6 +1059,94 @@ mod tests {
             retirements: Vec::new(),
             sha256: None,
         }
+    }
+
+    #[test]
+    fn schema_v2_requires_boundary_and_runtime_smoke_metadata() {
+        let baseline = builtin_manifest().unwrap();
+
+        let mut missing_boundary = baseline.clone();
+        missing_boundary.capabilities[0].boundary.clear();
+        missing_boundary.sha256 = None;
+        let error = missing_boundary
+            .validate()
+            .expect_err("schema v2 must require an ownership boundary");
+        assert!(error.to_string().contains("ownership boundary"));
+
+        let mut missing_smoke = baseline;
+        missing_smoke.capabilities[0].runtime_smoke = None;
+        missing_smoke.sha256 = None;
+        let error = missing_smoke
+            .validate()
+            .expect_err("schema v2 must require a runtime-smoke obligation");
+        assert!(error.to_string().contains("runtime-smoke obligation"));
+    }
+
+    #[test]
+    fn schema_v2_rejects_disposition_drift_and_unknown_relationships() {
+        let baseline = builtin_manifest().unwrap();
+
+        let mut drifted = baseline.clone();
+        let shipped = drifted
+            .capabilities
+            .iter_mut()
+            .find(|capability| capability.id == "artifact-library")
+            .expect("shipped capability fixture");
+        shipped.disposition = "proposed".to_string();
+        drifted.sha256 = None;
+        let error = drifted
+            .validate()
+            .expect_err("disposition must map to frozen recovery state");
+        assert!(
+            error
+                .to_string()
+                .contains("does not map from recovery state")
+        );
+
+        let mut dangling = baseline;
+        dangling.capabilities[0].relationships = vec![CapabilityRelationship {
+            relation: "operation-of".to_string(),
+            capability_id: "missing-capability".to_string(),
+        }];
+        dangling.sha256 = None;
+        let error = dangling
+            .validate()
+            .expect_err("relationships must target canonical capability IDs");
+        assert!(error.to_string().contains("unknown related capability"));
+    }
+
+    #[test]
+    fn legacy_schema_manifest_remains_valid_only_as_a_prebaseline_shape() {
+        let legacy = legacy_manifest(&["tasker".to_string(), "mt".to_string()], "abc1234")
+            .expect("host-generated legacy manifest");
+        assert_eq!(legacy.schema_version, LEGACY_MANIFEST_SCHEMA_VERSION);
+        assert!(legacy.is_legacy());
+        assert!(legacy.is_pre_baseline_shape());
+        legacy.validate().expect("legacy schema remains readable");
+    }
+
+    #[test]
+    fn generated_commit_must_exist_in_checkout_history() {
+        let mut manifest = builtin_manifest().unwrap();
+        manifest.generated_from_commit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        manifest.sha256 = None;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let error = manifest
+            .validate_generated_commit(&root)
+            .expect_err("generated commit must be an object in the checkout history");
+        assert!(error.to_string().contains("not present"));
+    }
+
+    #[test]
+    fn transition_rejects_governance_metadata_drift_after_migration() {
+        let predecessor = manifest(&["alpha"]).with_digest().unwrap();
+        let mut candidate = predecessor.clone();
+        candidate.predecessor_manifest_sha256 = Some(predecessor.digest().unwrap());
+        candidate.capabilities[0].boundary = "different ownership boundary".to_string();
+        candidate.sha256 = None;
+        let error = ForkCapabilityManifest::validate_transition(&predecessor, &candidate, "2")
+            .expect_err("governance metadata drift must fail closed");
+        assert!(error.to_string().contains("governance metadata changed"));
     }
 
     #[test]
@@ -829,7 +1217,7 @@ mod tests {
     #[test]
     fn builtin_manifest_is_complete_and_not_two_names() {
         let manifest = builtin_manifest().unwrap();
-        assert!(manifest.capabilities.len() >= 3);
+        assert_eq!(manifest.capabilities.len(), 19);
         assert!(
             manifest
                 .capabilities
@@ -842,6 +1230,22 @@ mod tests {
                 .iter()
                 .any(|capability| capability.id == "tasker")
         );
+        for expected in [
+            "entity-mentions",
+            "graph-viewport",
+            "metatool-observability",
+            "nous-provider-catalog-refresh",
+            "rust-cache-gc",
+            "side-panel-workspace",
+        ] {
+            assert!(
+                manifest
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.id == expected),
+                "missing maintained capability {expected}"
+            );
+        }
     }
 
     #[test]
@@ -874,6 +1278,13 @@ mod tests {
                 .iter()
                 .all(|capability| !capability.evidence.is_empty())
         );
+        assert!(manifest.capabilities.iter().all(|capability| {
+            !capability.owner.trim().is_empty()
+                && !capability.kind.trim().is_empty()
+                && !capability.boundary.trim().is_empty()
+                && !capability.disposition.trim().is_empty()
+                && capability.runtime_smoke.is_some()
+        }));
     }
 
     #[test]
