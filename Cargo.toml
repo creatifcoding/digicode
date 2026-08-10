@@ -114,6 +114,10 @@ name = "jcode"
 path = "src/main.rs"
 
 [[bin]]
+name = "digicode"
+path = "src/main.rs"
+
+[[bin]]
 name = "test_api"
 path = "src/bin/test_api.rs"
 

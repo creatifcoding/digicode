@@ -48,7 +48,7 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
     exit 1
 }
 
-$Repo = "1jehuang/jcode"
+$Repo = "creatifcoding/digicode"
 $ReleaseMetadataBase = if ($env:JCODE_RELEASE_METADATA_BASE) {
     $env:JCODE_RELEASE_METADATA_BASE.TrimEnd('/')
 } else {
@@ -960,10 +960,13 @@ $DownloadBases = Get-JcodeReleaseDownloadBases $Version
 $BuildsDir = Join-Path (Get-JcodeLocalAppDataDir) "jcode\builds"
 $StableDir = Join-Path $BuildsDir "stable"
 $VersionDir = Join-Path $BuildsDir "versions\$VersionNum"
+$PrimaryLauncherPath = Join-Path $InstallDir "digicode.exe"
 $LauncherPath = Join-Path $InstallDir "jcode.exe"
 
 $Existing = ""
-if (Test-Path $LauncherPath) {
+if (Test-Path $PrimaryLauncherPath) {
+    try { $Existing = & $PrimaryLauncherPath --version 2>$null | Select-Object -First 1 } catch {}
+} elseif (Test-Path $LauncherPath) {
     try { $Existing = & $LauncherPath --version 2>$null | Select-Object -First 1 } catch {}
 }
 
@@ -976,7 +979,8 @@ if ($Existing) {
 } else {
     Write-Info "Installing jcode $Version"
 }
-Write-Info "  launcher: $LauncherPath"
+Write-Info "  primary launcher: $PrimaryLauncherPath"
+Write-Info "  jcode compatibility alias: $LauncherPath"
 
 foreach ($d in @($InstallDir, $StableDir, $VersionDir)) {
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
@@ -1022,7 +1026,7 @@ if (-not $ResolvedArtifactExePath -and -not $ResolvedArtifactTgzPath -and $Downl
     Assert-JcodeFileChecksum -FilePath $DownloadPath -ExpectedSha256 $expectedSha256 -AssetName $downloadedAssetName | Out-Null
 }
 
-$DestBin = Join-Path $VersionDir "jcode.exe"
+$DestBin = Join-Path $VersionDir "digicode.exe"
 
 if ($DownloadMode -eq "tar") {
     Write-Info "Extracting..."
@@ -1063,9 +1067,9 @@ if ($DownloadMode -eq "tar") {
         Write-Err "Failed to clone $Repo at $Version (exit code: $($gitCloneResult.ExitCode))"
     }
 
-    Write-Info "Building jcode from source (this can take several minutes)..."
+    Write-Info "Building digicode from source (this can take several minutes)..."
     $cargoResult = Invoke-ProcessWithTimeout -FilePath "cargo" -ArgumentList @(
-        "build", "--release", "--locked", "-p", "jcode", "--bin", "jcode",
+        "build", "--release", "--locked", "-p", "jcode", "--bin", "digicode",
         "--manifest-path", (Join-Path $SrcDir "Cargo.toml")
     ) -TimeoutSeconds 1800 -FriendlyName "cargo-build" -CaptureOutput
     if ($cargoResult.TimedOut) {
@@ -1079,16 +1083,21 @@ if ($DownloadMode -eq "tar") {
         Write-Err "cargo build failed (exit code: $($cargoResult.ExitCode))"
     }
 
-    $BuiltBin = Join-Path $SrcDir "target\release\jcode.exe"
+    $BuiltBin = Join-Path $SrcDir "target\release\digicode.exe"
     if (-not (Test-Path $BuiltBin)) { Write-Err "Built binary not found at $BuiltBin" }
     Copy-Item -Path $BuiltBin -Destination $DestBin -Force
 }
 
 Assert-JcodeBinaryCandidate -BinaryPath $DestBin -ExpectedVersion $Version | Out-Null
 
-$StableBin = Join-Path $StableDir "jcode.exe"
+$DestCompatBin = Join-Path $VersionDir "jcode.exe"
+Copy-Item -Path $DestBin -Destination $DestCompatBin -Force
+$StableBin = Join-Path $StableDir "digicode.exe"
+$StableCompatBin = Join-Path $StableDir "jcode.exe"
 Copy-Item -Path $DestBin -Destination $StableBin -Force
+Copy-Item -Path $DestBin -Destination $StableCompatBin -Force
 Set-Content -Path (Join-Path $BuildsDir "stable-version") -Value $VersionNum
+$null = Install-JcodeLauncher -SourcePath $StableBin -LauncherPath $PrimaryLauncherPath
 Install-JcodeLauncher -SourcePath $StableBin -LauncherPath $LauncherPath | Out-Null
 } finally {
     Get-Item -LiteralPath $TempDir -ErrorAction SilentlyContinue |
@@ -1102,7 +1111,7 @@ Install-JcodeLauncher -SourcePath $StableBin -LauncherPath $LauncherPath | Out-N
 # install over it.
 if ($env:JCODE_SKIP_SERVER_RELOAD -ne "1") {
     try {
-        & $LauncherPath server reload 2>$null | Out-Null
+        & $PrimaryLauncherPath server reload 2>$null | Out-Null
     } catch {
     }
 }
@@ -1139,7 +1148,7 @@ if ($shouldSetupAlacritty) {
 }
 
 if ($shouldSetupHotkey) {
-    $configuredHotkey = Install-JcodeHotkey -JcodeExePath $LauncherPath
+    $configuredHotkey = Install-JcodeHotkey -JcodeExePath $PrimaryLauncherPath
 } else {
     Write-Info "Optional global hotkey setup not requested"
 }
@@ -1147,7 +1156,7 @@ if ($shouldSetupHotkey) {
 Set-SetupHintsState -AlacrittyConfigured:(Test-AlacrittyInstalled) -HotkeyConfigured:$configuredHotkey
 
 Write-Host ""
-Write-Info "jcode $Version installed successfully!"
+Write-Info "digicode $Version installed successfully!"
 Write-Host ""
 
 if (Test-AlacrittyInstalled) {
@@ -1158,19 +1167,19 @@ if (Test-AlacrittyInstalled) {
 }
 
 if ($configuredHotkey) {
-    Write-Info "Global launch keys ready: Alt+; and the Copilot key open jcode"
+    Write-Info "Global launch keys ready: Alt+; and the Copilot key open digicode"
     Write-Host ""
 } elseif (-not $ConfigureHotkey) {
-    Write-Info "Optional: run 'jcode setup-hotkey' to configure global launch hotkeys and terminal preferences."
+    Write-Info "Optional: run 'digicode setup-hotkey' to configure global launch hotkeys and terminal preferences."
     Write-Host ""
 }
 
-if (Get-Command jcode -ErrorAction SilentlyContinue) {
-    Write-Info "Run 'jcode' to get started."
+if (Get-Command digicode -ErrorAction SilentlyContinue) {
+    Write-Info "Run 'digicode' to get started. 'jcode' remains available as a compatibility alias."
 } else {
     Write-Host "  Open a new terminal window, then run:"
     Write-Host ""
-    Write-Host "    jcode" -ForegroundColor Green
+    Write-Host "    digicode" -ForegroundColor Green
 }
 }
 
