@@ -1,8 +1,8 @@
 # Scope: First-Class `@entity` Mentions
 
-> **Status:** Execution-ready proposal
+> **Status:** Execution-ready proposal; ontology ratified in [`../ENTITY_MENTIONS_ONTOLOGY_ADR.md`](../ENTITY_MENTIONS_ONTOLOGY_ADR.md)
 > **Date:** 2026-07-28
-> **Decision requested:** Approve the staged entity-mention contract before implementation begins.
+> **Decision requested:** Approve the staged entity-mention implementation plan after adopting the ratified ontology.
 
 ## 1. Outcome
 
