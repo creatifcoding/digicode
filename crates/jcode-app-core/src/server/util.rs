@@ -388,6 +388,57 @@ fn newer_binary_available(
     })
 }
 
+/// Cached, non-blocking read of `server_has_newer_binary` for render-adjacent
+/// paths (the History event's `server_has_update` field).
+///
+/// The full check walks the admitted channel candidates, which (with fork
+/// admission) can hash multi-hundred-MB binaries and spawn smoke-test
+/// subprocesses for the whole predecessor chain. Running that inline in
+/// `send_history` wedged `get_history`/`resume_session` for 70-98 s per
+/// request (the `loading session…` incident of 2026-08-14). This wrapper
+/// serves the last computed answer and refreshes it on a background thread at
+/// most once per TTL. The first call returns `false` and kicks the refresh;
+/// History is re-sent on state changes, so the header catches up when the
+/// flag flips. `/reload` (`handle_reload`) keeps the blocking check because a
+/// stale answer there could exec the wrong binary.
+static SERVER_HAS_UPDATE_CACHE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SERVER_HAS_UPDATE_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SERVER_HAS_UPDATE_LAST_REFRESH: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+const SERVER_HAS_UPDATE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub(crate) fn server_has_newer_binary_cached() -> bool {
+    let stale = SERVER_HAS_UPDATE_LAST_REFRESH
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .map(|at| at.elapsed() >= SERVER_HAS_UPDATE_TTL)
+        .unwrap_or(true);
+    if stale
+        && !SERVER_HAS_UPDATE_REFRESH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        std::thread::Builder::new()
+            .name("update-flag-refresh".into())
+            .spawn(|| {
+                let value = server_has_newer_binary();
+                SERVER_HAS_UPDATE_CACHE.store(value, std::sync::atomic::Ordering::Release);
+                if let Ok(mut guard) = SERVER_HAS_UPDATE_LAST_REFRESH.lock() {
+                    *guard = Some(std::time::Instant::now());
+                }
+                SERVER_HAS_UPDATE_REFRESH_IN_FLIGHT
+                    .store(false, std::sync::atomic::Ordering::Release);
+            })
+            .map(drop)
+            .unwrap_or_else(|_| {
+                SERVER_HAS_UPDATE_REFRESH_IN_FLIGHT
+                    .store(false, std::sync::atomic::Ordering::Release)
+            });
+    }
+    SERVER_HAS_UPDATE_CACHE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn server_has_newer_binary() -> bool {
     // Directional check only: report an update solely when a reload *candidate*
     // binary is strictly newer than the binary we are running.

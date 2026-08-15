@@ -1,5 +1,5 @@
 use super::ClientConnectionInfo;
-use super::server_has_newer_binary;
+use super::server_has_newer_binary_cached;
 use crate::agent::Agent;
 use crate::bus::Bus;
 use crate::message::{ContentBlock, Role};
@@ -536,7 +536,7 @@ async fn send_history_from_persisted_session(
         server_version: Some(jcode_build_meta::version().to_string()),
         server_name: Some(server_name.to_string()),
         server_icon: Some(server_icon.to_string()),
-        server_has_update: Some(server_has_newer_binary()),
+        server_has_update: Some(server_has_newer_binary_cached()),
         was_interrupted,
         reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted),
         connection_type: None,
@@ -749,7 +749,7 @@ pub(super) async fn send_history(
         server_version: Some(jcode_build_meta::version().to_string()),
         server_name: Some(server_name.to_string()),
         server_icon: Some(server_icon.to_string()),
-        server_has_update: Some(server_has_newer_binary()),
+        server_has_update: Some(server_has_newer_binary_cached()),
         was_interrupted,
         reload_recovery: history_reload_recovery_snapshot(session_id, was_interrupted),
         connection_type,

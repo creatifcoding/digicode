@@ -742,8 +742,50 @@ fn admit_installed_fork_build_inner(
     Ok(admission)
 }
 
+/// Process-local memo for admission results.
+///
+/// Admission is a pure function of the version's on-disk artifacts (binary
+/// bytes, receipt, manifest sidecar). Re-verifying is only meaningful when the
+/// binary changes, so the memo keys on (binary mtime, binary len): any
+/// reinstall or in-place rebuild invalidates naturally. Without this memo the
+/// full check re-hashes each ~345 MB channel binary AND spawns a smoke-test
+/// subprocess for the whole predecessor chain, which measured 2.7 s warm and
+/// 70-98 s under cache pressure — inline in server request handlers (the
+/// `loading session…` wedge documented in digimasons
+/// thoughts/2026-08-14-jcode-session-loading-adversarial-sweep.md).
+///
+/// Negative results are deliberately not cached: a missing or invalid receipt
+/// should heal the moment the operator installs one, without a restart.
+static ADMISSION_MEMO: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, (std::time::SystemTime, u64, ForkBuildAdmission)>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn admission_memo_key_meta(version: &str) -> Option<(std::time::SystemTime, u64)> {
+    let binary = version_binary_path(version).ok()?;
+    let meta = std::fs::metadata(&binary).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
 pub fn require_admitted_fork_build(version: &str) -> Result<ForkBuildAdmission> {
-    require_admitted_fork_build_inner(version, &mut HashSet::new())
+    if let Some((mtime, len)) = admission_memo_key_meta(version)
+        && let Ok(memo) = ADMISSION_MEMO.lock()
+        && let Some((cached_mtime, cached_len, admission)) = memo.get(version)
+        && *cached_mtime == mtime
+        && *cached_len == len
+    {
+        return Ok(admission.clone());
+    }
+
+    let admission = require_admitted_fork_build_inner(version, &mut HashSet::new())?;
+
+    if let Some((mtime, len)) = admission_memo_key_meta(version)
+        && let Ok(mut memo) = ADMISSION_MEMO.lock()
+    {
+        memo.insert(version.to_string(), (mtime, len, admission.clone()));
+    }
+    Ok(admission)
 }
 
 fn require_admitted_fork_build_inner(

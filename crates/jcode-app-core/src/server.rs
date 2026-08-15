@@ -611,7 +611,7 @@ pub use self::socket::{
 use self::socket::{signal_ready_fd, socket_has_live_listener};
 
 pub use self::util::ServerIdentity;
-pub(crate) use self::util::server_has_newer_binary;
+pub(crate) use self::util::{server_has_newer_binary, server_has_newer_binary_cached};
 use self::util::{
     debug_control_allowed, embedding_idle_unload_secs, git_common_dir_for, reload_exec_target,
     startup_headless_recovery_test_delay, swarm_id_for_dir,
