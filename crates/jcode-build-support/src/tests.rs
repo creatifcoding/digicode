@@ -1637,3 +1637,54 @@ fn repair_never_downgrades_when_stable_is_older() {
         );
     });
 }
+
+/// Regression: the fork was renamed from `creatifcoding/jcode` to
+/// `creatifcoding/digicode`, and the canonical checks compared the remote URL
+/// for exact equality.
+///
+/// The rename alone therefore made `canonical_fork_remote` fail with
+/// "checkout has no remote for canonical fork creatifcoding/jcode" on the very
+/// checkout it exists to bless, taking out `canonical_source_provenance`, and
+/// with it source-build admission and the `jcode update` source channel.
+/// Reproduced against the live checkout before the fix.
+#[test]
+fn both_canonical_fork_names_are_accepted_after_the_rename() {
+    for repo in ["creatifcoding/jcode", "creatifcoding/digicode"] {
+        for url in [
+            format!("https://github.com/{repo}"),
+            format!("https://github.com/{repo}.git"),
+            format!("git@github.com:{repo}.git"),
+            format!("ssh://git@github.com/{repo}.git"),
+            format!("git@github.com:{repo}.git/"),
+        ] {
+            assert!(
+                canonical_remote_url(&url),
+                "canonical remote should be accepted: {url}"
+            );
+        }
+        assert!(canonical_authority(&format!("local-fork:{repo}:master")));
+        assert!(canonical_authority(&format!("github:{repo}:release")));
+        assert!(source_intake_authority(&format!(
+            "local-fork:{repo}:source-intake"
+        )));
+    }
+}
+
+/// The rename must not widen the check into "any repository".
+#[test]
+fn non_canonical_repositories_are_still_rejected() {
+    for url in [
+        "https://github.com/1jehuang/jcode",
+        "git@github.com:hewhocannotbetamed/jcode.git",
+        "https://github.com/creatifcoding/digicode-evil",
+        "https://github.com/attacker/digicode",
+        "https://gitlab.com/creatifcoding/digicode",
+    ] {
+        assert!(
+            !canonical_remote_url(url),
+            "must not be treated as canonical: {url}"
+        );
+    }
+    assert!(!canonical_authority("local-fork:1jehuang/jcode:master"));
+    assert!(!canonical_authority("github:attacker/digicode:release"));
+}

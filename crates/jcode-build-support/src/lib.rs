@@ -56,6 +56,29 @@ pub use jcode_selfdev_types::{
 /// channel builds. This is deliberately the maintained fork, not the upstream
 /// source repository.
 pub const CANONICAL_FORK_REPOSITORY: &str = "creatifcoding/jcode";
+/// Former names of the canonical fork, still accepted as canonical.
+///
+/// The fork was renamed `creatifcoding/jcode` -> `creatifcoding/digicode`.
+/// Because `canonical_remote_url` compares the remote URL for exact equality,
+/// the rename alone made `canonical_fork_remote` fail with "checkout has no
+/// remote for canonical fork creatifcoding/jcode" on the very checkout it was
+/// meant to bless. That takes out `canonical_source_provenance`, and with it
+/// `admit_installed_canonical_source_build` and the `jcode update` source
+/// channel, on every clone that has followed the rename.
+///
+/// Reproduced against this checkout at HEAD before the fix.
+///
+/// GitHub keeps redirecting the old name, so both spellings legitimately
+/// address the same repository and both must be accepted. Renames are
+/// additive here: the list grows rather than being replaced, so an older
+/// clone that has not re-pointed its remote keeps working too.
+pub const CANONICAL_FORK_REPOSITORY_ALIASES: &[&str] = &["creatifcoding/digicode"];
+
+/// Every repository path that identifies the canonical fork.
+fn canonical_fork_repositories() -> impl Iterator<Item = &'static str> {
+    std::iter::once(CANONICAL_FORK_REPOSITORY)
+        .chain(CANONICAL_FORK_REPOSITORY_ALIASES.iter().copied())
+}
 /// Branch on the canonical fork that is allowed to feed automatic source
 /// updates. Upstream branches are intake-only and never build targets.
 pub const CANONICAL_FORK_RELEASE_BRANCH: &str = "master";
@@ -98,23 +121,28 @@ pub struct ForkBuildSource {
 }
 
 fn canonical_authority(authority: &str) -> bool {
-    authority.starts_with(&format!("github:{CANONICAL_FORK_REPOSITORY}:"))
-        || authority.starts_with(&format!("local-fork:{CANONICAL_FORK_REPOSITORY}:"))
+    canonical_fork_repositories().any(|repo| {
+        authority.starts_with(&format!("github:{repo}:"))
+            || authority.starts_with(&format!("local-fork:{repo}:"))
+    })
 }
 
 fn source_intake_authority(authority: &str) -> bool {
-    authority == format!("local-fork:{CANONICAL_FORK_REPOSITORY}:source-intake")
+    canonical_fork_repositories()
+        .any(|repo| authority == format!("local-fork:{repo}:source-intake"))
 }
 
 fn canonical_remote_url(url: &str) -> bool {
-    let url = url.trim().trim_end_matches('/');
-    [
-        format!("https://github.com/{CANONICAL_FORK_REPOSITORY}"),
-        format!("git@github.com:{CANONICAL_FORK_REPOSITORY}"),
-        format!("ssh://git@github.com/{CANONICAL_FORK_REPOSITORY}"),
-    ]
-    .into_iter()
-    .any(|prefix| url.trim_end_matches(".git") == prefix)
+    let url = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    canonical_fork_repositories().any(|repo| {
+        [
+            format!("https://github.com/{repo}"),
+            format!("git@github.com:{repo}"),
+            format!("ssh://git@github.com/{repo}"),
+        ]
+        .into_iter()
+        .any(|prefix| url == prefix)
+    })
 }
 
 fn git_output(repo_dir: &Path, args: &[&str]) -> Result<String> {
@@ -319,7 +347,9 @@ pub fn canonical_source_provenance(
 }
 
 fn validate_recorded_source(source: &ForkBuildSource, git_hash: &str) -> Result<()> {
-    if source.repository != CANONICAL_FORK_REPOSITORY {
+    // Accept any canonical spelling, so a receipt written before the
+    // `jcode` -> `digicode` rename still validates after it.
+    if !canonical_fork_repositories().any(|repo| source.repository == repo) {
         anyhow::bail!(
             "fork build source repository {:?} is not the canonical fork {CANONICAL_FORK_REPOSITORY}",
             source.repository
