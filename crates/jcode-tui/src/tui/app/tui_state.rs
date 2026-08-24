@@ -13,6 +13,8 @@ struct ContextTally {
     tool_call_count: usize,
     tool_result_chars: usize,
     tool_result_count: usize,
+    /// Only the local branch accumulates this; the remote branch leaves it 0.
+    session_context_chars: usize,
 }
 
 impl ContextTally {
@@ -68,6 +70,90 @@ struct ContextPrefixMemo {
 }
 
 const FULL_RECOUNT_INTERVAL: usize = 64;
+
+/// Same prefix memo, for the local (non-remote) transcript.
+///
+/// The local branch walks `session.messages` and decodes `ContentBlock`s, which
+/// is strictly more work per message than the remote branch. Replay measured it
+/// at 18.72ms p50 with the remote path already fixed, so both need the same
+/// treatment. `skip` (the compaction offset) participates in the fingerprint
+/// because changing it shifts which messages are counted at all.
+struct LocalContextPrefixMemo {
+    session_key: String,
+    skip: usize,
+    prefix_len: usize,
+    boundary_role_user: bool,
+    boundary_blocks: usize,
+    tally: ContextTally,
+    reuses: usize,
+}
+
+static LOCAL_CONTEXT_PREFIX_MEMO: Mutex<Option<LocalContextPrefixMemo>> = Mutex::new(None);
+
+/// Accumulate one local transcript message into a tally.
+///
+/// Lifted verbatim from the original `context_snapshot` loop body so the
+/// incremental path and a full recount produce identical numbers.
+fn accumulate_local_message(msg: &jcode_session_types::StoredMessage, t: &mut ContextTally) {
+    use crate::message::{ContentBlock, Role};
+
+    match msg.role {
+        Role::User => t.user_count += 1,
+        Role::Assistant => t.asst_count += 1,
+    }
+
+    for block in &msg.content {
+        match block {
+            ContentBlock::Text { text, .. } => {
+                if msg.role == Role::User
+                    && text.starts_with("<system-reminder>\n# Session Context")
+                {
+                    t.session_context_chars += text.len();
+                    t.user_count = t.user_count.saturating_sub(1);
+                } else {
+                    match msg.role {
+                        Role::User => t.user_chars += text.len(),
+                        Role::Assistant => t.asst_chars += text.len(),
+                    }
+                }
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                t.tool_call_count += 1;
+                t.tool_call_chars += name.len() + json_encoded_len(input);
+            }
+            ContentBlock::ToolResult { content, .. } => {
+                t.tool_result_count += 1;
+                t.tool_result_chars += content.len();
+            }
+            ContentBlock::Reasoning { text } | ContentBlock::ReasoningTrace { text } => {
+                t.asst_chars += text.len();
+            }
+            ContentBlock::AnthropicThinking {
+                thinking,
+                signature,
+            } => {
+                t.asst_chars += thinking.len() + signature.len();
+            }
+            ContentBlock::OpenAIReasoning {
+                id,
+                summary,
+                encrypted_content,
+                status,
+            } => {
+                t.asst_chars += id.len()
+                    + summary.iter().map(String::len).sum::<usize>()
+                    + encrypted_content.as_ref().map(String::len).unwrap_or(0)
+                    + status.as_ref().map(String::len).unwrap_or(0);
+            }
+            ContentBlock::Image { data, .. } => {
+                t.user_chars += data.len();
+            }
+            ContentBlock::OpenAICompaction { encrypted_content } => {
+                t.user_chars += encrypted_content.len();
+            }
+        }
+    }
+}
 
 static CONTEXT_PREFIX_MEMO: Mutex<Option<ContextPrefixMemo>> = Mutex::new(None);
 
@@ -1266,65 +1352,67 @@ impl crate::tui::TuiState for App {
                 0
             };
 
-            for msg in self.session.messages.iter().skip(skip) {
-                match msg.role {
-                    Role::User => user_count += 1,
-                    Role::Assistant => asst_count += 1,
-                }
+            // Same prefix memo as the remote branch: only the final message
+            // mutates (streaming), so tallies for everything before it are
+            // stable and carried forward. See `LocalContextPrefixMemo`.
+            let msgs = &self.session.messages;
+            let counted_len = msgs.len().saturating_sub(skip);
+            let prefix_len = counted_len.saturating_sub(1);
 
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Text { text, .. } => {
-                            if msg.role == Role::User
-                                && text.starts_with("<system-reminder>\n# Session Context")
-                            {
-                                info.session_context_chars += text.len();
-                                user_count = user_count.saturating_sub(1);
-                            } else {
-                                match msg.role {
-                                    Role::User => user_chars += text.len(),
-                                    Role::Assistant => asst_chars += text.len(),
-                                }
-                            }
-                        }
-                        ContentBlock::ToolUse { name, input, .. } => {
-                            tool_call_count += 1;
-                            tool_call_chars += name.len() + json_encoded_len(input);
-                        }
-                        ContentBlock::ToolResult { content, .. } => {
-                            tool_result_count += 1;
-                            tool_result_chars += content.len();
-                        }
-                        ContentBlock::Reasoning { text }
-                        | ContentBlock::ReasoningTrace { text } => {
-                            asst_chars += text.len();
-                        }
-                        ContentBlock::AnthropicThinking {
-                            thinking,
-                            signature,
-                        } => {
-                            asst_chars += thinking.len() + signature.len();
-                        }
-                        ContentBlock::OpenAIReasoning {
-                            id,
-                            summary,
-                            encrypted_content,
-                            status,
-                        } => {
-                            asst_chars += id.len()
-                                + summary.iter().map(String::len).sum::<usize>()
-                                + encrypted_content.as_ref().map(String::len).unwrap_or(0)
-                                + status.as_ref().map(String::len).unwrap_or(0);
-                        }
-                        ContentBlock::Image { data, .. } => {
-                            user_chars += data.len();
-                        }
-                        ContentBlock::OpenAICompaction { encrypted_content } => {
-                            user_chars += encrypted_content.len();
-                        }
-                    }
-                }
+            let mut guard = LOCAL_CONTEXT_PREFIX_MEMO.lock().ok();
+            let reusable = guard
+                .as_ref()
+                .and_then(|g| g.as_ref())
+                .filter(|memo| {
+                    memo.session_key == session_key
+                        && memo.skip == skip
+                        && memo.reuses < FULL_RECOUNT_INTERVAL
+                        && memo.prefix_len > 0
+                        && memo.prefix_len <= prefix_len
+                        && msgs.get(skip + memo.prefix_len - 1).is_some_and(|m| {
+                            (m.role == Role::User) == memo.boundary_role_user
+                                && m.content.len() == memo.boundary_blocks
+                        })
+                })
+                .map(|memo| (memo.prefix_len, memo.tally, memo.reuses));
+
+            let (scan_from, mut prefix_tally, prior_reuses) =
+                reusable.unwrap_or((0, ContextTally::default(), 0));
+
+            for msg in msgs.iter().skip(skip).take(prefix_len).skip(scan_from) {
+                accumulate_local_message(msg, &mut prefix_tally);
             }
+
+            if let Some(slot) = guard.as_mut()
+                && prefix_len > 0
+                && let Some(boundary) = msgs.get(skip + prefix_len - 1)
+            {
+                **slot = Some(LocalContextPrefixMemo {
+                    session_key: session_key.clone(),
+                    skip,
+                    prefix_len,
+                    boundary_role_user: boundary.role == Role::User,
+                    boundary_blocks: boundary.content.len(),
+                    tally: prefix_tally,
+                    reuses: if scan_from > 0 { prior_reuses + 1 } else { 0 },
+                });
+            }
+            drop(guard);
+
+            let mut total = prefix_tally;
+            for msg in msgs.iter().skip(skip).skip(prefix_len) {
+                accumulate_local_message(msg, &mut total);
+            }
+
+            user_chars += total.user_chars;
+            user_count += total.user_count;
+            asst_chars += total.asst_chars;
+            asst_count += total.asst_count;
+            tool_call_chars += total.tool_call_chars;
+            tool_call_count += total.tool_call_count;
+            tool_result_chars += total.tool_result_chars;
+            tool_result_count += total.tool_result_count;
+            info.session_context_chars += total.session_context_chars;
         }
 
         // Use the last exact tool-definition measurement if available.
