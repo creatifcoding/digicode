@@ -406,3 +406,130 @@ fn ordinary_wrapped_commands_still_run_immediately() {
         "gate became noisy on normal work: {noisy:#?}"
     );
 }
+
+/// Regression: `2>/dev/null` is the single most common idiom in shell work, and
+/// it made every command carrying it unrunnable.
+///
+/// `/dev` is protected recursively (a real `dd of=/dev/sda` must never run), but
+/// the standard character devices are discard sinks that live inside it. The
+/// recursive check ran first, so redirecting stderr to `/dev/null` was reported
+/// as "targets a protected system or home path that must never be destroyed"
+/// and hard-denied, with no justification able to unlock it.
+#[test]
+fn discarding_output_to_the_standard_devices_is_not_destructive() {
+    let ctx = ctx();
+    let mut blocked = Vec::new();
+    for command in [
+        "echo test 2>/dev/null",
+        "ls /home/u/proj 2>/dev/null",
+        "command -v jcode >/dev/null",
+        "make 2>/dev/null | head",
+        "cat notes.txt >/dev/stdout",
+        "echo oops >/dev/stderr",
+    ] {
+        let assessment = assess(command, &ctx);
+        if assessment.level != RiskLevel::Safe {
+            blocked.push(format!("{command} -> {:?}", assessment.level));
+        }
+    }
+    assert!(
+        blocked.is_empty(),
+        "routine output redirection was flagged: {blocked:#?}"
+    );
+}
+
+/// Writing to a real device node stays catastrophic. This is the other side of
+/// the exemption above, and is why that exemption is an exact match rather than
+/// a prefix: `/dev/sda` must not become reachable by spelling it
+/// `/dev/null/../sda`.
+#[test]
+fn real_device_nodes_remain_blocked() {
+    let ctx = ctx();
+    for command in [
+        "dd if=/dev/zero of=/dev/sda",
+        "cat image.iso >/dev/nvme0n1",
+        "echo x >/dev/null/../sda",
+    ] {
+        assert_eq!(
+            assess(command, &ctx).level,
+            RiskLevel::Catastrophic,
+            "device write should stay blocked: {command}"
+        );
+    }
+}
+
+/// Regression: a redirect made every *operand* of an otherwise harmless program
+/// get classified as a deletion target, so `ls ~/.jcode 2>/dev/null` reported
+/// that it would destroy `~/.jcode`. Only a destructive program's operands are
+/// things it deletes; a redirect clobbers its destination and nothing else.
+#[test]
+fn redirection_does_not_make_a_harmless_programs_arguments_into_targets() {
+    let ctx = ctx();
+    let mut blocked = Vec::new();
+    for command in [
+        "ls /home/u/.jcode 2>/dev/null",
+        "ls /home/u/.ssh 2>/dev/null",
+        "cat /etc/hostname 2>/dev/null",
+        "wc -l /home/u/.config/app.toml >counts.txt",
+    ] {
+        let assessment = assess(command, &ctx);
+        if assessment.level != RiskLevel::Safe {
+            blocked.push(format!("{command} -> {:?}", assessment.level));
+        }
+    }
+    assert!(
+        blocked.is_empty(),
+        "reading a protected path is not destroying it: {blocked:#?}"
+    );
+}
+
+/// ...but the redirect *destination* is still checked, because `>` truncates
+/// the file it opens.
+#[test]
+fn the_redirect_destination_itself_is_still_checked() {
+    let ctx = ctx();
+    assert_eq!(
+        assess("echo x >/etc/passwd", &ctx).level,
+        RiskLevel::Catastrophic,
+        "clobbering a protected file must stay blocked"
+    );
+}
+
+/// Regression: `-r` was read as "recursive" on any program, so `grep -rn` was
+/// reported as a "recursive delete inside the working directory". Recursion only
+/// widens blast radius for a program that actually deletes.
+#[test]
+fn recursive_flags_on_non_destructive_programs_are_not_deletions() {
+    let ctx = ctx();
+    let mut blocked = Vec::new();
+    for command in [
+        "grep -rn TODO crates/",
+        "ls -R /home/u/proj",
+        "cp -r src backup",
+        "rsync -r src/ dst/",
+    ] {
+        let assessment = assess(command, &ctx);
+        if !assessment.level.runs_immediately() {
+            blocked.push(format!("{command} -> {:?}", assessment.level));
+        }
+    }
+    assert!(
+        blocked.is_empty(),
+        "reading recursively is not deleting recursively: {blocked:#?}"
+    );
+}
+
+/// The recursion signal must survive on the programs that do delete.
+#[test]
+fn recursive_flags_still_count_for_destructive_programs() {
+    let ctx = ctx();
+    assert_eq!(
+        assess("rm -rf /home/u/proj/target", &ctx).level,
+        RiskLevel::Low,
+        "recursive delete in the working directory should still be recorded"
+    );
+    assert_eq!(
+        assess("rm -rf /home/u", &ctx).level,
+        RiskLevel::Catastrophic
+    );
+}

@@ -135,6 +135,15 @@ fn normalize(path: &Path) -> PathBuf {
 pub fn is_catastrophic_target(path: &Path, ctx: &RiskContext) -> bool {
     let path = normalize(path);
 
+    // The standard character devices are the conventional way to discard or
+    // forward output. They live under `/dev`, which is protected recursively,
+    // so they must be exempted *before* that check rather than after it:
+    // otherwise every `2>/dev/null` in an ordinary read-only command is
+    // reported as destroying a protected system path.
+    if is_benign_device(&path) {
+        return false;
+    }
+
     // Exact system roots, plus anything inside the ones whose contents are as
     // unrecoverable as the directory itself (`/etc/passwd`). `/home` and
     // `/Users` are deliberately not recursive: a user's own project lives
@@ -169,6 +178,25 @@ pub fn is_catastrophic_target(path: &Path, ctx: &RiskContext) -> bool {
     PROTECTED_HOME_SUBPATHS
         .iter()
         .any(|sub| path == home.join(sub))
+}
+
+/// The standard character devices used as discard or forward sinks. Writing to
+/// them cannot destroy data, so they are never a finding.
+///
+/// Matched exactly: `/dev/nullfoo` is not `/dev/null`, and a path *under* one of
+/// these is not one of these. `/dev/zero` is deliberately absent — it is a data
+/// *source* for `dd`, not a sink, and keeping it flagged preserves the warning
+/// on disk-wiping invocations.
+fn is_benign_device(path: &Path) -> bool {
+    [
+        "/dev/null",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/stdin",
+        "/dev/tty",
+    ]
+    .iter()
+    .any(|device| path == Path::new(device))
 }
 
 /// Classify one resolved target, returning a finding when it is notable.
@@ -225,12 +253,15 @@ pub fn classify_target(
         });
     }
 
-    // Raw device nodes are never a safe write target.
-    if expanded.starts_with("/dev")
-        && !expanded.starts_with("/dev/null")
-        && !expanded.starts_with("/dev/stdout")
-        && !expanded.starts_with("/dev/stderr")
-    {
+    // Raw device nodes are never a safe write target, except the standard
+    // character devices, which are sinks rather than storage. Those are not
+    // merely non-catastrophic: they are wholly uninteresting, so they return
+    // before the outside-the-working-directory rule below can flag every
+    // routine `2>/dev/null` for confirmation.
+    if expanded.starts_with("/dev") {
+        if is_benign_device(expanded) {
+            return None;
+        }
         return Some(RiskFinding {
             level: RiskLevel::Catastrophic,
             reason: "writes directly to a device node, which can destroy a \

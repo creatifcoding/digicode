@@ -307,11 +307,21 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
         return;
     }
 
-    let mut targets: Vec<&Token> = tokens
-        .iter()
-        .skip(1)
-        .filter(|t| !t.is_flag() && !t.is_operator)
-        .collect();
+    // Only a destructive program's own operands are things it would delete. A
+    // harmless program that merely redirects (`ls dir 2>/dev/null`) clobbers
+    // exactly the redirect destination and nothing else, so its operands must
+    // not be classified as deletion targets. Conflating the two reported every
+    // ordinary read-only command that redirected stderr as destroying its
+    // arguments.
+    let mut targets: Vec<&Token> = if triggered {
+        tokens
+            .iter()
+            .skip(1)
+            .filter(|t| !t.is_flag() && !t.is_operator)
+            .collect()
+    } else {
+        Vec::new()
+    };
     targets.extend(redirect_targets.iter().copied());
 
     // A destructive command fed by a pipe takes its operands from the previous
@@ -343,7 +353,11 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
         return;
     }
 
-    let recursive = tokens.iter().any(|t| t.is_recursive_flag());
+    // Recursion only widens blast radius for a program that is itself
+    // destructive. `grep -rn`, `ls -R`, and `cp -r` carry an `-r` that says
+    // nothing about deletion, and reading it as one reported plain searches as
+    // "recursive delete inside the working directory".
+    let recursive = triggered && tokens.iter().any(|t| t.is_recursive_flag());
 
     for target in targets {
         // `dd`-style `key=value` operands hide the path from a naive scan.
