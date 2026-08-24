@@ -768,8 +768,78 @@ fn admission_memo_key_meta(version: &str) -> Option<(std::time::SystemTime, u64)
     Some((meta.modified().ok()?, meta.len()))
 }
 
+/// Disk-backed extension of [`ADMISSION_MEMO`], scoped to one version.
+///
+/// The in-process memo only helps a long-lived server. Every *new* process
+/// re-pays the full chain, and `client_update_candidate` sits on the TUI
+/// header rebuild, so a cold client measured **39.9 s before its first frame**
+/// even with the in-process memo in place.
+///
+/// The receipt is written beside the binary it describes and is keyed on the
+/// same (mtime, len) identity, so any reinstall or in-place rebuild
+/// invalidates it exactly as the in-memory memo does. It caches only the
+/// verification *result*, never the admission decision inputs: a corrupted or
+/// unreadable cache is simply ignored and the full check runs.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AdmissionVerifyCache {
+    binary_mtime_unix_nanos: u128,
+    binary_len: u64,
+    admission: ForkBuildAdmission,
+}
+
+fn admission_cache_path(version: &str) -> Option<PathBuf> {
+    let binary = version_binary_path(version).ok()?;
+    Some(binary.parent()?.join("fork-admission.verified.json"))
+}
+
+fn mtime_nanos(mtime: std::time::SystemTime) -> u128 {
+    mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default()
+}
+
+fn read_admission_cache(
+    version: &str,
+    mtime: std::time::SystemTime,
+    len: u64,
+) -> Option<ForkBuildAdmission> {
+    let path = admission_cache_path(version)?;
+    let raw = std::fs::read(&path).ok()?;
+    let cache: AdmissionVerifyCache = serde_json::from_slice(&raw).ok()?;
+    if cache.binary_mtime_unix_nanos == mtime_nanos(mtime)
+        && cache.binary_len == len
+        && cache.admission.version == version
+    {
+        return Some(cache.admission);
+    }
+    None
+}
+
+fn write_admission_cache(
+    version: &str,
+    mtime: std::time::SystemTime,
+    len: u64,
+    admission: &ForkBuildAdmission,
+) {
+    let Some(path) = admission_cache_path(version) else {
+        return;
+    };
+    let cache = AdmissionVerifyCache {
+        binary_mtime_unix_nanos: mtime_nanos(mtime),
+        binary_len: len,
+        admission: admission.clone(),
+    };
+    // Best effort: a read-only or full disk must not break admission.
+    if let Ok(json) = serde_json::to_vec(&cache) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 pub fn require_admitted_fork_build(version: &str) -> Result<ForkBuildAdmission> {
-    if let Some((mtime, len)) = admission_memo_key_meta(version)
+    let key = admission_memo_key_meta(version);
+
+    if let Some((mtime, len)) = key
         && let Ok(memo) = ADMISSION_MEMO.lock()
         && let Some((cached_mtime, cached_len, admission)) = memo.get(version)
         && *cached_mtime == mtime
@@ -778,12 +848,24 @@ pub fn require_admitted_fork_build(version: &str) -> Result<ForkBuildAdmission> 
         return Ok(admission.clone());
     }
 
+    // Second chance before the expensive chain: a receipt this process has not
+    // seen, but a previous process already verified for this exact binary.
+    if let Some((mtime, len)) = key
+        && let Some(admission) = read_admission_cache(version, mtime, len)
+    {
+        if let Ok(mut memo) = ADMISSION_MEMO.lock() {
+            memo.insert(version.to_string(), (mtime, len, admission.clone()));
+        }
+        return Ok(admission);
+    }
+
     let admission = require_admitted_fork_build_inner(version, &mut HashSet::new())?;
 
-    if let Some((mtime, len)) = admission_memo_key_meta(version)
-        && let Ok(mut memo) = ADMISSION_MEMO.lock()
-    {
-        memo.insert(version.to_string(), (mtime, len, admission.clone()));
+    if let Some((mtime, len)) = admission_memo_key_meta(version) {
+        if let Ok(mut memo) = ADMISSION_MEMO.lock() {
+            memo.insert(version.to_string(), (mtime, len, admission.clone()));
+        }
+        write_admission_cache(version, mtime, len, &admission);
     }
     Ok(admission)
 }
