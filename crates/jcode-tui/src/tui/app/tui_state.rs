@@ -1,6 +1,37 @@
 use super::*;
 use crate::tui::TuiState as _;
 use std::cell::RefCell;
+
+/// Serialized JSON length of a value, without building the JSON string.
+///
+/// The context snapshot only needs the *size* of each tool call's input, but it
+/// obtained that with `input.to_string().len()`, which allocates the entire
+/// serialized payload and immediately discards it. With hundreds of tool calls
+/// carrying multi-kilobyte inputs, that dominated the snapshot rebuild, and the
+/// snapshot is rebuilt whenever the message count changes, which during an
+/// active session is constantly.
+///
+/// `serde_json` can serialize into any `io::Write`, so counting bytes into a
+/// sink yields the identical number with no allocation.
+fn json_encoded_len(value: &serde_json::Value) -> usize {
+    struct CountingSink(usize);
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = CountingSink(0);
+    match serde_json::to_writer(&mut sink, value) {
+        Ok(()) => sink.0,
+        // Fall back to the allocating form if serialization somehow fails, so
+        // the reported size can never silently drift from the old behavior.
+        Err(_) => value.to_string().len(),
+    }
+}
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -1091,7 +1122,7 @@ impl crate::tui::TuiState for App {
                         tool_result_chars += msg.content.len();
                         if let Some(tool) = &msg.tool_data {
                             tool_call_count += 1;
-                            tool_call_chars += tool.name.len() + tool.input.to_string().len();
+                            tool_call_chars += tool.name.len() + json_encoded_len(&tool.input);
                         }
                     }
                     _ => {}
@@ -1140,7 +1171,7 @@ impl crate::tui::TuiState for App {
                         }
                         ContentBlock::ToolUse { name, input, .. } => {
                             tool_call_count += 1;
-                            tool_call_chars += name.len() + input.to_string().len();
+                            tool_call_chars += name.len() + json_encoded_len(input);
                         }
                         ContentBlock::ToolResult { content, .. } => {
                             tool_result_count += 1;
