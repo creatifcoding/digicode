@@ -3515,6 +3515,12 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     // Session facts use actual final-frame cells for collision detection. They
     // prefer the composer chrome and may climb into a few transcript-tail rows
     // only when the right suffix is genuinely unused.
+    // The `final` phase (everything after the widget pass) was the only
+    // unattributed span left in the frame, and per-frame accounting put
+    // ~60ms of a 61ms median frame inside it. Time its four components
+    // individually so the next investigation reads a number instead of
+    // inferring one.
+    let facts_start = Instant::now();
     input_ui::draw_right_fact_stack(
         frame,
         app,
@@ -3527,6 +3533,9 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     // Command-suggestion popover: a late overlay pass so the palette floats
     // over existing rows (blank space, pinned footer, or the transcript tail)
     // instead of reserving layout height and shoving everything around.
+    let facts_ms = facts_start.elapsed().as_secs_f64() * 1000.0;
+
+    let overlays_start = Instant::now();
     input_ui::draw_command_suggestions_overlay(frame, app, chunks[7]);
 
     // Ctrl+R reverse prompt-history search overlay (drawn after the command
@@ -3535,12 +3544,17 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
 
     // Observe the rendered messages area for the anchor-stability (smoothness)
     // report. Runs on the final buffer so it sees exactly what the user sees.
+    let overlays_ms = overlays_start.elapsed().as_secs_f64() * 1000.0;
+
+    let smoothness_start = Instant::now();
     smoothness::observe_frame(
         frame.buffer_mut(),
         messages_area,
         app.scroll_offset(),
         !app.auto_scroll_paused(),
     );
+
+    let smoothness_ms = smoothness_start.elapsed().as_secs_f64() * 1000.0;
 
     let frame_elapsed = total_start.elapsed();
     // 250 ms only caught pathological frames, so the ordinary ~60 ms frame that
@@ -3549,12 +3563,15 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     // the same population and a median frame can be decomposed.
     if frame_elapsed >= Duration::from_millis(40) {
         crate::logging::warn(&format!(
-            "TUI_RENDER_PHASES prepare={:.2}ms messages={:.2}ms chrome={:.2}ms widget_data={:.2}ms widget_render={:.2}ms final={:.2}ms total={:.2}ms",
+            "TUI_RENDER_PHASES prepare={:.2}ms messages={:.2}ms chrome={:.2}ms widget_data={:.2}ms widget_render={:.2}ms facts={:.2}ms overlays={:.2}ms smoothness={:.2}ms final={:.2}ms total={:.2}ms",
             prep_elapsed.as_secs_f64() * 1000.0,
             messages_draw.as_secs_f64() * 1000.0,
             chrome_elapsed.as_secs_f64() * 1000.0,
             widget_data_elapsed.as_secs_f64() * 1000.0,
             widget_render_ms.unwrap_or_default(),
+            facts_ms,
+            overlays_ms,
+            smoothness_ms,
             frame_elapsed
                 .saturating_sub(prep_elapsed)
                 .saturating_sub(messages_draw)
@@ -3563,6 +3580,9 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
                 .saturating_sub(Duration::from_secs_f32(
                     widget_render_ms.unwrap_or_default() / 1000.0,
                 ))
+                .saturating_sub(Duration::from_secs_f64(facts_ms / 1000.0))
+                .saturating_sub(Duration::from_secs_f64(overlays_ms / 1000.0))
+                .saturating_sub(Duration::from_secs_f64(smoothness_ms / 1000.0))
                 .as_secs_f64()
                 * 1000.0,
             frame_elapsed.as_secs_f64() * 1000.0,
