@@ -145,6 +145,15 @@ pub fn tokenize(command: &str) -> Vec<Token> {
                 }
             }
             '\\' => {
+                // A backslash-newline is a line continuation: the shell joins
+                // the lines and the next word is an ordinary operand. Folding
+                // the newline into the token instead hid the operand, so
+                // `rm -rf \` + newline + `~` scored Low rather than
+                // Catastrophic.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                    continue;
+                }
                 if let Some(next) = chars.next() {
                     has_content = true;
                     current.push(next);

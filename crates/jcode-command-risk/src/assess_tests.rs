@@ -533,3 +533,150 @@ fn recursive_flags_still_count_for_destructive_programs() {
         RiskLevel::Catastrophic
     );
 }
+
+/// Regression: one-token bypasses of the entire gate.
+///
+/// Each of these reported **Safe** — not merely under-escalated, but the same
+/// verdict as `ls`. Every one is `rm -rf ~` with a single token of ordinary
+/// shell syntax in front, which is precisely the command this crate exists to
+/// stop. Found by adversarial audit after the false-positive fixes landed.
+#[test]
+fn prefixes_and_grouping_cannot_hide_the_destructive_verb() {
+    let ctx = ctx();
+    let mut escaped = Vec::new();
+    for command in [
+        // A leading environment assignment was only stripped inside wrapper
+        // unwrapping, so the program name read as `FOO=1`.
+        "FOO=1 rm -rf /home/u",
+        "FOO=1 BAR=2 rm -rf /home/u",
+        // `sudo -n` takes no value, but a shared flag table let `-n` eat `rm`.
+        "sudo -n rm -rf /home/u",
+        "sudo -s rm -rf /home/u",
+        "sudo -k rm -rf /home/u",
+        // Subshell and group brackets glue onto the program and the operand.
+        "(rm -rf /home/u)",
+        "{ rm -rf /home/u; }",
+        // Operand-taking and string-taking wrappers walked off the end.
+        "su root -c 'rm -rf /home/u'",
+        "chroot /mnt rm -rf /home/u",
+        "eval 'rm -rf /home/u'",
+    ] {
+        let level = assess(command, &ctx).level;
+        if level != RiskLevel::Catastrophic {
+            escaped.push(format!("{command} -> {level:?}"));
+        }
+    }
+    assert!(
+        escaped.is_empty(),
+        "one-token prefix bypassed the gate: {escaped:#?}"
+    );
+}
+
+/// Regression: command substitution runs regardless of the outer program.
+///
+/// `echo $(rm -rf ~)` deletes the home directory and then echoes nothing.
+/// Only shells were descended into, so every other program made substitution
+/// a free pass. The tokenizer splits `$(rm -rf ~)` on whitespace, so this has
+/// to be extracted from the raw command string rather than per token.
+#[test]
+fn command_substitution_is_assessed_whatever_the_outer_program_is() {
+    let ctx = ctx();
+    let mut escaped = Vec::new();
+    for command in [
+        "echo $(rm -rf /home/u)",
+        "ls $(rm -rf /home/u)",
+        "printf '%s' `rm -rf /home/u`",
+        "echo $(echo $(rm -rf /home/u))",
+    ] {
+        let level = assess(command, &ctx).level;
+        if level != RiskLevel::Catastrophic {
+            escaped.push(format!("{command} -> {level:?}"));
+        }
+    }
+    assert!(
+        escaped.is_empty(),
+        "substitution hid a destructive command: {escaped:#?}"
+    );
+}
+
+/// Regression: overwrite verbs destroy their destination as surely as `rm`.
+#[test]
+fn overwrite_verbs_are_destructive() {
+    let ctx = ctx();
+    let mut escaped = Vec::new();
+    for command in [
+        "mv evil /etc/passwd",
+        "cp evil /etc/passwd",
+        "tee /etc/passwd",
+        "install evil /etc/passwd",
+        "ln -sf evil /etc/passwd",
+    ] {
+        let level = assess(command, &ctx).level;
+        if level != RiskLevel::Catastrophic {
+            escaped.push(format!("{command} -> {level:?}"));
+        }
+    }
+    assert!(
+        escaped.is_empty(),
+        "overwrite verb reached a protected path ungated: {escaped:#?}"
+    );
+}
+
+/// Regression: `~user` is another account's home and cannot be resolved here.
+///
+/// It previously fell through as an ordinary relative path and scored Low.
+#[test]
+fn another_users_home_and_credentials_are_protected() {
+    let ctx = ctx();
+    for command in ["rm -rf ~root", "rm -rf ~root/.ssh", "rm -rf ~deploy/.aws"] {
+        assert_eq!(
+            assess(command, &ctx).level,
+            RiskLevel::Catastrophic,
+            "should be denied: {command}"
+        );
+    }
+}
+
+/// Regression: a backslash-newline is a line continuation, not part of a word.
+///
+/// Folding the newline into the token hid the operand that followed it.
+#[test]
+fn line_continuation_does_not_hide_the_target() {
+    let ctx = ctx();
+    assert_eq!(
+        assess("rm -rf \\\n/home/u", &ctx).level,
+        RiskLevel::Catastrophic
+    );
+}
+
+/// The counterpart to the above: none of that may make ordinary work noisy.
+#[test]
+fn the_new_unwrapping_does_not_flag_everyday_commands() {
+    let ctx = ctx();
+    let mut noisy = Vec::new();
+    for command in [
+        // `-name` takes a pattern, not a path, and `-exec` is usually a read.
+        "find . -name '*.rs' -exec grep TODO {} +",
+        "find . -iname '*.md' -print",
+        // Leading assignments and grouping on harmless programs.
+        "FOO=1 ls",
+        "RUST_LOG=debug cargo test",
+        "(cd src && ls)",
+        // Substitution whose inner command is harmless.
+        "echo $(git rev-parse HEAD)",
+        "ls $(pwd)",
+        // Copy/move within the working directory is routine.
+        "cp src/main.rs src/main.rs.bak",
+        "mv build/out build/out2",
+        "sudo -n systemctl status jcode",
+    ] {
+        let level = assess(command, &ctx).level;
+        if !level.runs_immediately() {
+            noisy.push(format!("{command} -> {level:?}"));
+        }
+    }
+    assert!(
+        noisy.is_empty(),
+        "gate became noisy on normal work: {noisy:#?}"
+    );
+}

@@ -149,6 +149,12 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 /// directory is routine. It means "inspect the targets".
 const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "rm", "rmdir", "shred", "unlink", "truncate", "dd", "mkfs", "fdisk", "parted", "wipefs", "srm",
+    // Overwrite verbs. These destroy the *destination* just as surely as `rm`
+    // does: `mv evil /etc/passwd` and `cp evil /etc/passwd` replace the file,
+    // `tee` and `install` truncate it, and `ln -sf` replaces it with a symlink.
+    // They were absent, so every one of them reported Safe against a protected
+    // path.
+    "mv", "cp", "tee", "install", "ln",
 ];
 
 /// Commands that run another command. The real program is one of their
@@ -160,16 +166,130 @@ const WRAPPER_COMMANDS: &[&str] = &[
 ];
 
 /// Wrapper options that consume the following word as their value.
-const WRAPPER_FLAGS_WITH_VALUES: &[&str] = &[
-    "-n",
-    "-u",
-    "-s",
-    "-c",
-    "-k",
-    "--signal",
-    "--adjustment",
-    "--user",
+///
+/// This is deliberately **per wrapper**. A shared list is unsound: `sudo -n`
+/// means "non-interactive" and takes no value, while `nice -n` takes a
+/// priority. Treating `sudo -n rm -rf ~` as "`-n` eats `rm`" made the
+/// destructive verb invisible and the whole command Safe.
+const WRAPPER_FLAGS_WITH_VALUES: &[(&str, &[&str])] = &[
+    ("nice", &["-n", "--adjustment"]),
+    ("ionice", &["-n", "-c", "-p"]),
+    ("timeout", &["-k", "-s", "--signal"]),
+    ("env", &["-u", "--unset"]),
+    ("xargs", &["-n", "-P", "-I", "-d", "-s", "-L", "-a", "-E"]),
+    ("stdbuf", &["-i", "-o", "-e"]),
+    ("setsid", &[]),
+    ("nohup", &[]),
+    ("time", &["-f", "-o"]),
+    ("watch", &["-n", "--interval"]),
+    // `sudo`/`doas` short flags here take a value; `-n`, `-s`, `-k`, `-i` do not.
+    (
+        "sudo",
+        &[
+            "-u", "-g", "-p", "-C", "-h", "-r", "-t", "-U", "--user", "--group",
+        ],
+    ),
+    ("doas", &["-u", "-C"]),
+    ("command", &[]),
+    ("builtin", &[]),
+    ("exec", &["-a"]),
 ];
+
+/// Whether `flag` consumes the next word when it appears after `wrapper`.
+fn flag_takes_value(wrapper: &str, flag: &str) -> bool {
+    WRAPPER_FLAGS_WITH_VALUES
+        .iter()
+        .find(|(name, _)| *name == wrapper)
+        .is_some_and(|(_, flags)| flags.contains(&flag))
+}
+
+/// Shell grouping punctuation that can precede a program name.
+///
+/// `(rm -rf ~)` and `{ rm -rf ~; }` are ordinary shell, and the tokenizer
+/// leaves the bracket glued to the program (`(rm`) or standing alone (`{`).
+/// Either way the program lookup misses and the command reads as Safe.
+fn strip_command_prefix(mut tokens: &[Token]) -> &[Token] {
+    loop {
+        let Some(first) = tokens.first() else {
+            return tokens;
+        };
+        // A leading `VAR=value` assignment is environment, not the program.
+        // Guard against eating a real operand: only a bare `name=value` with
+        // no slash qualifies (`of=/dev/sda` is a `dd` operand, not a prefix,
+        // but it never appears in leading position).
+        let is_assignment = !first.is_operator
+            && first.text.split_once('=').is_some_and(|(key, _)| {
+                !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
+        if is_assignment {
+            tokens = &tokens[1..];
+            continue;
+        }
+        // A standalone grouping token contributes no program.
+        if matches!(first.text.as_str(), "(" | "{" | ")" | "}" | "!") {
+            tokens = &tokens[1..];
+            continue;
+        }
+        return tokens;
+    }
+}
+
+/// Strip grouping punctuation glued to a program name, so `(rm` reads as `rm`.
+///
+/// `${HOME}` must survive intact: trimming its trailing `}` would leave
+/// `${HOME` unexpandable and downgrade a home-directory delete from
+/// Catastrophic to Confirm, so a token containing `${` is left alone.
+fn unwrap_group_punctuation(name: &str) -> &str {
+    if name.contains("${") {
+        return name;
+    }
+    name.trim_start_matches(['(', '{', '!'])
+        .trim_end_matches([')', '}', ';'])
+}
+
+/// Pull the inner command text out of `$(...)` and backtick substitutions.
+///
+/// Nesting is tracked for `$(`, so `$(echo $(rm -rf ~))` yields the whole
+/// inner text and the recursive assessment finds the `rm`. An unterminated
+/// substitution yields the remainder, which is the conservative choice: it is
+/// better to assess too much text than to silently skip a command.
+fn extract_substitutions(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let bytes: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '$' && i + 1 < bytes.len() && bytes[i + 1] == '(' {
+            let mut depth = 1;
+            let mut j = i + 2;
+            let start = j;
+            while j < bytes.len() && depth > 0 {
+                match bytes[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                if depth > 0 {
+                    j += 1;
+                }
+            }
+            found.push(bytes[start..j.min(bytes.len())].iter().collect());
+            i = j + 1;
+            continue;
+        }
+        if bytes[i] == '`' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != '`' {
+                j += 1;
+            }
+            found.push(bytes[start..j.min(bytes.len())].iter().collect());
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    found
+}
 
 /// Shells, which take their program from a string argument we cannot parse
 /// reliably. Treated as opaque rather than assumed safe.
@@ -177,10 +297,16 @@ const SHELL_COMMANDS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
 /// Commands that are destructive only with specific flags.
 const CONDITIONALLY_DESTRUCTIVE: &[(&str, &[&str])] = &[
-    ("find", &["-delete", "-exec"]),
-    ("git", &["clean"]),
+    ("find", &["-delete"]),
+    // `git clean` deletes untracked files; `reset --hard` and `checkout -- .`
+    // discard uncommitted work, which is unrecoverable in exactly the way this
+    // gate exists to catch.
+    ("git", &["clean", "--hard"]),
     ("chmod", &["-R"]),
     ("chown", &["-R"]),
+    // `rsync --delete` removes files from the destination that are absent at
+    // the source, which can empty a whole tree.
+    ("rsync", &["--delete", "--delete-after", "--delete-before"]),
 ];
 
 /// Assess a single shell command string.
@@ -192,6 +318,31 @@ pub fn assess(command: &str, ctx: &RiskContext) -> RiskAssessment {
 
     for segment in tokenize::split_segments(command) {
         assess_segment(&segment, ctx, &mut findings);
+    }
+
+    // Command substitution runs a full command regardless of how harmless the
+    // surrounding one is: `echo $(rm -rf ~)` deletes the home directory and
+    // then echoes nothing. This runs on the raw string rather than per token
+    // because the tokenizer splits `$(rm -rf ~)` on whitespace into `$(rm`,
+    // `-rf`, `~)`, so no single token holds the substitution.
+    //
+    // Nested substitutions are followed to a bounded depth: the extractor
+    // returns the outer body, whose own `$(...)` must then be unwrapped again
+    // or `echo $(echo $(rm -rf ~))` slips through. The bound keeps a
+    // pathological input from looping.
+    let mut pending: Vec<String> = extract_substitutions(command);
+    let mut depth = 0;
+    while let Some(inner) = pending.pop() {
+        if inner.trim().is_empty() {
+            continue;
+        }
+        for segment in tokenize::split_segments(&inner) {
+            assess_segment(&segment, ctx, &mut findings);
+        }
+        if depth < 8 {
+            depth += 1;
+            pending.extend(extract_substitutions(&inner));
+        }
     }
 
     if findings.is_empty() {
@@ -206,6 +357,16 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
     // is a complete bypass.
     let mut tokens = tokens;
     let mut wrapped_by: Option<String> = None;
+
+    // Leading `VAR=value` assignments and shell grouping punctuation come
+    // before the program name. Both were previously only stripped *inside*
+    // wrapper unwrapping, so `FOO=1 rm -rf ~` and `(rm -rf ~)` presented a
+    // program name of `FOO=1` / `(rm`, matched nothing in the destructive
+    // list, and were reported Safe. That is a one-token bypass of the entire
+    // gate, so the stripping has to happen before the first program lookup.
+    let stripped = strip_command_prefix(tokens);
+    tokens = stripped;
+
     loop {
         let Some(first) = tokens.first() else {
             // Ran off the end while unwrapping: the payload is invisible.
@@ -221,11 +382,40 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
             }
             return;
         };
-        let name = first.basename();
+        let name = unwrap_group_punctuation(&first.basename()).to_string();
         if !WRAPPER_COMMANDS.contains(&name.as_str()) {
             break;
         }
-        wrapped_by = Some(name);
+        wrapped_by = Some(name.clone());
+        // `su` and `eval` carry their payload as a quoted string argument, so
+        // assess it as script text the way a shell's `-c` string is assessed.
+        // Landing on a program token instead walked off the end and returned
+        // Safe.
+        if matches!(name.as_str(), "su" | "eval") {
+            for token in tokens.iter().skip(1).filter(|t| !t.is_flag()) {
+                for segment in tokenize::split_segments(&token.text) {
+                    assess_segment(&segment, ctx, findings);
+                }
+            }
+            return;
+        }
+        // `chroot NEWROOT CMD ...` takes a directory operand *before* the
+        // command it runs. Skipping only flags left `chroot` pointing at the
+        // directory instead of the command, so `chroot /mnt rm -rf ~` read as
+        // a chroot of a path and never saw the `rm`.
+        if name == "chroot" {
+            let rest = &tokens[1..];
+            let mut idx = 0;
+            while idx < rest.len() && (rest[idx].is_flag() || rest[idx].is_operator) {
+                idx += 1;
+            }
+            // Consume the NEWROOT operand itself.
+            if idx < rest.len() {
+                idx += 1;
+            }
+            tokens = &rest[idx..];
+            continue;
+        }
         // Skip the wrapper plus its own options and `VAR=value` assignments,
         // landing on the wrapped program. Options that take a separate value
         // (`nice -n 10`, `timeout 5`) must consume that value too.
@@ -240,7 +430,7 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
             if token.is_flag() {
                 idx += 1;
                 // A short flag known to take an argument consumes the next word.
-                if WRAPPER_FLAGS_WITH_VALUES.contains(&token.text.as_str()) && idx < rest.len() {
+                if flag_takes_value(&name, &token.text) && idx < rest.len() {
                     idx += 1;
                 }
                 continue;
@@ -270,7 +460,7 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
         }
         return;
     };
-    let program_name = program.basename();
+    let program_name = unwrap_group_punctuation(&program.basename()).to_string();
 
     // A shell invoked with an inline script is opaque to this parser. Assess
     // the script text too, so `sh -c "rm -rf ~"` is not a free pass.
@@ -322,6 +512,22 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
     } else {
         Vec::new()
     };
+    // `find -name '*.rs'` / `-path '*/x/*'` take a *pattern*, not a path. The
+    // pattern was being read as a glob target, so an ordinary
+    // `find . -name '*.rs' -exec grep ...` asked for confirmation.
+    if program_name == "find" {
+        let pattern_values: Vec<&str> = tokens
+            .windows(2)
+            .filter(|w| {
+                matches!(
+                    w[0].text.as_str(),
+                    "-name" | "-path" | "-iname" | "-ipath" | "-regex"
+                )
+            })
+            .map(|w| w[1].text.as_str())
+            .collect();
+        targets.retain(|t| !pattern_values.contains(&t.text.as_str()));
+    }
     targets.extend(redirect_targets.iter().copied());
 
     // A destructive command fed by a pipe takes its operands from the previous
@@ -360,13 +566,16 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
     let recursive = triggered && tokens.iter().any(|t| t.is_recursive_flag());
 
     for target in targets {
+        // Grouping punctuation glues onto the last operand of a subshell, so
+        // `(rm -rf ~)` yields the token `~)`. Left attached, `~)` never equals
+        // `~` and the home directory check misses.
+        let text = unwrap_group_punctuation(&target.text).to_string();
         // `dd`-style `key=value` operands hide the path from a naive scan.
-        let raw = target
-            .text
+        let raw = text
             .split_once('=')
             .filter(|(key, _)| matches!(*key, "of" | "if" | "seek" | "conv"))
             .map(|(_, value)| value)
-            .unwrap_or(&target.text);
+            .unwrap_or(&text);
         let expanded = paths::expand(raw, ctx);
         if let Some(finding) = paths::classify_target(&expanded, raw, recursive, ctx) {
             findings.push(finding);

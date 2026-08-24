@@ -96,6 +96,14 @@ pub fn expand(raw: &str, ctx: &RiskContext) -> PathBuf {
         }
     }
 
+    // `~user` names *another* account's home. We cannot resolve it without
+    // reading passwd, and `rm -rf ~root/.ssh` previously fell through as an
+    // ordinary relative path and scored Low. Leave it unexpanded and let the
+    // caller treat it as unresolvable-and-therefore-risky.
+    if text.starts_with('~') {
+        return PathBuf::from(text);
+    }
+
     let path = PathBuf::from(&text);
     if path.is_absolute() {
         return normalize(&path);
@@ -243,11 +251,33 @@ pub fn classify_target(
         });
     }
 
-    if raw.contains('$') || raw.contains('`') {
+    // `~user` names another account's home, which we cannot resolve without
+    // reading passwd. Recursively destroying it, or anything in it, is as
+    // unacceptable as doing so to our own home, and a credential store under
+    // it (`rm -rf ~root/.ssh`) is categorically off limits. Judge it on the
+    // spelling rather than letting it fall through as a relative path.
+    if raw.starts_with('~') && !raw.starts_with("~/") {
+        let after_user = raw.split_once('/').map(|(_, rest)| rest).unwrap_or("");
+        let hits_credentials = PROTECTED_CREDENTIAL_SUBPATHS
+            .iter()
+            .any(|sub| after_user == *sub || after_user.starts_with(&format!("{sub}/")));
+        if after_user.is_empty() || hits_credentials {
+            return Some(RiskFinding {
+                level: RiskLevel::Catastrophic,
+                reason: "targets another user's home directory or credential \
+                         store, which must never be destroyed"
+                    .to_string(),
+                target: Some(raw.to_string()),
+            });
+        }
+    }
+
+    if raw.contains('$') || raw.contains('`') || raw.starts_with('~') {
         return Some(RiskFinding {
             level: RiskLevel::Confirm,
-            reason: "target is computed at runtime (variable or command \
-                     substitution), so its value cannot be checked in advance"
+            reason: "target is computed at runtime (variable, command \
+                     substitution, or another user's home), so its value \
+                     cannot be checked in advance"
                 .to_string(),
             target: Some(raw.to_string()),
         });
