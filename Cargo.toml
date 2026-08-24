@@ -336,6 +336,21 @@ opt-level = 3
 [profile.test.package."jcode-tui-anim"]
 opt-level = 3
 
+# The TUI render/input path and the app-core request path are the two largest
+# first-party crates (jcode-tui ~202k lines, jcode-app-core ~144k lines), and
+# they run on every keystroke and every frame. At opt-level 0 the same code is
+# 8-13x slower than optimized (measured with jcode-fuzzy's own
+# examples/bench_realistic.rs, pin on vs off: 44ms -> 394ms, 58ms -> 781ms),
+# which is the "input feels laggy" report. Everything below pins individual
+# third-party crates one at a time; these two are the first-party bulk that was
+# never covered. opt-level 1 recovers most of the runtime speed for far less
+# codegen time than 3, keeping the selfdev profile's fast-iteration purpose.
+[profile.selfdev.package."jcode-tui"]
+opt-level = 1
+
+[profile.selfdev.package."jcode-app-core"]
+opt-level = 1
+
 # The fuzzy matcher runs a char-level DP over every picker entry on every
 # keystroke (e.g. /model search across hundreds of routes). Like the anim
 # kernels above, it is small, pure, dependency-free code that rarely changes,
