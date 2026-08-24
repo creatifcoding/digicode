@@ -1103,6 +1103,65 @@ pub(super) fn gather_todos_and_goals_for_session(
     (Vec::new(), Vec::new())
 }
 
+/// Cached `backend · model` label for the memory sidecar badge.
+///
+/// `Sidecar::new()` resolves its backend through `auto_select_backend`, which
+/// calls `auth::codex::load_credentials()` and `auth::claude::load_credentials()`.
+/// Each of those opens and JSON-parses credential files, so building a sidecar
+/// just to read two `&str` fields did up to three file reads **per frame**,
+/// outside the `gather_memory_info` cache that surrounds it.
+///
+/// That put blocking credential IO on the render path. `TUI_RENDER_PHASES`
+/// attributes 57.9% of pathological frame time (1459 s in one day) to the
+/// `widget_data` phase this sits in, versus 1.1% for drawing the messages.
+///
+/// The label only changes when the user logs in or out or edits the configured
+/// memory model, so it is refreshed on a background thread at most once per
+/// TTL. The first call returns `None` and the badge appears a frame later.
+fn sidecar_label_cached() -> Option<String> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static CACHE: Mutex<Option<(Instant, Option<String>, bool)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(10);
+
+    fn fetch() -> Option<String> {
+        let sidecar = crate::sidecar::Sidecar::new();
+        Some(format!(
+            "{} · {}",
+            sidecar.backend_name(),
+            sidecar.model_name()
+        ))
+    }
+
+    let Ok(mut guard) = CACHE.lock() else {
+        return None;
+    };
+    if let Some((ts, cached, refreshing)) = guard.as_mut() {
+        if ts.elapsed() < TTL || *refreshing {
+            return cached.clone();
+        }
+        let stale = cached.clone();
+        *refreshing = true;
+        std::thread::spawn(move || {
+            let label = fetch();
+            if let Ok(mut guard) = CACHE.lock() {
+                *guard = Some((Instant::now(), label, false));
+            }
+        });
+        return stale;
+    }
+
+    *guard = Some((backdated_now(TTL + Duration::from_secs(1)), None, true));
+    std::thread::spawn(move || {
+        let label = fetch();
+        if let Ok(mut guard) = CACHE.lock() {
+            *guard = Some((Instant::now(), label, false));
+        }
+    });
+    None
+}
+
 pub(super) fn gather_memory_info(
     memory_enabled: bool,
     working_dir: Option<String>,
@@ -1122,12 +1181,7 @@ pub(super) fn gather_memory_info(
         None
     };
     let sidecar_model = if memory_enabled && crate::memory::memory_sidecar_enabled() {
-        let sidecar = crate::sidecar::Sidecar::new();
-        Some(format!(
-            "{} · {}",
-            sidecar.backend_name(),
-            sidecar.model_name()
-        ))
+        sidecar_label_cached()
     } else {
         None
     };

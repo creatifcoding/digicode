@@ -3543,13 +3543,17 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     );
 
     let frame_elapsed = total_start.elapsed();
-    if frame_elapsed >= Duration::from_millis(250) {
+    // 250 ms only caught pathological frames, so the ordinary ~60 ms frame that
+    // actually drives perceived input lag was never phase-attributed. The
+    // slow-frame threshold itself is 40 ms; match it so the two logs describe
+    // the same population and a median frame can be decomposed.
+    if frame_elapsed >= Duration::from_millis(40) {
         crate::logging::warn(&format!(
-            "TUI_RENDER_PHASES prepare={}ms messages={}ms chrome={}ms widget_data={}ms widget_render={}ms final={}ms total={}ms",
-            prep_elapsed.as_millis(),
-            messages_draw.as_millis(),
-            chrome_elapsed.as_millis(),
-            widget_data_elapsed.as_millis(),
+            "TUI_RENDER_PHASES prepare={:.2}ms messages={:.2}ms chrome={:.2}ms widget_data={:.2}ms widget_render={:.2}ms final={:.2}ms total={:.2}ms",
+            prep_elapsed.as_secs_f64() * 1000.0,
+            messages_draw.as_secs_f64() * 1000.0,
+            chrome_elapsed.as_secs_f64() * 1000.0,
+            widget_data_elapsed.as_secs_f64() * 1000.0,
             widget_render_ms.unwrap_or_default(),
             frame_elapsed
                 .saturating_sub(prep_elapsed)
@@ -3559,8 +3563,9 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
                 .saturating_sub(Duration::from_secs_f32(
                     widget_render_ms.unwrap_or_default() / 1000.0,
                 ))
-                .as_millis(),
-            frame_elapsed.as_millis(),
+                .as_secs_f64()
+                * 1000.0,
+            frame_elapsed.as_secs_f64() * 1000.0,
         ));
     }
 
