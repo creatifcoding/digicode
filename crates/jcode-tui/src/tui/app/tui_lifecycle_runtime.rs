@@ -172,6 +172,20 @@ impl App {
 
     /// Check if the selected reload candidate is newer than startup.
     /// Candidate selection matches `/reload` so the `cli↑` badge and reload target stay aligned.
+    ///
+    /// This is called from the header build on the render path
+    /// (`ui_header.rs`), and `preferred_reload_candidate` walks fork admission,
+    /// which hashes multi-hundred-MB channel binaries and spawns smoke-test
+    /// subprocesses. Running it inline made the header the single largest cost
+    /// in the whole frame: in one day of `TUI_SLOW_FRAME` telemetry,
+    /// `full_prep_header_ms` was **68.3% of all draw time**, p90 30 s,
+    /// max 74.9 s, 872 s in total, while the message body was 1.1%.
+    ///
+    /// The answer only changes when a new binary is installed, so it is served
+    /// from a cached value refreshed on a background thread at most once per
+    /// TTL. The first call reports `false` and kicks the refresh; the badge is
+    /// a cosmetic hint that catches up on a later frame, and `/reload` does its
+    /// own authoritative check before exec'ing anything.
     pub(super) fn has_newer_binary(&self) -> bool {
         let Some(startup_mtime) = self.client_binary_mtime else {
             return false;
@@ -183,23 +197,81 @@ impl App {
             self.session.is_canary
         };
 
-        let Some((candidate, _label)) =
-            crate::build::preferred_reload_candidate(is_selfdev_session)
-        else {
+        newer_binary_badge_cached(is_selfdev_session, startup_mtime)
+    }
+
+    /// Uncached form, kept for `/reload` and tests where a stale answer would
+    /// exec the wrong binary.
+    pub(crate) fn has_newer_binary_blocking(&self) -> bool {
+        let Some(startup_mtime) = self.client_binary_mtime else {
             return false;
         };
 
-        // The candidate may be a channel symlink to a release wrapper script;
-        // compare the payload that actually runs (`client_binary_mtime` is the
-        // running payload's mtime). Comparing the wrapper's mtime reported a
-        // phantom "newer client" forever after release installs whose wrapper
-        // was written after the payload, re-execing the client in a loop.
-        std::fs::metadata(crate::build::resolve_binary_payload(&candidate))
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .is_some_and(|mtime| mtime > startup_mtime)
-    }
+        let is_selfdev_session = if self.is_remote {
+            self.remote_is_canary.unwrap_or(self.session.is_canary)
+        } else {
+            self.session.is_canary
+        };
 
+        compute_newer_binary(is_selfdev_session, startup_mtime)
+    }
+}
+
+/// Cache for the `cli↑` badge. See [`App::has_newer_binary`].
+static NEWER_BINARY_BADGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static NEWER_BINARY_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static NEWER_BINARY_LAST_REFRESH: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+const NEWER_BINARY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn newer_binary_badge_cached(
+    is_selfdev_session: bool,
+    startup_mtime: std::time::SystemTime,
+) -> bool {
+    let stale = NEWER_BINARY_LAST_REFRESH
+        .lock()
+        .ok()
+        .and_then(|guard| *guard)
+        .map(|at| at.elapsed() >= NEWER_BINARY_TTL)
+        .unwrap_or(true);
+    if stale && !NEWER_BINARY_REFRESH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let spawned = std::thread::Builder::new()
+            .name("cli-update-badge".into())
+            .spawn(move || {
+                let value = compute_newer_binary(is_selfdev_session, startup_mtime);
+                NEWER_BINARY_BADGE.store(value, std::sync::atomic::Ordering::Release);
+                if let Ok(mut guard) = NEWER_BINARY_LAST_REFRESH.lock() {
+                    *guard = Some(std::time::Instant::now());
+                }
+                NEWER_BINARY_REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+            });
+        if spawned.is_err() {
+            NEWER_BINARY_REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    NEWER_BINARY_BADGE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn compute_newer_binary(is_selfdev_session: bool, startup_mtime: std::time::SystemTime) -> bool {
+    let Some((candidate, _label)) = crate::build::preferred_reload_candidate(is_selfdev_session)
+    else {
+        return false;
+    };
+
+    // The candidate may be a channel symlink to a release wrapper script;
+    // compare the payload that actually runs (`client_binary_mtime` is the
+    // running payload's mtime). Comparing the wrapper's mtime reported a
+    // phantom "newer client" forever after release installs whose wrapper
+    // was written after the payload, re-execing the client in a loop.
+    std::fs::metadata(crate::build::resolve_binary_payload(&candidate))
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .is_some_and(|mtime| mtime > startup_mtime)
+}
+
+impl App {
     /// After an in-process server reload (e.g. `self-dev build-reload`), the
     /// server PID is unchanged and connected clients never disconnect, so they
     /// keep running their old binary and client-side changes never take effect.
@@ -218,7 +290,9 @@ impl App {
         if self.is_processing {
             return false;
         }
-        if !self.has_newer_binary() {
+        // Authoritative: this re-execs the client, so a stale cached badge
+        // could launch the wrong binary.
+        if !self.has_newer_binary_blocking() {
             return false;
         }
         let session_id = self.reload_handoff_session_id();
@@ -606,7 +680,8 @@ pub(super) fn handle_dev_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/reload" {
-        if !app.has_newer_binary() {
+        // Authoritative: /reload must not act on a stale cached answer.
+        if !app.has_newer_binary_blocking() {
             app.push_display_message(DisplayMessage {
                 role: "system".to_string(),
                 content: "No newer binary found. Nothing to reload.\nUse /rebuild to build a new version.".to_string(),

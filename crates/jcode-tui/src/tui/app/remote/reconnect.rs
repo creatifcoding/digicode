@@ -594,7 +594,7 @@ pub(in crate::tui::app) async fn handle_post_connect<B: ratatui::backend::Backen
             app.reload_info.push(ctx.reconnect_notice_line());
         }
 
-        let must_reload_client = state.server_reload_in_progress || app.has_newer_binary();
+        let must_reload_client = state.server_reload_in_progress || app.has_newer_binary_blocking();
 
         if must_reload_client {
             app.push_display_message(DisplayMessage::system(

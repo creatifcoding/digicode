@@ -533,11 +533,20 @@ fn test_has_newer_binary_detection() {
         created = true;
     }
 
+    // Detection itself is asserted through the blocking form. The badge form
+    // (`has_newer_binary`) is deliberately served from a TTL cache refreshed on
+    // a background thread, because running it inline on the render path made
+    // the header 68.3% of all draw time (p90 30 s). A cached first call
+    // returns `false` and schedules the refresh, so it cannot be asserted
+    // synchronously here.
     app.client_binary_mtime = Some(SystemTime::UNIX_EPOCH);
-    assert!(app.has_newer_binary());
+    assert!(app.has_newer_binary_blocking());
 
     app.client_binary_mtime = Some(SystemTime::now() + Duration::from_secs(3600));
-    assert!(!app.has_newer_binary());
+    assert!(!app.has_newer_binary_blocking());
+
+    // The badge form must stay total and cheap regardless of the answer.
+    let _ = app.has_newer_binary();
 
     if created {
         let _ = std::fs::remove_file(&exe);

@@ -925,7 +925,7 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed == "/reload" {
-                    let client_needs_reload = app.has_newer_binary();
+                    let client_needs_reload = app.has_newer_binary_blocking();
                     let server_needs_reload =
                         app.remote_server_has_update.unwrap_or(client_needs_reload);
 
